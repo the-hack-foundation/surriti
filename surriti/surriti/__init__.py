@@ -42,6 +42,7 @@ from surriti.graphiti import (
     AddBulkEpisodeResults,
     AddEpisodeResults,
     AddTripletResults,
+    Graphiti,
     RawEpisode,
     Surriti,
 )
@@ -67,6 +68,7 @@ from surriti.search_filters import (
 __all__ = [
     # Core facade
     "Surriti",
+    "Graphiti",
     # Result dataclasses
     "AddBulkEpisodeResults",
     "AddEpisodeResults",
@@ -118,4 +120,3 @@ __all__ = [
 ]
 
 __version__ = "0.5.0"
-

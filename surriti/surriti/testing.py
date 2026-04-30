@@ -91,6 +91,16 @@ class InMemoryDriver:
                 if r.get("group_id") == v.get("g") and r.get("name") in names
             ]
             return [rows]
+        if "FROM relates_to" in s and "AND in = type::record" in s and "AND out = type::record" in s:
+            rows = [
+                r for r in self.records["relates_to"]
+                if r.get("group_id") == v.get("group_id")
+                and r.get("source_node_uuid") == v.get("src")
+                and r.get("target_node_uuid") == v.get("tgt")
+                and r.get("name") == v.get("name")
+                and r.get("invalid_at") is None
+            ]
+            return [rows[:10]]
         if "FROM relates_to" in s and "fact_embedding <|" in s:
             vec = v.get("vec")
             scored = []
@@ -111,8 +121,39 @@ class InMemoryDriver:
                 and v.get("group_id") in (None, r.get("group_id"))
             ]
             return [rows]
+        if "FROM entity" in s and "name_embedding <|" in s:
+            vec = v.get("vec")
+            scored = []
+            for r in self.records["entity"]:
+                if v.get("group_id") not in (None, r.get("group_id")):
+                    continue
+                if not r.get("name_embedding"):
+                    continue
+                scored.append((cosine_similarity(vec, r["name_embedding"]), r))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [[r for _, r in scored[:10]]]
+        if "FROM entity" in s and "name @1@" in s:
+            q = (v.get("q") or "").lower()
+            tokens = [t for t in q.split() if t]
+            rows = [
+                r for r in self.records["entity"]
+                if any(t in r.get("name", "").lower() for t in tokens)
+                and v.get("group_id") in (None, r.get("group_id"))
+            ]
+            return [rows]
         if s.startswith("SELECT * FROM episode"):
-            rows = [r for r in self.records["episode"] if r.get("group_id") == v.get("g")]
+            groups = set(v.get("groups") or [])
+            rows = [
+                r for r in self.records["episode"]
+                if (
+                    (groups and r.get("group_id") in groups)
+                    or (not groups and r.get("group_id") == v.get("g"))
+                )
+            ]
+            if v.get("source") is not None:
+                rows = [r for r in rows if r.get("source") == v.get("source")]
+            if v.get("ref") is not None:
+                rows = [r for r in rows if r.get("reference_time") <= v.get("ref")]
             rows.sort(key=lambda r: r.get("reference_time"), reverse=True)
             return [rows[: v.get("n", 10)]]
         if s.startswith("SELECT content FROM episode WHERE uuid IN") or \
@@ -120,6 +161,16 @@ class InMemoryDriver:
             uuids = set(v.get("u") or [])
             rows = [r for r in self.records["episode"] if r.get("uuid") in uuids]
             return [rows]
+        if s.startswith("UPDATE relates_to") and "array::distinct" in s:
+            extra = list(v.get("episodes") or [])
+            for r in self.records["relates_to"]:
+                if r.get("uuid") == v.get("uuid"):
+                    merged = list(r.get("episodes") or [])
+                    for episode_uuid in extra:
+                        if episode_uuid not in merged:
+                            merged.append(episode_uuid)
+                    r["episodes"] = merged
+            return [[{"ok": True}]]
         if s.startswith("UPDATE relates_to"):
             uuids = set(v.get("uuids") or [])
             for r in self.records["relates_to"]:

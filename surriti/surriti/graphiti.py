@@ -173,7 +173,11 @@ class Surriti:
         excluded_entity_types: list[str] | None = None,
         entity_types: dict[str, type] | None = None,
         previous_episode_uuids: list[str] | None = None,
+        edge_types: dict[str, type] | None = None,
+        edge_type_map: dict[tuple[str, str], list[str]] | None = None,
         custom_extraction_instructions: str | None = None,
+        saga: Any | None = None,
+        saga_previous_episode_uuid: str | None = None,
         speaker_id: str | None = None,
         speaker_name: str | None = None,
     ) -> AddEpisodeResults:
@@ -199,6 +203,22 @@ class Surriti:
         """
 
         ref_time = reference_time or datetime.now(timezone.utc)
+
+        # Graphiti supplies recent episodes as extraction context by default.
+        # Surriti keeps the prompt compact by passing only prior content, never
+        # episode names/metadata, so small models do not extract turn labels.
+        context_text = episode_body
+        if previous_episode_uuids is None:
+            ctx = await self._fetch_recent_episode_contents(
+                reference_time=ref_time,
+                group_id=group_id,
+                source=source,
+            )
+        else:
+            ctx = await self._fetch_episode_contents(previous_episode_uuids)
+        if ctx:
+            context_text = f"{ctx}\n---\n{episode_body}"
+
         episode = EpisodicNode(
             uuid=uuid or str(uuid4()),
             name=name,
@@ -256,13 +276,6 @@ class Surriti:
                 else speaker_hint
             )
 
-        # Optionally include previous episode text as extra context.
-        context_text = episode_body
-        if previous_episode_uuids:
-            ctx = await self._fetch_episode_contents(previous_episode_uuids)
-            if ctx:
-                context_text = f"{ctx}\n---\n{episode_body}"
-
         extraction = await self.llm.extract(
             context_text,
             group_id=group_id,
@@ -283,6 +296,15 @@ class Surriti:
                 hits = [t for t in type_names if t.lower() in lname]
                 if hits:
                     ent.labels = sorted(set((ent.labels or []) + hits))
+        if edge_types:
+            allowed = set(edge_types)
+            extraction.facts = [
+                f for f in extraction.facts if not f.predicate or f.predicate in allowed
+            ]
+        if edge_type_map:
+            extraction.facts = self._filter_facts_by_edge_type_map(
+                extraction.entities, extraction.facts, edge_type_map
+            )
         if excluded_entity_types:
             excluded = set(excluded_entity_types)
             extraction.entities = [
@@ -728,30 +750,64 @@ class Surriti:
     async def search(
         self,
         query: str,
+        center_node_uuid: str | None = None,
+        group_ids: list[str] | None = None,
+        num_results: int | None = None,
+        search_filter: SearchFilters | None = None,
+        driver: Any | None = None,
         *,
         group_id: str | None = None,
         config: SearchConfig | None = None,
-    ) -> SearchResults:
-        """Hybrid (vector + BM25) search over EntityEdge facts."""
+        return_results: bool | None = None,
+    ) -> SearchResults | list[EntityEdge]:
+        """Hybrid (vector + BM25) search over EntityEdge facts.
 
+        Surriti-native calls return :class:`SearchResults`. Graphiti-style
+        calls that use ``group_ids`` / ``num_results`` / ``search_filter`` /
+        ``center_node_uuid`` return the edge list unless ``return_results`` is
+        explicitly set.
+        """
+
+        graphiti_style = any(
+            value is not None
+            for value in (center_node_uuid, group_ids, num_results, search_filter, driver)
+        )
         embedding = await self.embedder.create(query) if query else None
         cfg = config or SearchConfig()
+        if num_results is not None:
+            cfg.limit = num_results
+        if center_node_uuid is not None:
+            cfg.focal_uuid = center_node_uuid
+        if search_filter is not None:
+            cfg.filters = search_filter
         if cfg.cross_encoder is None:
             cfg.cross_encoder = self.cross_encoder
-        return await hybrid_search(
-            self.driver,
+        effective_group_id = group_id
+        if effective_group_id is None and group_ids:
+            effective_group_id = group_ids[0]
+        results = await hybrid_search(
+            driver or self.driver,
             query=query,
             query_embedding=embedding,
-            group_id=group_id,
+            group_id=effective_group_id,
             config=cfg,
         )
+        if return_results is None:
+            return_results = not graphiti_style
+        return results if return_results else results.edges
 
     async def search_(
         self,
         query: str,
+        config: SearchConfig | None = None,
+        group_ids: list[str] | None = None,
+        center_node_uuid: str | None = None,
+        bfs_origin_node_uuids: list[str] | None = None,
+        search_filter: SearchFilters | None = None,
+        driver: Any | None = None,
         *,
         group_id: str | None = None,
-        config: SearchConfig | None = None,
+        search_config: SearchConfig | None = None,
         filters: SearchFilters | None = None,
     ) -> SearchResults:
         """Advanced search returning edges + nodes + episodes + communities.
@@ -760,42 +816,48 @@ class Surriti:
         ``SearchFilters`` (date ranges, edge types, labels, properties).
         """
 
-        cfg = config or SearchConfig(include_nodes=True, include_episodes=True)
-        if filters is not None:
-            cfg.filters = filters
+        cfg = config or search_config or SearchConfig(include_nodes=True, include_episodes=True)
+        effective_filter = filters or search_filter
+        if effective_filter is not None:
+            cfg.filters = effective_filter
+        if center_node_uuid is not None:
+            cfg.focal_uuid = center_node_uuid
         if cfg.cross_encoder is None:
             cfg.cross_encoder = self.cross_encoder
+        effective_group_id = group_id
+        if effective_group_id is None and group_ids:
+            effective_group_id = group_ids[0]
 
         embedding = await self.embedder.create(query) if query else None
         results = await hybrid_search(
-            self.driver,
+            driver or self.driver,
             query=query,
             query_embedding=embedding,
-            group_id=group_id,
+            group_id=effective_group_id,
             config=cfg,
         )
         if cfg.include_nodes:
             results.nodes = await search_nodes(
-                self.driver,
+                driver or self.driver,
                 query=query,
                 query_embedding=embedding,
-                group_id=group_id,
+                group_id=effective_group_id,
                 limit=cfg.limit,
                 filters=cfg.filters,
             )
         if cfg.include_episodes:
             results.episodes = await search_episodes(
-                self.driver,
+                driver or self.driver,
                 query=query,
-                group_id=group_id,
+                group_id=effective_group_id,
                 limit=cfg.limit,
             )
         if cfg.include_communities:
             results.communities = await search_communities(
-                self.driver,
+                driver or self.driver,
                 query=query,
                 query_embedding=embedding,
-                group_id=group_id,
+                group_id=effective_group_id,
                 limit=cfg.limit,
             )
         return results
@@ -995,6 +1057,51 @@ class Surriti:
         return "\n---\n".join(
             (r.get("content") or "").strip() for r in rows if r.get("content")
         )
+
+    async def _fetch_recent_episode_contents(
+        self,
+        *,
+        reference_time: datetime,
+        group_id: str,
+        source: EpisodeType,
+        limit: int = 10,
+    ) -> str:
+        episodes = await self.retrieve_episodes(
+            reference_time=reference_time,
+            last_n=limit,
+            group_id=group_id,
+            source=source,
+        )
+        # Graphiti provides prior episodes in chronological order to the LLM.
+        ordered = sorted(episodes, key=lambda ep: ep.reference_time)
+        return "\n---\n".join(ep.content.strip() for ep in ordered if ep.content)
+
+    def _filter_facts_by_edge_type_map(
+        self,
+        entities: list[ExtractedEntity],
+        facts: list[ExtractedFact],
+        edge_type_map: dict[tuple[str, str], list[str]],
+    ) -> list[ExtractedFact]:
+        labels_by_name = {
+            ent.name: set(ent.labels or ["Entity"]) | {"Entity"} for ent in entities
+        }
+        filtered: list[ExtractedFact] = []
+        for fact in facts:
+            subj_labels = labels_by_name.get(fact.subject, {"Entity"})
+            obj_labels = labels_by_name.get(fact.object, {"Entity"})
+            allowed: set[str] = set()
+            map_had_match = False
+            for (source_label, target_label), predicates in edge_type_map.items():
+                if source_label in subj_labels and target_label in obj_labels:
+                    map_had_match = True
+                    allowed.update(predicates)
+            if not map_had_match:
+                continue
+            # In Graphiti, an empty predicate list means unrestricted generic
+            # Entity->Entity extraction.
+            if not allowed or fact.predicate in allowed:
+                filtered.append(fact)
+        return filtered
 
     # ------------------------------------------------------------------ internals
     async def _save_episode(self, episode: EpisodicNode) -> None:
@@ -1239,6 +1346,26 @@ class Surriti:
         fact_text = fact.fact or f"{subject.name} {fact.predicate} {obj.name}."
         embedding = await self.embedder.create(fact_text)
 
+        existing = await self._find_equivalent_edge(
+            group_id=group_id,
+            subject_uuid=subject.uuid,
+            object_uuid=obj.uuid,
+            predicate=fact.predicate,
+            fact_text=fact_text,
+        )
+        if existing is not None:
+            if episode and episode.uuid not in existing.episodes:
+                existing.episodes.append(episode.uuid)
+                await self.driver.query(
+                    """
+                    UPDATE relates_to
+                    SET episodes = array::distinct(array::concat(episodes, $episodes))
+                    WHERE uuid = $uuid;
+                    """,
+                    {"uuid": existing.uuid, "episodes": [episode.uuid]},
+                )
+            return existing, []
+
         edge = EntityEdge(
             uuid=str(uuid4()),
             group_id=group_id,
@@ -1293,6 +1420,46 @@ class Surriti:
         )
         return edge, invalidated
 
+    async def _find_equivalent_edge(
+        self,
+        *,
+        group_id: str,
+        subject_uuid: str,
+        object_uuid: str,
+        predicate: str,
+        fact_text: str,
+    ) -> EntityEdge | None:
+        """Find an existing exact edge that should receive another episode support.
+
+        This is the SurrealDB-native approximation of Graphiti's edge
+        resolution pass for repeated facts. Near-duplicate facts still go
+        through contradiction handling so temporal changes are not masked.
+        """
+
+        from surriti.search import _unwrap
+
+        rows = _unwrap(
+            await self.driver.query(
+                """
+                SELECT * FROM relates_to
+                WHERE group_id = $group_id
+                    AND in = type::record("entity", $src)
+                    AND out = type::record("entity", $tgt)
+                    AND name = $name
+                    AND invalid_at IS NONE
+                LIMIT 10;
+                """,
+                {
+                    "group_id": group_id,
+                    "src": subject_uuid,
+                    "tgt": object_uuid,
+                    "name": predicate,
+                },
+            )
+        )
+        exact = next((row for row in rows if row.get("fact") == fact_text), None)
+        return parse_edge(exact) if exact else None
+
     async def _link_mentions(
         self,
         *,
@@ -1335,3 +1502,7 @@ def _parse_iso(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+# Graphiti-compatible class name for consumers migrating imports.
+Graphiti = Surriti

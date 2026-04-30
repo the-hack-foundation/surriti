@@ -223,7 +223,7 @@ async def _apply_reranker(
     if cfg.focal_uuid or cfg.reranker is Reranker.node_distance:
         if not cfg.focal_uuid:
             raise ValueError("Reranker.node_distance requires SearchConfig.focal_uuid")
-        return await _rerank_by_focal_distance(driver, candidates, cfg.focal_uuid)
+        return await _rerank_by_focal_distance(driver, candidates, cfg.focal_uuid, fused)
     if cfg.reranker is Reranker.mmr:
         return mmr_rerank(
             candidates=candidates,
@@ -253,6 +253,7 @@ async def _rerank_by_focal_distance(
     driver: SurrealDriver,
     candidates: list[dict[str, Any]],
     focal_uuid: str,
+    fused: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Order candidates by hop distance from the focal entity (closer first).
 
@@ -282,7 +283,8 @@ async def _rerank_by_focal_distance(
             distances[uuid] = depth
 
     def sort_key(edge: dict[str, Any]) -> tuple[int, float]:
-        return (distances.get(edge["uuid"], 99), -float(edge.get("_score", 0.0)))
+        score = (fused or {}).get(edge["uuid"], edge.get("_score", 0.0))
+        return (distances.get(edge["uuid"], 99), -float(score))
 
     return sorted(candidates, key=sort_key)
 
