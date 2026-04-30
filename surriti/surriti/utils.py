@@ -1,0 +1,113 @@
+"""Internal helpers: record parsing and SurrealDB row normalisation."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from surriti.edges import CommunityEdge, EntityEdge, EpisodicEdge
+from surriti.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
+
+
+def _coerce_dt(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _strip_record_id(value: Any) -> str:
+    """SurrealDB record IDs come back as ``RecordID('table', 'key')`` objects
+    or ``table:key`` strings. We only ever need the key portion when joining
+    against our application-managed ``uuid`` field."""
+
+    if value is None:
+        return ""
+    text = str(value)
+    if ":" in text:
+        return text.split(":", 1)[1].strip("⟨⟩")
+    return text
+
+
+def parse_episode(row: dict[str, Any]) -> EpisodicNode:
+    return EpisodicNode(
+        uuid=row.get("uuid") or _strip_record_id(row.get("id")),
+        group_id=row.get("group_id", ""),
+        name=row.get("name", ""),
+        source=EpisodeType(row.get("source", "message")),
+        source_description=row.get("source_description", ""),
+        content=row.get("content", ""),
+        reference_time=_coerce_dt(row.get("reference_time")) or datetime.utcnow(),
+        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+        entity_edges=list(row.get("entity_edges") or []),
+    )
+
+
+def parse_entity(row: dict[str, Any]) -> EntityNode:
+    return EntityNode(
+        uuid=row.get("uuid") or _strip_record_id(row.get("id")),
+        group_id=row.get("group_id", ""),
+        name=row.get("name", ""),
+        summary=row.get("summary", "") or "",
+        labels=list(row.get("labels") or ["Entity"]),
+        attributes=dict(row.get("attributes") or {}),
+        name_embedding=row.get("name_embedding"),
+        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+    )
+
+
+def parse_edge(row: dict[str, Any]) -> EntityEdge:
+    return EntityEdge(
+        uuid=row.get("uuid") or _strip_record_id(row.get("id")),
+        group_id=row.get("group_id", ""),
+        source_node_uuid=row.get("source_node_uuid")
+        or _strip_record_id(row.get("in")),
+        target_node_uuid=row.get("target_node_uuid")
+        or _strip_record_id(row.get("out")),
+        name=row.get("name", ""),
+        fact=row.get("fact", ""),
+        fact_embedding=row.get("fact_embedding"),
+        episodes=list(row.get("episodes") or []),
+        valid_at=_coerce_dt(row.get("valid_at")),
+        invalid_at=_coerce_dt(row.get("invalid_at")),
+        expired_at=_coerce_dt(row.get("expired_at")),
+        attributes=dict(row.get("attributes") or {}),
+        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+    )
+
+
+def parse_episodic_edge(row: dict[str, Any]) -> EpisodicEdge:
+    return EpisodicEdge(
+        uuid=row.get("uuid") or _strip_record_id(row.get("id")),
+        group_id=row.get("group_id", ""),
+        source_node_uuid=_strip_record_id(row.get("in")),
+        target_node_uuid=_strip_record_id(row.get("out")),
+        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+    )
+
+
+def parse_community_edge(row: dict[str, Any]) -> CommunityEdge:
+    return CommunityEdge(
+        uuid=row.get("uuid") or _strip_record_id(row.get("id")),
+        group_id=row.get("group_id", ""),
+        source_node_uuid=_strip_record_id(row.get("in")),
+        target_node_uuid=_strip_record_id(row.get("out")),
+        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+    )
+
+
+def parse_community(row: dict[str, Any]) -> CommunityNode:
+    return CommunityNode(
+        uuid=row.get("uuid") or _strip_record_id(row.get("id")),
+        group_id=row.get("group_id", ""),
+        name=row.get("name", ""),
+        summary=row.get("summary", "") or "",
+        name_embedding=row.get("name_embedding"),
+        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+    )

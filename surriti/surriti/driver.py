@@ -1,0 +1,145 @@
+"""Thin async wrapper around the SurrealDB Python SDK.
+
+Surriti talks to SurrealDB exclusively through this driver. It exposes a
+small surface (connect/close, query, create/select/relate) so that tests can
+swap in a fake driver and so that callers never need to import the Surreal
+SDK directly.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+from surriti.errors import SurritiConnectionError, SurritiSchemaError
+from surriti.schema import ALL_TABLES, schema_ddl
+
+logger = logging.getLogger(__name__)
+
+
+class SurrealDriver:
+    """Async SurrealDB driver wrapper.
+
+    Parameters
+    ----------
+    url:
+        WebSocket or HTTP endpoint of the SurrealDB server, e.g.
+        ``ws://localhost:8000/rpc``. Use ``mem://`` for an in-process
+        instance (only the surrealdb SDK supports this).
+    namespace, database:
+        Surreal namespace and database to use.
+    username, password:
+        Optional credentials for ``signin``.
+    embedding_dim:
+        Dimensionality used by ``init_schema``.
+    """
+
+    def __init__(
+        self,
+        url: str = "ws://localhost:8000/rpc",
+        namespace: str = "surriti",
+        database: str = "surriti",
+        username: str | None = None,
+        password: str | None = None,
+        embedding_dim: int = 1024,
+    ) -> None:
+        self.url = url
+        self.namespace = namespace
+        self.database = database
+        self.username = username
+        self.password = password
+        self.embedding_dim = embedding_dim
+        self._db: Any | None = None
+
+    # ------------------------------------------------------------------ factory
+    @classmethod
+    def from_env(cls) -> "SurrealDriver":
+        """Build a driver from ``SURRITI_SURREAL_*`` environment variables."""
+
+        return cls(
+            url=os.environ.get("SURRITI_SURREAL_URL", "ws://localhost:8000/rpc"),
+            namespace=os.environ.get("SURRITI_SURREAL_NS", "surriti"),
+            database=os.environ.get("SURRITI_SURREAL_DB", "surriti"),
+            username=os.environ.get("SURRITI_SURREAL_USER"),
+            password=os.environ.get("SURRITI_SURREAL_PASS"),
+            embedding_dim=int(os.environ.get("SURRITI_EMBEDDING_DIM", "1024")),
+        )
+
+    # ---------------------------------------------------------------- lifecycle
+    async def connect(self) -> None:
+        # Imported lazily so the rest of the package is testable without the
+        # surrealdb extra installed.
+        try:
+            from surrealdb import AsyncSurreal  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - import guard
+            raise SurritiConnectionError(
+                "The 'surrealdb' package is required. Install it with `pip install surrealdb`."
+            ) from exc
+
+        try:
+            self._db = AsyncSurreal(self.url)
+            connect_result = self._db.connect()
+            if connect_result is not None:
+                try:
+                    await connect_result
+                except TypeError:
+                    pass
+            if self.username and self.password:
+                await self._db.signin({"username": self.username, "password": self.password})
+            await self._db.use(self.namespace, self.database)
+        except SurritiConnectionError:
+            raise
+        except Exception as exc:
+            raise SurritiConnectionError(
+                f"Could not connect to SurrealDB at {self.url!r}: {exc}"
+            ) from exc
+        logger.debug("Connected to SurrealDB at %s", self.url)
+
+    async def close(self) -> None:
+        if self._db is not None:
+            try:
+                await self._db.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                logger.exception("Error closing SurrealDB connection")
+            self._db = None
+
+    async def __aenter__(self) -> "SurrealDriver":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
+    # ---------------------------------------------------------------- helpers
+    @property
+    def db(self) -> Any:
+        if self._db is None:
+            raise SurritiConnectionError(
+                "SurrealDriver is not connected. Call `await driver.connect()` "
+                "or use it as an async context manager."
+            )
+        return self._db
+
+    async def query(
+        self, surql: str, variables: dict[str, Any] | None = None
+    ) -> list[Any]:
+        """Run a SurrealQL query and return the (last statement's) result."""
+
+        result = await self.db.query(surql, variables or {})
+        return result
+
+    async def init_schema(self) -> None:
+        """Apply the Surriti schema. Idempotent - safe to call repeatedly."""
+
+        try:
+            await self.query(schema_ddl(self.embedding_dim))
+        except Exception as exc:
+            raise SurritiSchemaError(f"Failed to initialise schema: {exc}") from exc
+
+    async def clear(self) -> None:
+        """Delete every record in tables managed by Surriti. Useful for tests."""
+
+        for table in ALL_TABLES:
+            await self.query(f"DELETE {table};")
+

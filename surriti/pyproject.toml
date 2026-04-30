@@ -1,0 +1,90 @@
+[project]
+name = "surriti"
+version = "0.4.0"
+description = "Temporal knowledge-graph memory for AI agents, built on SurrealDB."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Surriti contributors" }]
+keywords = [
+    "ai",
+    "agents",
+    "memory",
+    "knowledge-graph",
+    "temporal",
+    "surrealdb",
+    "rag",
+    "llm",
+    "graphiti",
+    "vector-search",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "surrealdb>=1.0.0",
+    "pydantic>=2.6",
+    "python-dotenv>=1.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.40"]
+anthropic = ["anthropic>=0.39"]
+all = ["openai>=1.40", "anthropic>=0.39"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "build>=1.2",
+    "twine>=5.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/surriti/surriti"
+Repository = "https://github.com/surriti/surriti"
+Documentation = "https://github.com/surriti/surriti#readme"
+Issues = "https://github.com/surriti/surriti/issues"
+Changelog = "https://github.com/surriti/surriti/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["surriti"]
+
+[tool.hatch.build.targets.sdist]
+include = ["surriti", "README.md", "CHANGELOG.md", "LICENSE", "examples"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_unused_ignores = true
+ignore_missing_imports = true

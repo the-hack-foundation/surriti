@@ -1,0 +1,53 @@
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v2.1.4
+    container_name: surriti-surrealdb
+    command: start --user root --pass root --bind 0.0.0.0:8000 memory
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://localhost:8000"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  myapp:
+    build:
+      context: .          # repo root -- so both myapp/ and surriti/ are available
+      dockerfile: myapp/Dockerfile
+    container_name: myapp
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      OLLAMA_URL:   "http://ollama:11434"
+      OLLAMA_MODEL: "qwen3:1.7b"
+      OLLAMA_EXTRACT_MODEL: "qwen2.5:3b"
+      OLLAMA_EMBED_MODEL: "nomic-embed-text"
+      SURRITI_SURREAL_URL:  "ws://surrealdb:8000/rpc"
+      SURRITI_SURREAL_NS:   "myapp"
+      SURRITI_SURREAL_DB:   "myapp"
+      SURRITI_SURREAL_USER: "root"
+      SURRITI_SURREAL_PASS: "root"
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ollama_models:
