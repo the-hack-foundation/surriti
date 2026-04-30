@@ -51,7 +51,7 @@ def test_driver_from_env_uses_defaults(monkeypatch):
     assert d.namespace == "surriti"
     assert d.database == "surriti"
     assert d.username is None and d.password is None
-    assert d.embedding_dim == 1024
+    assert d.embedding_dim == 768
 
 
 def test_driver_from_env_reads_overrides(monkeypatch):

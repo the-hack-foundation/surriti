@@ -8,7 +8,7 @@ Graphiti's data model. Running ``init_schema()`` is idempotent because each
 from __future__ import annotations
 
 
-def schema_ddl(embedding_dim: int = 1024) -> str:
+def schema_ddl(embedding_dim: int = 768) -> str:
     """Return the full DDL block needed to bootstrap a Surriti database.
 
     Parameters
@@ -38,7 +38,7 @@ def schema_ddl(embedding_dim: int = 1024) -> str:
     DEFINE INDEX IF NOT EXISTS episode_uuid_idx     ON episode FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS episode_group_idx    ON episode FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS episode_content_fts  ON episode FIELDS content
-        SEARCH ANALYZER surriti_en BM25 HIGHLIGHTS;
+        FULLTEXT ANALYZER surriti_en BM25 HIGHLIGHTS;
 
     -- Entity ------------------------------------------------------------
     DEFINE TABLE IF NOT EXISTS entity SCHEMAFULL;
@@ -47,14 +47,16 @@ def schema_ddl(embedding_dim: int = 1024) -> str:
     DEFINE FIELD IF NOT EXISTS name           ON entity TYPE string;
     DEFINE FIELD IF NOT EXISTS summary        ON entity TYPE string DEFAULT "";
     DEFINE FIELD IF NOT EXISTS labels         ON entity TYPE array<string> DEFAULT ["Entity"];
-    DEFINE FIELD IF NOT EXISTS attributes     ON entity FLEXIBLE TYPE object DEFAULT {{}};
+    DEFINE FIELD IF NOT EXISTS attributes     ON entity TYPE object FLEXIBLE DEFAULT {{}};
     DEFINE FIELD IF NOT EXISTS name_embedding ON entity TYPE option<array<float>>;
     DEFINE FIELD IF NOT EXISTS created_at     ON entity TYPE datetime;
     DEFINE INDEX IF NOT EXISTS entity_uuid_idx     ON entity FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS entity_group_idx    ON entity FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS entity_name_uniq    ON entity FIELDS group_id, name UNIQUE;
-    DEFINE INDEX IF NOT EXISTS entity_name_fts     ON entity FIELDS name, summary
-        SEARCH ANALYZER surriti_en BM25 HIGHLIGHTS;
+    DEFINE INDEX IF NOT EXISTS entity_name_fts     ON entity FIELDS name
+        FULLTEXT ANALYZER surriti_en BM25 HIGHLIGHTS;
+    DEFINE INDEX IF NOT EXISTS entity_summary_fts  ON entity FIELDS summary
+        FULLTEXT ANALYZER surriti_en BM25 HIGHLIGHTS;
     DEFINE INDEX IF NOT EXISTS entity_name_hnsw    ON entity FIELDS name_embedding
         HNSW DIMENSION {embedding_dim} DIST COSINE TYPE F32;
 
@@ -86,12 +88,12 @@ def schema_ddl(embedding_dim: int = 1024) -> str:
     DEFINE FIELD IF NOT EXISTS valid_at       ON relates_to TYPE option<datetime>;
     DEFINE FIELD IF NOT EXISTS invalid_at     ON relates_to TYPE option<datetime>;
     DEFINE FIELD IF NOT EXISTS expired_at     ON relates_to TYPE option<datetime>;
-    DEFINE FIELD IF NOT EXISTS attributes     ON relates_to FLEXIBLE TYPE object DEFAULT {{}};
+    DEFINE FIELD IF NOT EXISTS attributes     ON relates_to TYPE object FLEXIBLE DEFAULT {{}};
     DEFINE FIELD IF NOT EXISTS created_at     ON relates_to TYPE datetime;
     DEFINE INDEX IF NOT EXISTS relates_to_uuid_idx  ON relates_to FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS relates_to_group_idx ON relates_to FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS relates_to_fact_fts  ON relates_to FIELDS fact
-        SEARCH ANALYZER surriti_en BM25 HIGHLIGHTS;
+        FULLTEXT ANALYZER surriti_en BM25 HIGHLIGHTS;
     DEFINE INDEX IF NOT EXISTS relates_to_fact_hnsw ON relates_to FIELDS fact_embedding
         HNSW DIMENSION {embedding_dim} DIST COSINE TYPE F32;
 

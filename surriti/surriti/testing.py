@@ -22,9 +22,15 @@ class InMemoryDriver:
 
     embedding_dim: int = 64
 
-    def __init__(self, embedding_dim: int = 64) -> None:
+    def __init__(
+        self,
+        embedding_dim: int = 64,
+        *,
+        enforce_entity_name_uniq: bool = False,
+    ) -> None:
         self.embedding_dim = embedding_dim
         self.records: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self.enforce_entity_name_uniq = enforce_entity_name_uniq
 
     async def connect(self) -> None:  # pragma: no cover - no-op
         return None
@@ -41,10 +47,20 @@ class InMemoryDriver:
     async def query(self, surql: str, variables: dict[str, Any] | None = None):
         s = surql.strip()
         v = variables or {}
-        if s.startswith('CREATE type::thing("episode"'):
+        if s.startswith('CREATE type::record("episode"'):
             self._insert("episode", v)
             return [[{"ok": True}]]
-        if s.startswith('CREATE type::thing("entity"'):
+        if s.startswith('CREATE type::record("entity"'):
+            if self.enforce_entity_name_uniq:
+                for r in self.records["entity"]:
+                    if (
+                        r.get("group_id") == v.get("group_id")
+                        and r.get("name") == v.get("name")
+                    ):
+                        raise RuntimeError(
+                            "Database index entity_name_uniq already contains "
+                            f"[{v.get('group_id')!r}, {v.get('name')!r}]"
+                        )
             self._insert("entity", v)
             return [[{"ok": True}]]
         if "RELATE" in s and "->relates_to->" in s:
@@ -62,6 +78,12 @@ class InMemoryDriver:
         if "RELATE" in s and "->mentions->" in s:
             self._insert("mentions", {**v, "in": v["ep"], "out": v["en"]})
             return [[{"ok": True}]]
+        if s.startswith("SELECT * FROM entity WHERE group_id") and "name = $n" in s:
+            rows = [
+                r for r in self.records["entity"]
+                if r.get("group_id") == v.get("g") and r.get("name") == v.get("n")
+            ]
+            return [rows[:1]]
         if s.startswith("SELECT * FROM entity WHERE group_id"):
             names = set(v.get("names") or [])
             rows = [
@@ -93,7 +115,8 @@ class InMemoryDriver:
             rows = [r for r in self.records["episode"] if r.get("group_id") == v.get("g")]
             rows.sort(key=lambda r: r.get("reference_time"), reverse=True)
             return [rows[: v.get("n", 10)]]
-        if s.startswith("SELECT name, content FROM episode WHERE uuid IN"):
+        if s.startswith("SELECT content FROM episode WHERE uuid IN") or \
+                s.startswith("SELECT name, content FROM episode WHERE uuid IN"):
             uuids = set(v.get("u") or [])
             rows = [r for r in self.records["episode"] if r.get("uuid") in uuids]
             return [rows]
@@ -103,6 +126,16 @@ class InMemoryDriver:
                 if r.get("uuid") in uuids:
                     r["invalid_at"] = v.get("invalid_at")
                     r["expired_at"] = v.get("expired_at")
+            return [[{"ok": True}]]
+        if s.startswith('UPDATE type::record("entity"'):
+            for r in self.records["entity"]:
+                if r.get("uuid") == v.get("uuid"):
+                    if "summary" in v:
+                        r["summary"] = v["summary"]
+                    if "labels" in v:
+                        r["labels"] = v["labels"]
+                    if "attributes" in v:
+                        r["attributes"] = v["attributes"]
             return [[{"ok": True}]]
         return [[]]
 

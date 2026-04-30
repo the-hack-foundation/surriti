@@ -239,7 +239,7 @@ def print_header(session_id: str, user_id: str) -> None:
     console.print(Text.assemble(
         ("session  ", "dim"), (session_id, "bright_cyan"), "\n",
         ("user     ", "dim"), (user_id, "bright_cyan"), "\n",
-        ("/quit  /memory  /clear", "dim"),
+        ("/quit  /memory  /clear  /screen", "dim"),
     ))
     console.print()
 
@@ -312,6 +312,25 @@ async def run(http_base: str, ws_base: str, session_id: str, user_id: str) -> No
                 await _show_memory(client, http_base, user_id)
                 continue
             if line == "/clear":
+                # Destructive: wipe the tenant's graph on the server, then
+                # clear the terminal. Use /screen for screen-only clear.
+                try:
+                    resp = await client.delete(f"{http_base}/memory/{user_id}")
+                    if resp.status_code >= 400:
+                        console.print(
+                            f"[red]server refused delete: http {resp.status_code} "
+                            f"{resp.text.strip()}[/]"
+                        )
+                    else:
+                        console.print(
+                            f"[dim]wiped memory for user {user_id!r}[/]"
+                        )
+                except httpx.RequestError as exc:
+                    console.print(f"[red]connection error:[/] {exc}")
+                console.clear()
+                print_header(session_id, user_id)
+                continue
+            if line == "/screen":
                 console.clear()
                 print_header(session_id, user_id)
                 continue

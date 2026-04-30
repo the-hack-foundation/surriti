@@ -462,3 +462,142 @@ async def test_search_recipes_edge_rrf_returns_results(memory):
     res = await memory.search_("Alice", group_id="g_rec", config=recipes.EDGE_HYBRID_SEARCH_RRF)
     assert res.edges
 
+
+
+# ---------------------------------------------------------------- multi-tenant + idempotency
+
+async def test_duplicate_extraction_does_not_crash_against_unique_index(memory):
+    """LLM duplicates the same entity in one extraction; the pipeline must
+    dedupe so the ``entity_name_uniq`` index is not violated."""
+
+    from surriti.llm import (
+        ExtractedEntity,
+        ExtractedFact,
+        ScriptedLLMClient,
+        ScriptedResponse,
+    )
+
+    memory.llm = ScriptedLLMClient([
+        ScriptedResponse(
+            entities=[
+                ExtractedEntity(name="Michael", labels=["Person"]),
+                ExtractedEntity(name="Michael", labels=["Person"]),
+            ],
+            facts=[],
+        )
+    ])
+
+    res = await memory.add_episode(
+        name="dup", episode_body="hello, my name is Michael",
+        source=EpisodeType.message, group_id="dup_tenant",
+    )
+    assert sum(1 for n in res.nodes if n.name == "Michael") == 1
+
+
+async def test_multi_tenant_same_name_isolated(memory):
+    """Same entity name in two different tenants must coexist as distinct rows
+    and never appear in each other's search results."""
+
+    from surriti.llm import (
+        ExtractedEntity,
+        ScriptedLLMClient,
+        ScriptedResponse,
+    )
+
+    memory.llm = ScriptedLLMClient([
+        ScriptedResponse(entities=[ExtractedEntity(name="Michael", labels=["Person"])]),
+        ScriptedResponse(entities=[ExtractedEntity(name="Michael", labels=["Person"])]),
+    ])
+
+    await memory.add_episode(
+        name="a", episode_body="hi from alice",
+        source=EpisodeType.message, group_id="alice-uuid",
+    )
+    await memory.add_episode(
+        name="b", episode_body="hi from bob",
+        source=EpisodeType.message, group_id="bob-uuid",
+    )
+
+    from surriti.search import _unwrap
+
+    rows = _unwrap(await memory.driver.query(
+        "SELECT * FROM entity WHERE name = 'Michael';", {}
+    ))
+    michaels = [r for r in rows if r.get("name") == "Michael"]
+    assert len(michaels) == 2
+    assert {m["group_id"] for m in michaels} == {"alice-uuid", "bob-uuid"}
+
+
+async def test_repeated_add_episode_reuses_entity(memory):
+    """Same tenant ingests the same Michael-bearing episode twice → one entity,
+    two episodes, both linked via mentions edges."""
+
+    from surriti.llm import (
+        ExtractedEntity,
+        ScriptedLLMClient,
+        ScriptedResponse,
+    )
+
+    memory.llm = ScriptedLLMClient([
+        ScriptedResponse(entities=[ExtractedEntity(name="Michael", labels=["Person"])]),
+        ScriptedResponse(entities=[ExtractedEntity(name="Michael", labels=["Person"])]),
+    ])
+
+    await memory.add_episode(
+        name="t1", episode_body="hi I'm Michael",
+        source=EpisodeType.message, group_id="rep",
+    )
+    await memory.add_episode(
+        name="t2", episode_body="hi again, Michael",
+        source=EpisodeType.message, group_id="rep",
+    )
+
+    from surriti.search import _unwrap
+
+    rows = _unwrap(await memory.driver.query(
+        "SELECT * FROM entity WHERE group_id = 'rep' AND name = 'Michael';", {}
+    ))
+    assert len(rows) == 1
+
+
+async def test_upsert_user_creates_and_updates_canonical_user_entity(memory):
+    u1 = await memory.upsert_user(group_id="user-42")
+    u2 = await memory.upsert_user(group_id="user-42", display_name="Michael")
+    u3 = await memory.upsert_user(group_id="user-42", display_name="Michael")
+    assert u1.uuid == u2.uuid == u3.uuid
+    assert "User" in u2.labels
+
+    from surriti.search import _unwrap
+
+    rows = _unwrap(await memory.driver.query(
+        "SELECT * FROM entity WHERE group_id = 'user-42' AND name = 'user-42';", {}
+    ))
+    assert len(rows) == 1
+    assert rows[0]["attributes"].get("display_name") == "Michael"
+
+
+async def test_add_episode_with_speaker_id_creates_user_entity(memory):
+    from surriti.llm import (
+        ExtractedEntity,
+        ScriptedLLMClient,
+        ScriptedResponse,
+    )
+
+    memory.llm = ScriptedLLMClient([
+        ScriptedResponse(entities=[ExtractedEntity(name="Michael", labels=["Person"])]),
+    ])
+
+    await memory.add_episode(
+        name="intro", episode_body="hello, my name is Michael",
+        source=EpisodeType.message, group_id="user-99",
+        speaker_id="user-99", speaker_name="Michael",
+    )
+
+    from surriti.search import _unwrap
+
+    rows = _unwrap(await memory.driver.query(
+        "SELECT * FROM entity WHERE group_id = 'user-99' AND name = 'user-99';", {}
+    ))
+    assert len(rows) == 1
+    assert "User" in rows[0]["labels"]
+    assert rows[0]["attributes"].get("display_name") == "Michael"

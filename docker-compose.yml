@@ -1,42 +1,98 @@
 services:
   surrealdb:
-    image: surrealdb/surrealdb:v2.1.4
+    image: surrealdb/surrealdb:v3.0.5
     container_name: surriti-surrealdb
-    command: start --user root --pass root --bind 0.0.0.0:8000 memory
+    # Run as root so the named volume mounted at /data is writable on a
+    # fresh deploy (the upstream image's default user can't create files
+    # in an empty bind/named-volume mount).
+    user: "root"
+    # `rocksdb` is the on-disk engine. Data lives under /data inside the
+    # container (mapped to the named volume below) so `docker compose down`
+    # no longer wipes the graph. To do a full reset (DB + container):
+    # `docker compose down -v`.
+    command: start --user root --pass root --bind 0.0.0.0:8000 rocksdb:/data/surreal.db
     ports:
       - "8000:8000"
+    volumes:
+      - surrealdb_data:/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://localhost:8000"]
       interval: 2s
       timeout: 2s
       retries: 30
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
+  vllm:
+    image: vllm/vllm-openai:v0.18.0
+    container_name: surriti-vllm
+    ipc: host
+    # Host port 8001 to avoid colliding with surrealdb on 8000.
+    # Inside the docker network myapp reaches vllm at http://vllm:8000.
     ports:
-      - "11434:11434"
+      - "8001:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HF_HOME=/root/.cache/huggingface
+      - VLLM_ENABLE_CUDA_COMPATIBILITY=0
+      - CUDA_MODULE_LOADING=LAZY
+      - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - VLLM_IMAGE_FETCH_TIMEOUT=30
+      - VLLM_VIDEO_FETCH_TIMEOUT=120
     volumes:
-      - ollama_models:/root/.ollama
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command:
+      - "${MODEL_ID:-Qwen/Qwen3.5-4B}"
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --served-model-name
+      - "${MODEL_ID:-Qwen/Qwen3.5-4B}"
+      - --dtype
+      - "float16"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - "hermes"
+      - --load-format
+      - "bitsandbytes"
+      - --quantization
+      - "bitsandbytes"
+      - --model-loader-extra-config
+      - '{"load_in_4bit":true,"bnb_4bit_quant_type":"nf4","bnb_4bit_compute_dtype":"float16","bnb_4bit_use_double_quant":false}'
+      - --max-model-len
+      - "16384"
+      - --gpu-memory-utilization
+      - "0.65"
+      - --enforce-eager
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     healthcheck:
-      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
-      interval: 5s
+      # /v1/models returns 200 once the engine has finished loading.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models > /dev/null || exit 1"]
+      interval: 10s
       timeout: 5s
-      retries: 30
+      retries: 60
+      start_period: 600s
 
   myapp:
     build:
       context: .          # repo root -- so both myapp/ and surriti/ are available
       dockerfile: myapp/Dockerfile
-    container_name: myapp
+    container_name: surriti-myapp
     ports:
       - "3000:3000"
     environment:
       PORT: "3000"
-      OLLAMA_URL:   "http://ollama:11434"
-      OLLAMA_MODEL: "qwen3:1.7b"
-      OLLAMA_EXTRACT_MODEL: "qwen2.5:3b"
-      OLLAMA_EMBED_MODEL: "nomic-embed-text"
+      VLLM_BASE_URL: "http://vllm:8000/v1"
+      VLLM_MODEL:    "${MODEL_ID:-Qwen/Qwen3.5-4B}"
+      EMBED_MODEL:   "nomic-ai/nomic-embed-text-v1.5"
+      EMBED_DIM:     "768"
       SURRITI_SURREAL_URL:  "ws://surrealdb:8000/rpc"
       SURRITI_SURREAL_NS:   "myapp"
       SURRITI_SURREAL_DB:   "myapp"
@@ -45,9 +101,12 @@ services:
     depends_on:
       surrealdb:
         condition: service_healthy
-      ollama:
+      vllm:
         condition: service_healthy
     restart: unless-stopped
 
+
 volumes:
-  ollama_models:
+  # Holds the SurrealDB on-disk store. Survives `docker compose down`;
+  # nuke with `docker compose down -v` for a full reset.
+  surrealdb_data:

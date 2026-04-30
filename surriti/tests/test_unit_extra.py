@@ -264,3 +264,40 @@ async def test_scripted_llm_threads_entity_types():
     client = ScriptedLLMClient([ScriptedResponse()])
     await client.extract("x", entity_types={"Person": object, "Place": object})
     assert sorted(client.extract_calls[0]["entity_types"]) == ["Person", "Place"]
+
+
+# --------------------------------------------------------------- _unwrap shapes
+from surriti.search import _unwrap
+
+
+def test_unwrap_sdk2_flat_list():
+    rows = [{"uuid": "a", "name": "x"}, {"uuid": "b", "name": "y"}]
+    assert _unwrap(rows) == rows
+
+
+def test_unwrap_sdk1_list_of_lists():
+    rows = [[{"uuid": "a"}, {"uuid": "b"}]]
+    assert _unwrap(rows) == [{"uuid": "a"}, {"uuid": "b"}]
+
+
+def test_unwrap_legacy_result_wrapper():
+    rows = [{"result": [{"uuid": "a"}], "status": "OK"}]
+    assert _unwrap(rows) == [{"uuid": "a"}]
+
+
+def test_unwrap_multi_statement_legacy():
+    rows = [
+        {"result": [{"x": 1}], "status": "OK"},
+        {"result": [{"uuid": "z"}], "status": "OK"},
+    ]
+    assert _unwrap(rows) == [{"uuid": "z"}]
+
+
+def test_unwrap_empty_and_none():
+    assert _unwrap(None) == []
+    assert _unwrap([]) == []
+    assert _unwrap([{"result": None}]) == []
+
+
+def test_unwrap_single_dict():
+    assert _unwrap({"uuid": "a"}) == [{"uuid": "a"}]

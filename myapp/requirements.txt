@@ -1,4 +1,5 @@
 fastapi
 uvicorn[standard]
 httpx
-openai
+openai>=1.40
+fastembed>=0.4

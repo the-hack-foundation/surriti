@@ -112,16 +112,32 @@ async def _fulltext_search_edges(
 
 
 def _unwrap(rows: Any) -> list[dict[str, Any]]:
-    """SurrealDB returns either ``[{'result': [...]}]`` or ``[[...]]`` depending
-    on SDK version. Normalise to a flat list of dicts."""
+    """Normalise SurrealDB query results to a flat list of dicts.
 
+    Handles the three shapes returned across SDK versions:
+    - ``[{"result": [...]}, ...]``       (legacy SDK 1.x multi-statement)
+    - ``[[...], ...]``                   (SDK 1.x list-of-lists)
+    - ``[{...}, {...}, ...]`` or ``{...}`` (SDK 2.0 flat result of last stmt)
+    """
+
+    if rows is None:
+        return []
+    if isinstance(rows, dict):
+        if "result" in rows:
+            return list(rows["result"] or [])
+        return [rows]
+    if not isinstance(rows, list):
+        return list(rows)
     if not rows:
         return []
-    first = rows[-1] if isinstance(rows, list) else rows
-    if isinstance(first, dict) and "result" in first:
-        return list(first["result"] or [])
-    if isinstance(first, list):
-        return list(first)
+    # SDK 2.0: flat list of row dicts (no "result" wrapper).
+    if all(isinstance(r, dict) and "result" not in r for r in rows):
+        return list(rows)
+    last = rows[-1]
+    if isinstance(last, dict) and "result" in last:
+        return list(last["result"] or [])
+    if isinstance(last, list):
+        return list(last)
     return list(rows)
 
 

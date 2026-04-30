@@ -42,7 +42,7 @@ class SurrealDriver:
         database: str = "surriti",
         username: str | None = None,
         password: str | None = None,
-        embedding_dim: int = 1024,
+        embedding_dim: int = 768,
     ) -> None:
         self.url = url
         self.namespace = namespace
@@ -63,7 +63,7 @@ class SurrealDriver:
             database=os.environ.get("SURRITI_SURREAL_DB", "surriti"),
             username=os.environ.get("SURRITI_SURREAL_USER"),
             password=os.environ.get("SURRITI_SURREAL_PASS"),
-            embedding_dim=int(os.environ.get("SURRITI_EMBEDDING_DIM", "1024")),
+            embedding_dim=int(os.environ.get("SURRITI_EMBEDDING_DIM", "768")),
         )
 
     # ---------------------------------------------------------------- lifecycle
@@ -79,12 +79,7 @@ class SurrealDriver:
 
         try:
             self._db = AsyncSurreal(self.url)
-            connect_result = self._db.connect()
-            if connect_result is not None:
-                try:
-                    await connect_result
-                except TypeError:
-                    pass
+            await self._db.connect()
             if self.username and self.password:
                 await self._db.signin({"username": self.username, "password": self.password})
             await self._db.use(self.namespace, self.database)
@@ -124,10 +119,44 @@ class SurrealDriver:
     async def query(
         self, surql: str, variables: dict[str, Any] | None = None
     ) -> list[Any]:
-        """Run a SurrealQL query and return the (last statement's) result."""
+        """Run a SurrealQL query and return the (last statement's) result.
 
-        result = await self.db.query(surql, variables or {})
-        return result
+        Transparently reconnects ONCE if the underlying websocket has been
+        torn down (e.g. SurrealDB was restarted while myapp kept running).
+        Recognised stale-connection signatures include "no close frame",
+        "ConnectionClosed", "WebSocket", and "not connected".
+        """
+
+        try:
+            return await self.db.query(surql, variables or {})
+        except SurritiConnectionError:
+            raise
+        except Exception as exc:
+            msg = str(exc).lower()
+            stale = any(
+                tok in msg
+                for tok in (
+                    "no close frame",
+                    "connectionclosed",
+                    "connection closed",
+                    "websocket",
+                    "not connected",
+                    "broken pipe",
+                    "connection reset",
+                )
+            )
+            if not stale:
+                raise
+            logger.warning(
+                "SurrealDB connection appears stale (%s); reconnecting and retrying.",
+                exc,
+            )
+            try:
+                await self.close()
+            except Exception:  # pragma: no cover
+                logger.debug("close() raised during reconnect; ignoring", exc_info=True)
+            await self.connect()
+            return await self.db.query(surql, variables or {})
 
     async def init_schema(self) -> None:
         """Apply the Surriti schema. Idempotent - safe to call repeatedly."""

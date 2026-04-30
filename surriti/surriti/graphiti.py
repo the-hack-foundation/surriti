@@ -121,7 +121,7 @@ class Surriti:
         - ``SURRITI_SURREAL_NS``   (default ``surriti``)
         - ``SURRITI_SURREAL_DB``   (default ``surriti``)
         - ``SURRITI_SURREAL_USER`` / ``SURRITI_SURREAL_PASS``
-        - ``SURRITI_EMBEDDING_DIM`` (default ``1024``)
+        - ``SURRITI_EMBEDDING_DIM`` (default ``768``)
 
         The returned instance is *not* connected. Use it inside
         ``async with`` or call ``await surriti.connect()`` first.
@@ -174,6 +174,8 @@ class Surriti:
         entity_types: dict[str, type] | None = None,
         previous_episode_uuids: list[str] | None = None,
         custom_extraction_instructions: str | None = None,
+        speaker_id: str | None = None,
+        speaker_name: str | None = None,
     ) -> AddEpisodeResults:
         """Process a new episode end-to-end.
 
@@ -208,6 +210,52 @@ class Surriti:
         )
         await self._save_episode(episode)
 
+        # Ensure the speaker has a canonical User entity in this tenant and
+        # tell the extractor to anchor first-person pronouns to it.
+        if speaker_id:
+            await self.upsert_user(
+                group_id=group_id,
+                user_id=speaker_id,
+                display_name=speaker_name,
+            )
+            if speaker_name:
+                speaker_hint = (
+                    f"(Speaker context: \"I\"/\"me\"/\"my\" refer to "
+                    f"\"{speaker_name}\" (stable id \"{speaker_id}\"). "
+                    f"Use \"{speaker_name}\" as the subject for facts "
+                    f"about the speaker. The OBJECT must be the actual "
+                    f"value mentioned in the text -- never the literal "
+                    f"word \"speaker\" or \"{speaker_name}\" again. "
+                    f"Examples: \"I work at Acme\" -> "
+                    f"`{speaker_name} -[works_at]-> Acme`; "
+                    f"\"my birthday is October 14\" -> "
+                    f"`{speaker_name} -[has_birthday]-> October 14`; "
+                    f"\"I am 33 years old\" -> "
+                    f"`{speaker_name} -[is_age]-> 33`. Add the value "
+                    f"(Acme, October 14, 33) to the entities list too.)"
+                )
+            else:
+                speaker_hint = (
+                    f"(Speaker context: \"I\"/\"me\"/\"my\" refer to the "
+                    f"entity with stable id \"{speaker_id}\". Use "
+                    f"\"{speaker_id}\" as the subject for facts about the "
+                    f"speaker. The OBJECT must be the actual value "
+                    f"mentioned in the text -- never the literal word "
+                    f"\"speaker\" or \"{speaker_id}\" again. Examples: "
+                    f"\"my name is Auley\" -> "
+                    f"`{speaker_id} -[is_named]-> Auley`; "
+                    f"\"I am 5 months old\" -> "
+                    f"`{speaker_id} -[is_age]-> 5 months`; "
+                    f"\"I am a baby\" -> `{speaker_id} -[is_a]-> baby`. "
+                    f"Add the value (Auley, 5 months, baby) to the "
+                    f"entities list too.)"
+                )
+            custom_extraction_instructions = (
+                f"{custom_extraction_instructions}\n\n{speaker_hint}"
+                if custom_extraction_instructions
+                else speaker_hint
+            )
+
         # Optionally include previous episode text as extra context.
         context_text = episode_body
         if previous_episode_uuids:
@@ -220,6 +268,11 @@ class Surriti:
             group_id=group_id,
             entity_types=entity_types,
             custom_instructions=custom_extraction_instructions,
+        )
+        logger.debug(
+            "extract -> entities=%r facts=%r",
+            [(e.name, e.labels) for e in extraction.entities],
+            [(f.subject, f.predicate, f.object) for f in extraction.facts],
         )
 
         # Apply entity type label hinting (DummyLLM doesn't, so we do it here too).
@@ -244,14 +297,82 @@ class Surriti:
         entities = await self._upsert_entities(extraction.entities, group_id=group_id)
         name_to_entity = {e.name: e for e in entities}
 
+        # Auto-resolve the speaker so the LLM can use either the stable id
+        # (`default`) or the display name (`Michael`) as a subject without
+        # having to list it in the entities array. Without this, every
+        # `Michael -[works_at]-> Acme` from a turn that didn't echo the
+        # speaker name silently becomes an unresolved-entity drop.
+        if speaker_id and speaker_id not in name_to_entity:
+            speaker_ents = await self._upsert_entities(
+                [ExtractedEntity(name=speaker_id, labels=["User"])],
+                group_id=group_id,
+            )
+            name_to_entity[speaker_id] = speaker_ents[0]
+            if speaker_ents[0].uuid not in {e.uuid for e in entities}:
+                entities.append(speaker_ents[0])
+        if speaker_name and speaker_name not in name_to_entity:
+            speaker_ents = await self._upsert_entities(
+                [ExtractedEntity(name=speaker_name, labels=["Person"])],
+                group_id=group_id,
+            )
+            name_to_entity[speaker_name] = speaker_ents[0]
+            if speaker_ents[0].uuid not in {e.uuid for e in entities}:
+                entities.append(speaker_ents[0])
+
+        # Predicates that *legitimately* connect an entity to itself
+        # (identity/aliasing). Everything else with subject == object is LLM
+        # garbage we drop as defence-in-depth on top of the system prompt.
+        _IDENTITY_PREDICATES = {"is_named", "is_called", "is_self", "is_aka"}
+
         edges: list[EntityEdge] = []
         invalidated_all: list[EntityEdge] = []
         for fact in extraction.facts:
             subject = name_to_entity.get(fact.subject)
             obj = name_to_entity.get(fact.object)
             if subject is None or obj is None:
-                logger.debug("Skipping fact with unresolved entities: %r", fact)
+                logger.debug(
+                    "Skipping fact: unresolved entities subj=%r(found=%s) "
+                    "obj=%r(found=%s) names_known=%r",
+                    fact.subject, subject is not None,
+                    fact.object, obj is not None,
+                    list(name_to_entity.keys()),
+                )
                 continue
+            predicate = (fact.predicate or "").lower()
+            if subject.uuid == obj.uuid:
+                # Speaker-aware repair: small models often emit
+                # "Auley is_named Auley" when the speaker's stable id is
+                # "default". Rewrite the subject to the speaker's id so
+                # the naming edge connects two distinct entities.
+                if (
+                    speaker_id
+                    and predicate in _IDENTITY_PREDICATES
+                    and fact.subject != speaker_id
+                    and speaker_id != fact.object
+                ):
+                    speaker_ents = await self._upsert_entities(
+                        [ExtractedEntity(name=speaker_id, labels=["User"])],
+                        group_id=group_id,
+                    )
+                    subject = speaker_ents[0]
+                    name_to_entity[speaker_id] = subject
+                    if subject.uuid not in {e.uuid for e in entities}:
+                        entities.append(subject)
+                    logger.debug(
+                        "Rewrote self-loop identity fact subject %r -> %r",
+                        fact.subject, speaker_id,
+                    )
+                elif predicate in _IDENTITY_PREDICATES and not speaker_id:
+                    # Identity predicate but no speaker context to repair
+                    # with -- keep the self-loop as a fallback so we don't
+                    # lose the naming entirely.
+                    pass
+                else:
+                    logger.debug(
+                        "Skipping self-loop fact %r -[%s]-> %r",
+                        fact.subject, fact.predicate, fact.object,
+                    )
+                    continue
             edge, invalidated = await self._add_fact_edge(
                 fact=fact,
                 subject=subject,
@@ -454,7 +575,7 @@ class Surriti:
                 {"u": shared_uuids, "ep": episode_uuid},
             )
         await self.driver.query(
-            "DELETE mentions WHERE in = type::thing('episode', $ep);",
+            "DELETE mentions WHERE in = type::record('episode', $ep);",
             {"ep": episode_uuid},
         )
         await self.driver.query(
@@ -474,9 +595,9 @@ class Surriti:
 
         await self.driver.query(
             """
-            DELETE relates_to WHERE in = type::thing('entity', $u) OR out = type::thing('entity', $u);
-            DELETE mentions WHERE out = type::thing('entity', $u);
-            DELETE has_member WHERE out = type::thing('entity', $u);
+            DELETE relates_to WHERE in = type::record('entity', $u) OR out = type::record('entity', $u);
+            DELETE mentions WHERE out = type::record('entity', $u);
+            DELETE has_member WHERE out = type::record('entity', $u);
             DELETE entity WHERE uuid = $u;
             """,
             {"u": entity_uuid},
@@ -566,7 +687,7 @@ class Surriti:
             )
             await self.driver.query(
                 """
-                CREATE type::thing("community", $uuid) CONTENT {
+                CREATE type::record("community", $uuid) CONTENT {
                     uuid: $uuid, group_id: $group_id, name: $name,
                     summary: $summary, name_embedding: $emb, created_at: $created_at
                 };
@@ -589,7 +710,7 @@ class Surriti:
                 )
                 await self.driver.query(
                     """
-                    RELATE (type::thing("community", $c))->has_member->(type::thing("entity", $e))
+                    RELATE (type::record("community", $c))->has_member->(type::record("entity", $e))
                     CONTENT { uuid: $uuid, group_id: $group_id, created_at: $created_at };
                     """,
                     {
@@ -805,7 +926,7 @@ class Surriti:
             node.name_embedding = await self.embedder.create(node.name)
         await self.driver.query(
             """
-            UPSERT type::thing("entity", $uuid) MERGE {
+            UPSERT type::record("entity", $uuid) MERGE {
                 uuid: $uuid, group_id: $group_id, name: $name,
                 summary: $summary, labels: $labels, attributes: $attributes,
                 name_embedding: $emb, created_at: $created_at
@@ -864,17 +985,22 @@ class Surriti:
             return ""
         rows = _unwrap(
             await self.driver.query(
-                "SELECT name, content FROM episode WHERE uuid IN $u;",
+                "SELECT content FROM episode WHERE uuid IN $u;",
                 {"u": episode_uuids},
             )
         )
-        return "\n".join(f"[{r.get('name','')}] {r.get('content','')}" for r in rows)
+        # NOTE: never include the episode `name` -- it's internal metadata
+        # (e.g. "chat", "turn-a") and small models will treat it as an
+        # entity. Join contents only.
+        return "\n---\n".join(
+            (r.get("content") or "").strip() for r in rows if r.get("content")
+        )
 
     # ------------------------------------------------------------------ internals
     async def _save_episode(self, episode: EpisodicNode) -> None:
         await self.driver.query(
             """
-            CREATE type::thing("episode", $uuid) CONTENT {
+            CREATE type::record("episode", $uuid) CONTENT {
                 uuid: $uuid,
                 group_id: $group_id,
                 name: $name,
@@ -898,24 +1024,149 @@ class Surriti:
             },
         )
 
+    async def upsert_user(
+        self,
+        *,
+        group_id: str,
+        user_id: str | None = None,
+        display_name: str | None = None,
+        summary: str = "",
+    ) -> EntityNode:
+        """UPSERT the canonical ``User`` entity for a tenant.
+
+        ``group_id`` is the multi-tenant boundary; ``user_id`` is the stable
+        identifier used as the entity's ``name`` (defaults to ``group_id``,
+        which is the common case where each tenant *is* one user). The
+        friendly name lives in ``attributes.display_name`` so it doesn't
+        pollute the ``(group_id, name)`` unique index. Idempotent: repeated
+        calls update ``display_name`` / ``summary`` and return the existing
+        node.
+        """
+
+        uid = user_id or group_id
+        if not uid:
+            raise ValueError("upsert_user requires a non-empty user_id or group_id")
+
+        from surriti.search import _unwrap
+
+        rows = _unwrap(await self.driver.query(
+            "SELECT * FROM entity WHERE group_id = $g AND name = $n LIMIT 1;",
+            {"g": group_id, "n": uid},
+        ))
+        if rows:
+            existing = parse_entity(rows[0])
+            attrs = dict(existing.attributes or {})
+            changed = False
+            if display_name is not None and attrs.get("display_name") != display_name:
+                attrs["display_name"] = display_name
+                changed = True
+            new_summary = summary or existing.summary
+            new_labels = sorted(set((existing.labels or []) + ["User"]))
+            if new_labels != (existing.labels or []):
+                changed = True
+            if changed or new_summary != existing.summary:
+                await self.driver.query(
+                    """
+                    UPDATE type::record("entity", $uuid) SET
+                        summary = $summary,
+                        labels = $labels,
+                        attributes = $attributes;
+                    """,
+                    {
+                        "uuid": existing.uuid,
+                        "summary": new_summary,
+                        "labels": new_labels,
+                        "attributes": attrs,
+                    },
+                )
+                existing.attributes = attrs
+                existing.summary = new_summary
+                existing.labels = new_labels
+            return existing
+
+        embedding = await self.embedder.create(uid)
+        node = EntityNode(
+            name=uid,
+            summary=summary,
+            labels=["User"],
+            name_embedding=embedding,
+            group_id=group_id,
+            attributes={"display_name": display_name} if display_name else {},
+        )
+        try:
+            await self.driver.query(
+                """
+                CREATE type::record("entity", $uuid) CONTENT {
+                    uuid: $uuid,
+                    group_id: $group_id,
+                    name: $name,
+                    summary: $summary,
+                    labels: $labels,
+                    attributes: $attributes,
+                    name_embedding: $emb,
+                    created_at: $created_at
+                };
+                """,
+                {
+                    "uuid": node.uuid,
+                    "group_id": node.group_id,
+                    "name": node.name,
+                    "summary": node.summary,
+                    "labels": node.labels,
+                    "attributes": node.attributes,
+                    "emb": node.name_embedding,
+                    "created_at": node.created_at,
+                },
+            )
+            return node
+        except Exception as exc:
+            if "entity_name_uniq" not in str(exc):
+                raise
+            # Race: another caller created the User concurrently.
+            fallback = _unwrap(await self.driver.query(
+                "SELECT * FROM entity WHERE group_id = $g AND name = $n LIMIT 1;",
+                {"g": group_id, "n": uid},
+            ))
+            if not fallback:
+                raise
+            return parse_entity(fallback[0])
+
     async def _upsert_entities(
         self, extracted: list[ExtractedEntity], *, group_id: str
     ) -> list[EntityNode]:
-        """Insert new entities; reuse existing ones by (group_id, name)."""
+        """Insert new entities; reuse existing ones by ``(group_id, name)``.
+
+        Idempotent under any input duplication and tolerant to a race against
+        the ``entity_name_uniq`` index: if a CREATE collides we re-SELECT
+        and reuse the now-existing row instead of bubbling the error up.
+        Tenant isolation is enforced by ``entity_name_uniq`` on
+        ``(group_id, name)`` — entities with the same name in different
+        ``group_id``s are deliberately distinct nodes.
+        """
 
         if not extracted:
             return []
-        names = [e.name for e in extracted]
-        rows = await self.driver.query(
-            "SELECT * FROM entity WHERE group_id = $g AND name IN $names;",
-            {"g": group_id, "names": names},
-        )
+
+        # 1. Dedupe input by name (preserve first occurrence) so the LLM
+        #    emitting "Michael" twice in one extraction doesn't trip the
+        #    unique index on the second CREATE.
+        seen: dict[str, ExtractedEntity] = {}
+        for ext in extracted:
+            if ext.name and ext.name not in seen:
+                seen[ext.name] = ext
+        deduped = list(seen.values())
+
         from surriti.search import _unwrap
 
-        existing = {r["name"]: parse_entity(r) for r in _unwrap(rows)}
+        # 2. Bulk lookup of every existing entity in this tenant.
+        rows = _unwrap(await self.driver.query(
+            "SELECT * FROM entity WHERE group_id = $g AND name IN $names;",
+            {"g": group_id, "names": [e.name for e in deduped]},
+        ))
+        existing: dict[str, EntityNode] = {r["name"]: parse_entity(r) for r in rows}
 
         results: list[EntityNode] = []
-        for ext in extracted:
+        for ext in deduped:
             if ext.name in existing:
                 results.append(existing[ext.name])
                 continue
@@ -927,30 +1178,49 @@ class Surriti:
                 name_embedding=embedding,
                 group_id=group_id,
             )
-            await self.driver.query(
-                """
-                CREATE type::thing("entity", $uuid) CONTENT {
-                    uuid: $uuid,
-                    group_id: $group_id,
-                    name: $name,
-                    summary: $summary,
-                    labels: $labels,
-                    attributes: {},
-                    name_embedding: $emb,
-                    created_at: $created_at
-                };
-                """,
-                {
-                    "uuid": node.uuid,
-                    "group_id": node.group_id,
-                    "name": node.name,
-                    "summary": node.summary,
-                    "labels": node.labels,
-                    "emb": node.name_embedding,
-                    "created_at": node.created_at,
-                },
-            )
-            results.append(node)
+            try:
+                await self.driver.query(
+                    """
+                    CREATE type::record("entity", $uuid) CONTENT {
+                        uuid: $uuid,
+                        group_id: $group_id,
+                        name: $name,
+                        summary: $summary,
+                        labels: $labels,
+                        attributes: {},
+                        name_embedding: $emb,
+                        created_at: $created_at
+                    };
+                    """,
+                    {
+                        "uuid": node.uuid,
+                        "group_id": node.group_id,
+                        "name": node.name,
+                        "summary": node.summary,
+                        "labels": node.labels,
+                        "emb": node.name_embedding,
+                        "created_at": node.created_at,
+                    },
+                )
+                results.append(node)
+            except Exception as exc:
+                # Race against entity_name_uniq: a concurrent ingest (or a
+                # duplicate that slipped past dedupe) created
+                # (group_id, name) between our SELECT and CREATE. Re-fetch
+                # the existing row and reuse it.
+                if "entity_name_uniq" not in str(exc):
+                    raise
+                logger.debug(
+                    "entity_name_uniq race for (%s, %s); reusing existing.",
+                    group_id, ext.name,
+                )
+                fallback = _unwrap(await self.driver.query(
+                    "SELECT * FROM entity WHERE group_id = $g AND name = $n LIMIT 1;",
+                    {"g": group_id, "n": ext.name},
+                ))
+                if not fallback:
+                    raise
+                results.append(parse_entity(fallback[0]))
         return results
 
     async def _add_fact_edge(
@@ -993,7 +1263,7 @@ class Surriti:
 
         await self.driver.query(
             """
-            RELATE (type::thing("entity", $src))->relates_to->(type::thing("entity", $tgt))
+            RELATE (type::record("entity", $src))->relates_to->(type::record("entity", $tgt))
             CONTENT {
                 uuid: $uuid,
                 group_id: $group_id,
@@ -1039,7 +1309,7 @@ class Surriti:
             )
             await self.driver.query(
                 """
-                RELATE (type::thing("episode", $ep))->mentions->(type::thing("entity", $en))
+                RELATE (type::record("episode", $ep))->mentions->(type::record("entity", $en))
                 CONTENT {
                     uuid: $uuid,
                     group_id: $group_id,

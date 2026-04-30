@@ -43,33 +43,77 @@ JSON with two arrays:
 
 {
   "entities": [
-    {"name": "Alice",       "labels": ["Person"],       "summary": "..."},
-    {"name": "Acme Corp",   "labels": ["Organization"], "summary": "..."}
+    {"name": "<a real name from the input>", "labels": ["Person"], "summary": "..."}
   ],
   "facts": [
-    {"subject": "Alice", "predicate": "works_at",
-     "object":  "Acme Corp",
-     "fact":    "Alice works at Acme Corp.",
-     "valid_at": "2026-01-01T00:00:00Z"}
+    {"subject": "<entity name>", "predicate": "snake_case_verb",
+     "object":  "<entity name>",
+     "fact":    "A complete natural-language sentence."}
   ]
 }
 
-Rules:
+WHAT COUNTS AS A FACT (extract these):
+- Self-introductions: "my name is X" / "I'm X" / "call me X" -> a fact
+  using the speaker as subject and predicate `is_named`.
+- Properties of the speaker: "I am 5 months old" -> `is_age`;
+  "I am a baby" -> `is_a`; "I work at Acme" -> `works_at`;
+  "I live in Berlin" -> `lives_in`; "I like pizza" -> `likes`;
+  "I am learning to crawl" -> `is_learning`;
+  "my birthday is October 14" -> `has_birthday`;
+  "I will be 33" -> `is_age`.
+- Properties of other named entities: "Alice works at Acme" -> a fact.
+- Compound sentences: "my name is Auley and I am 5 months old" -> TWO
+  facts (one `is_named`, one `is_age`).
+- VALUES become entities too: dates ("October 14"), ages ("33"),
+  places ("Berlin"), companies ("Acme") must appear in the `entities`
+  array AND be used as the `object` of the fact. NEVER use a literal
+  placeholder like "speaker" or "value" as subject or object.
+- When in doubt, extract.
+
+WHAT TO SKIP (return no fact for these, but mention any named entities):
+- Pure interjections with no claim: "hi", "thanks", "ok", "lol", "hmm".
+- Pure questions: "where do I work?", "what's my name?".
+
+HARD RULES (violations make the output unusable):
+- NEVER invent entities, predicates, or relations not supported by the
+  input. Do NOT use placeholder names like Alice, Bob, Acme, Foo, Bar
+  unless they appear in the text.
+- NEVER emit a self-loop fact (subject == object). "Michael knows
+  Michael" is FORBIDDEN. For naming, the subject is the SPEAKER (see the
+  speaker context appended below) and the object is the new name --
+  they are different entities.
+- Tokens that look like internal metadata -- bracketed labels (`[chat]`,
+  `[turn-a]`), bare UUIDs -- are NOT entities. Ignore them entirely.
 - Use the EXACT entity name strings inside facts (subject/object).
-- Predicates are snake_case verbs (e.g. works_at, lives_in, knows).
+- Predicates are snake_case verbs (is_named, is_a, is_age, works_at,
+  lives_in, likes, knows, is_brother_of, ...). Avoid `related_to`.
 - Each fact's `fact` is a complete natural-language sentence.
-- Omit fields you cannot determine. Never invent a `valid_at`.
 - Return ONLY the JSON object, no commentary, no markdown fences.
 """
 
 
 CONTRADICTION_SYSTEM = """\
-You decide which prior facts are invalidated by a new fact about the same \
-entities. Return STRICT JSON: {"invalidated_indexes": [<int>, ...]}.
+You decide which prior facts are invalidated by a new fact. Return STRICT \
+JSON: {"invalidated_indexes": [<int>, ...]}.
 
-A prior fact is invalidated if the new fact materially contradicts it
-(e.g. "X works at A" then "X no longer works at A" or "X moved to B").
-Return an empty list if nothing is contradicted.
+A prior fact is invalidated ONLY when ALL of these are true:
+1. It has the SAME subject as the new fact.
+2. It is in the SAME relation domain as the new fact (employment vs
+   employment, residence vs residence, naming vs naming, preference vs
+   preference). Different domains never contradict each other.
+3. The new fact materially supersedes it (e.g. "X works at A" then
+   "X now works at B" or "X no longer works at A"; "X lives in P" then
+   "X moved to Q").
+
+Examples that are NOT contradictions (return `[]`):
+- new: `Michael is_brother_of Michael`, prior: `Michael works_with Mark`
+  (different domains: family vs employment).
+- new: `Alice likes pizza`, prior: `Alice lives_in Berlin`
+  (different domains).
+- new: `Bob is_named Robert`, prior: `Bob works_at Acme`
+  (different domains).
+
+When in doubt, return an empty list.
 """
 
 
@@ -194,9 +238,11 @@ class OpenAILLMClient(LLMClient):
         api_key: str | None = None,
         temperature: float = 0.0,
         client: Any | None = None,
+        extra_body: dict | None = None,
     ) -> None:
         self.model = model
         self.temperature = temperature
+        self.extra_body = extra_body
         if client is not None:
             self._client = client
             return
@@ -215,7 +261,7 @@ class OpenAILLMClient(LLMClient):
 
     async def _complete(self, system: str, user: str) -> str:
         try:
-            resp = await self._client.chat.completions.create(
+            kwargs: dict = dict(
                 model=self.model,
                 temperature=self.temperature,
                 response_format={"type": "json_object"},
@@ -224,6 +270,9 @@ class OpenAILLMClient(LLMClient):
                     {"role": "user", "content": user},
                 ],
             )
+            if self.extra_body:
+                kwargs["extra_body"] = self.extra_body
+            resp = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:
             raise SurritiLLMError(f"OpenAI API call failed: {exc}") from exc
         return (resp.choices[0].message.content or "").strip()
