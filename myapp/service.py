@@ -385,6 +385,7 @@ async def _run_turn(req: SendRequest) -> None:
 
     try:
         recalled_facts: list[str] = []
+        recalled_nodes: list[dict] = []
 
         # ---- 1. Recall ------------------------------------------------------
         if _memory is not None:
@@ -397,7 +398,10 @@ async def _run_turn(req: SendRequest) -> None:
                 edges_view = [_edge_view(e, names, results.scores.get(e.uuid))
                               for e in results.edges[:8]]
                 nodes_view = [_node_view(n) for n in results.nodes[:8]]
-                recalled_facts = [e["fact"] for e in edges_view if e["fact"]]
+                # Only include facts that are still currently valid.
+                recalled_facts = [e["fact"] for e in edges_view
+                                  if e["fact"] and not e.get("invalid_at")]
+                recalled_nodes = nodes_view
                 await emit({
                     "type":  "memory_recall",
                     "query": req.content,
@@ -413,11 +417,31 @@ async def _run_turn(req: SendRequest) -> None:
 
         # ---- 2. Build prompt ------------------------------------------------
         messages: list[dict] = []
+        sys_parts: list[str] = [
+            "You are a helpful assistant with persistent memory about the "
+            f"user (user_id={req.user_id}). The MEMORY section below was "
+            "retrieved from your own knowledge graph for this user and is "
+            "authoritative. Treat it as facts you already know. NEVER say "
+            "things like 'I don't have access to personal information' or "
+            "'I'm just an AI' when the answer is present in MEMORY -- "
+            "instead, answer directly using the memory. If MEMORY is empty "
+            "or doesn't cover the question, say so plainly and ask a brief "
+            "follow-up."
+        ]
+        if recalled_nodes:
+            ent_lines = [
+                f"- {n['name']}" + (f" ({', '.join(n['labels'])})"
+                                    if n.get('labels') else "")
+                for n in recalled_nodes
+            ]
+            sys_parts.append("MEMORY entities:\n" + "\n".join(ent_lines))
         if recalled_facts:
-            ctx = "Relevant context from memory:\n" + "\n".join(
+            sys_parts.append("MEMORY facts:\n" + "\n".join(
                 f"- {f}" for f in recalled_facts
-            )
-            messages.append({"role": "system", "content": ctx})
+            ))
+        if not recalled_facts and not recalled_nodes:
+            sys_parts.append("MEMORY: (empty)")
+        messages.append({"role": "system", "content": "\n\n".join(sys_parts)})
         messages.append({"role": "user", "content": req.content})
 
         # ---- 3. Stream LLM tokens ------------------------------------------
