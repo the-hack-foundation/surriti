@@ -88,7 +88,8 @@ class InMemoryDriver:
             names = set(v.get("names") or [])
             rows = [
                 r for r in self.records["entity"]
-                if r.get("group_id") == v.get("g") and r.get("name") in names
+                if r.get("group_id") == v.get("g")
+                and (not names or r.get("name") in names)
             ]
             return [rows]
         if "FROM relates_to" in s and "AND in = type::record" in s and "AND out = type::record" in s:
@@ -228,6 +229,25 @@ class InMemoryDriver:
                         if episode_uuid not in merged:
                             merged.append(episode_uuid)
                     r["episodes"] = merged
+            return [[{"ok": True}]]
+        if s.startswith("UPDATE relates_to") and "record::id(in) IN $aliases" in s:
+            aliases = set(v.get("aliases") or [])
+            for r in self.records["relates_to"]:
+                if r.get("group_id") != v.get("group_id"):
+                    continue
+                if r.get("source_node_uuid") in aliases or r.get("in") in aliases:
+                    r["in"] = v.get("canonical")
+                    r["source_node_uuid"] = v.get("canonical")
+                if r.get("target_node_uuid") in aliases or r.get("out") in aliases:
+                    r["out"] = v.get("canonical")
+                    r["target_node_uuid"] = v.get("canonical")
+            for r in self.records["mentions"]:
+                if r.get("group_id") == v.get("group_id") and r.get("out") in aliases:
+                    r["out"] = v.get("canonical")
+            self.records["entity"] = [
+                r for r in self.records["entity"]
+                if not (r.get("group_id") == v.get("group_id") and r.get("uuid") in aliases)
+            ]
             return [[{"ok": True}]]
         if s.startswith("UPDATE relates_to") and "conflict_group_id = $cg" in s:
             uuids = set(v.get("uuids") or [])

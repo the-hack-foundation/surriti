@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 from surriti.edges import CommunityEdge, EntityEdge, EpisodicEdge
 from surriti.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
@@ -43,8 +47,8 @@ def parse_episode(row: dict[str, Any]) -> EpisodicNode:
         source=EpisodeType(row.get("source", "message")),
         source_description=row.get("source_description", ""),
         content=row.get("content", ""),
-        reference_time=_coerce_dt(row.get("reference_time")) or datetime.utcnow(),
-        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+        reference_time=_coerce_dt(row.get("reference_time")) or _utcnow(),
+        created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
         entity_edges=list(row.get("entity_edges") or []),
     )
 
@@ -58,7 +62,7 @@ def parse_entity(row: dict[str, Any]) -> EntityNode:
         labels=list(row.get("labels") or ["Entity"]),
         attributes=dict(row.get("attributes") or {}),
         name_embedding=row.get("name_embedding"),
-        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+        created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
     )
 
 
@@ -95,7 +99,7 @@ def parse_edge(row: dict[str, Any]) -> EntityEdge:
         derived=bool(row.get("derived") or False),
         derived_from=row.get("derived_from"),
         attributes=dict(row.get("attributes") or {}),
-        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+        created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
     )
 
 
@@ -105,7 +109,7 @@ def parse_episodic_edge(row: dict[str, Any]) -> EpisodicEdge:
         group_id=row.get("group_id", ""),
         source_node_uuid=_strip_record_id(row.get("in")),
         target_node_uuid=_strip_record_id(row.get("out")),
-        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+        created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
     )
 
 
@@ -115,7 +119,7 @@ def parse_community_edge(row: dict[str, Any]) -> CommunityEdge:
         group_id=row.get("group_id", ""),
         source_node_uuid=_strip_record_id(row.get("in")),
         target_node_uuid=_strip_record_id(row.get("out")),
-        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+        created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
     )
 
 
@@ -126,5 +130,5 @@ def parse_community(row: dict[str, Any]) -> CommunityNode:
         name=row.get("name", ""),
         summary=row.get("summary", "") or "",
         name_embedding=row.get("name_embedding"),
-        created_at=_coerce_dt(row.get("created_at")) or datetime.utcnow(),
+        created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
     )

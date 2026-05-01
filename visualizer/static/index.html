@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -9,45 +9,125 @@
   <body>
     <div class="app-shell">
       <aside class="sidebar" aria-label="Graph controls">
-        <div class="brand">
+        <header class="brand">
           <div class="mark">S</div>
-          <div>
+          <div class="brand-text">
             <h1>Surriti Graph</h1>
             <p>SurrealDB knowledge map</p>
           </div>
-        </div>
+          <div class="brand-actions">
+            <button id="themeBtn" type="button" title="Toggle theme (T)" aria-label="Toggle theme">◐</button>
+            <button id="exportBtn" type="button" title="Export (E)" aria-label="Export">↓</button>
+          </div>
+        </header>
+
+        <fieldset class="view-toggle lens-toggle" aria-label="Graph lens">
+          <label><input type="radio" name="view" value="truth" checked> Truth</label>
+          <label><input type="radio" name="view" value="raw"> Raw</label>
+          <label><input type="radio" name="view" value="provenance"> Provenance</label>
+          <label><input type="radio" name="view" value="conflicts"> Conflicts</label>
+          <label><input type="radio" name="view" value="timeline"> Timeline</label>
+          <label><input type="radio" name="view" value="frames"> Frames</label>
+        </fieldset>
 
         <label class="field">
           <span>Group</span>
-          <input id="groupInput" type="text" placeholder="all groups">
+          <input id="groupInput" type="text" placeholder="all groups" list="groupList">
+          <datalist id="groupList"></datalist>
         </label>
 
         <label class="field">
-          <span>Search</span>
+          <span>Search <kbd>/</kbd></span>
           <input id="searchInput" type="search" placeholder="entity, fact, edge">
         </label>
 
-        <div class="toggles" aria-label="Node filters">
-          <label><input class="kindToggle" type="checkbox" value="entity" checked> Entities</label>
-          <label><input class="kindToggle" type="checkbox" value="episode" checked> Episodes</label>
-          <label><input class="kindToggle" type="checkbox" value="community" checked> Communities</label>
-          <label><input id="invalidToggle" type="checkbox" checked> Invalidated facts</label>
-          <label><input id="aggregateToggle" type="checkbox" checked> Aggregate mentions</label>
-        </div>
+        <details class="filter-group" open>
+          <summary>Node kinds</summary>
+          <div class="checks">
+            <label><input class="kindToggle" type="checkbox" value="entity" checked> Entities</label>
+            <label><input class="kindToggle" type="checkbox" value="episode" checked> Episodes</label>
+            <label><input class="kindToggle" type="checkbox" value="community" checked> Communities</label>
+          </div>
+        </details>
 
-        <div class="toolbar">
-          <button id="refreshBtn" type="button">Refresh</button>
-          <button id="fitBtn" type="button">Fit</button>
-          <button id="freezeBtn" type="button">Freeze</button>
-        </div>
+        <details class="filter-group" open>
+          <summary>Edges</summary>
+          <div class="checks">
+            <label class="field compact">
+              <span>Edge visibility</span>
+              <select id="edgeVisibility">
+                <option value="active" selected>Active facts only</option>
+                <option value="all">All edges</option>
+                <option value="invalidated">Invalidated only</option>
+                <option value="conflicts">Conflicts only</option>
+                <option value="derived">Derived only</option>
+                <option value="non_derived">Non-derived only</option>
+              </select>
+            </label>
+            <label><input id="aggregateToggle" type="checkbox" checked> Aggregate mentions</label>
+          </div>
+        </details>
+
+        <details class="filter-group" open>
+          <summary>Status</summary>
+          <label class="field filter-field">
+            <span>Status preset</span>
+            <select id="statusPreset">
+              <option value="current" selected>Current</option>
+              <option value="historical">Historical</option>
+              <option value="unresolved">Unresolved</option>
+              <option value="all">All</option>
+            </select>
+          </label>
+        </details>
+
+        <details class="filter-group">
+          <summary>Source type</summary>
+          <div class="checks">
+            <label><input class="sourceToggle" type="checkbox" value="user" checked> user</label>
+            <label><input class="sourceToggle" type="checkbox" value="assistant" checked> assistant</label>
+            <label><input class="sourceToggle" type="checkbox" value="tool" checked> tool</label>
+            <label><input class="sourceToggle" type="checkbox" value="system" checked> system</label>
+          </div>
+        </details>
+
+        <details class="filter-group">
+          <summary>Frame</summary>
+          <div class="checks">
+            <input id="frameSearch" type="search" placeholder="filter frames">
+            <div id="frameList" class="checks scroll"></div>
+          </div>
+        </details>
+
+        <details class="filter-group">
+          <summary>Confidence</summary>
+          <div class="range-row">
+            <input id="minConfidence" type="range" min="0" max="100" value="0">
+            <span id="minConfidenceLabel" class="muted">≥ 0.00</span>
+          </div>
+        </details>
+
+        <details class="filter-group">
+          <summary>Validity range</summary>
+          <label class="field"><span>Valid after</span>
+            <input id="validAfter" type="datetime-local"></label>
+          <label class="field"><span>Valid before</span>
+            <input id="validBefore" type="datetime-local"></label>
+        </details>
 
         <section class="timeline" aria-label="Temporal playback">
           <div class="timeline-head">
-            <label><input id="asOfToggle" type="checkbox"> As-of mode</label>
+            <label><input id="asOfToggle" type="checkbox"> As-of</label>
             <span id="asOfLabel" class="muted">live</span>
           </div>
           <input id="asOfSlider" type="range" min="0" max="100" value="100" disabled>
         </section>
+
+        <div class="toolbar">
+          <button id="refreshBtn" type="button" title="Refresh (R)">Refresh</button>
+          <button id="fitBtn" type="button" title="Fit to view (F)">Fit</button>
+          <button id="freezeBtn" type="button" title="Freeze layout (Space)">Freeze</button>
+        </div>
 
         <section class="metrics" aria-label="Graph metrics">
           <div><span id="nodeCount">0</span><small>nodes</small></div>
@@ -62,6 +142,8 @@
           <div><i class="line relates"></i>Fact</div>
           <div><i class="line mentions"></i>Mention</div>
           <div><i class="line invalid"></i>Invalidated</div>
+          <div><i class="line conflict"></i>Needs resolution</div>
+          <div><i class="line derived"></i>Derived</div>
         </section>
       </aside>
 
@@ -71,14 +153,59 @@
       </main>
 
       <aside class="inspector" aria-label="Selection details">
-        <div class="inspector-head">
-          <span id="selectionKind">Nothing selected</span>
-          <button id="clearBtn" type="button">Clear</button>
-        </div>
-        <div id="details" class="details">
-          <p class="empty">Select a node or relationship to inspect its facts, timestamps, attributes, and neighbors.</p>
-        </div>
+        <nav class="tabs" role="tablist">
+          <button class="tab active" data-tab="inspector" role="tab" aria-selected="true">Inspector</button>
+          <button class="tab" data-tab="conflicts" role="tab" aria-selected="false">Conflicts <span id="conflictBadge" class="tab-badge hidden">0</span></button>
+          <button class="tab" data-tab="timeline" role="tab" aria-selected="false">Timeline</button>
+          <button class="tab" data-tab="aliases" role="tab" aria-selected="false">Aliases <span id="aliasBadge" class="tab-badge hidden">0</span></button>
+          <button class="tab" data-tab="frames" role="tab" aria-selected="false">Frames</button>
+        </nav>
+
+        <section class="tab-panel active" data-panel="inspector">
+          <div class="inspector-head">
+            <span id="selectionKind">Nothing selected</span>
+            <button id="clearBtn" type="button" title="Clear (Esc)">Clear</button>
+          </div>
+          <div id="details" class="details">
+            <p class="empty">Select a node or relationship to inspect every field already on the row — qualifiers, roles, frame metadata, conflict groups, and lineage.</p>
+          </div>
+        </section>
+
+        <section class="tab-panel" data-panel="conflicts">
+          <div id="conflictList" class="details">
+            <p class="empty">No unresolved conflicts.</p>
+          </div>
+        </section>
+
+        <section class="tab-panel" data-panel="timeline">
+          <div id="timelineView" class="details">
+            <p class="empty">Select an entity to see its temporal history.</p>
+          </div>
+        </section>
+
+        <section class="tab-panel" data-panel="aliases">
+          <div id="aliasList" class="details">
+            <p class="empty">No likely aliases found.</p>
+          </div>
+        </section>
+
+        <section class="tab-panel" data-panel="frames">
+          <div id="frameHealth" class="details">
+            <p class="empty">Frame health loads with the graph.</p>
+          </div>
+        </section>
       </aside>
+    </div>
+
+    <dialog id="transcriptModal" class="modal" aria-label="Episode transcript">
+      <article id="transcriptBody"></article>
+      <button id="transcriptClose" type="button" autofocus>Close</button>
+    </dialog>
+
+    <div id="exportMenu" class="popover hidden" role="menu">
+      <button data-export="json" role="menuitem">Download JSON</button>
+      <button data-export="svg" role="menuitem">Download SVG</button>
+      <button data-export="png" role="menuitem">Download PNG</button>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>

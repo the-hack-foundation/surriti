@@ -162,6 +162,75 @@ async def test_multi_tenant_same_name_isolated():
 
 
 @pytest.mark.asyncio
+async def test_case_variant_entities_merge_within_tenant_only():
+    resp1 = ScriptedResponse(
+        entities=[
+            ExtractedEntity(name="Michael", labels=["Person"]),
+            ExtractedEntity(name="Florida", labels=["Place"]),
+        ],
+        facts=[ExtractedFact("Michael", "lives_in", "Florida", "Michael lives in Florida.")],
+    )
+    resp2 = ScriptedResponse(
+        entities=[
+            ExtractedEntity(name="Michael", labels=["Person"]),
+            ExtractedEntity(name="florida", labels=["Place"]),
+        ],
+        facts=[ExtractedFact("Michael", "lives_in", "florida", "Michael lives in florida.")],
+    )
+    driver = FakeSurrealDriver(enforce_entity_name_uniq=True)
+    surriti = Surriti(
+        driver,
+        llm_client=ScriptedLLMClient([resp1, resp2]),
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+
+    first = await surriti.add_episode(name="a", episode_body="a", group_id="tenant-A")
+    second = await surriti.add_episode(name="b", episode_body="b", group_id="tenant-A")
+
+    florida = next(n for n in first.nodes if n.name == "Florida")
+    assert any(n.name == "Florida" and n.uuid == florida.uuid for n in second.nodes)
+    assert not [r for r in driver.records["entity"] if r["group_id"] == "tenant-A" and r["name"] == "florida"]
+
+    other = ScriptedResponse(entities=[ExtractedEntity(name="florida", labels=["Place"])], facts=[])
+    surriti.llm = ScriptedLLMClient([other])
+    await surriti.add_episode(name="c", episode_body="c", group_id="tenant-B")
+
+    rows = [r for r in driver.records["entity"] if r["name"].lower() == "florida"]
+    assert len(rows) == 2
+    assert {r["group_id"] for r in rows} == {"tenant-A", "tenant-B"}
+
+
+@pytest.mark.asyncio
+async def test_existing_case_duplicate_entities_are_cleaned_up_within_tenant():
+    driver = FakeSurrealDriver(enforce_entity_name_uniq=True)
+    surriti = Surriti(driver, embedder=DummyEmbedder(embedding_dim=64))
+    driver.records["entity"].extend([
+        {"uuid": "canonical-florida", "group_id": "tenant-A", "name": "Florida", "labels": ["Place"], "summary": "", "attributes": {}},
+        {"uuid": "alias-florida", "group_id": "tenant-A", "name": "florida", "labels": ["Place"], "summary": "", "attributes": {}},
+        {"uuid": "other-florida", "group_id": "tenant-B", "name": "florida", "labels": ["Place"], "summary": "", "attributes": {}},
+    ])
+    driver.records["relates_to"].append({
+        "uuid": "edge-1",
+        "group_id": "tenant-A",
+        "name": "lives_in",
+        "source_node_uuid": "person-1",
+        "target_node_uuid": "alias-florida",
+        "in": "person-1",
+        "out": "alias-florida",
+    })
+
+    nodes = await surriti._upsert_entities(
+        [ExtractedEntity(name="FLORIDA", labels=["Place"])],
+        group_id="tenant-A",
+    )
+
+    assert nodes[0].uuid == "canonical-florida"
+    assert [r["name"] for r in driver.records["entity"] if r["group_id"] == "tenant-A"] == ["Florida"]
+    assert any(r["uuid"] == "other-florida" for r in driver.records["entity"])
+    assert driver.records["relates_to"][0]["target_node_uuid"] == "canonical-florida"
+
+
+@pytest.mark.asyncio
 async def test_upsert_user_is_idempotent():
     driver = FakeSurrealDriver(enforce_entity_name_uniq=True)
     surriti = Surriti(driver, embedder=DummyEmbedder(embedding_dim=64))

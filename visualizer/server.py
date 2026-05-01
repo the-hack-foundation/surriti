@@ -1,10 +1,17 @@
-"""D3 visualizer server for Surriti's SurrealDB graph."""
+"""D3 visualizer server for Surriti's SurrealDB graph.
+
+All filter parameters compose AND-style at the SurrealDB query level via
+parameterized bindings -- never f-string interpolation -- and every
+``EntityEdge``/``EntityNode`` field already on disk is surfaced on the
+wire so the client can render without fabricating data.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +23,18 @@ from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
+log = logging.getLogger("surriti.visualizer")
 
 load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Wire helpers
+# ---------------------------------------------------------------------------
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _jsonable(value: Any) -> Any:
@@ -33,6 +50,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def _compact_raw(row: dict[str, Any]) -> dict[str, Any]:
+    """Strip embeddings from the wire payload but keep every other field."""
     return {
         key: _jsonable(value)
         for key, value in row.items()
@@ -43,10 +61,7 @@ def _compact_raw(row: dict[str, Any]) -> dict[str, Any]:
 def _record_id(value: Any) -> str:
     if value is None:
         return ""
-    if isinstance(value, str):
-        raw = value
-    else:
-        raw = str(value)
+    raw = value if isinstance(value, str) else str(value)
     if ":" in raw:
         return raw.rsplit(":", 1)[-1].strip("`'\"")
     return raw.strip("`'\"")
@@ -60,6 +75,7 @@ def _unwrap(rows: Any) -> list[dict[str, Any]]:
             return list(rows["result"] or [])
         return [rows]
     if not isinstance(rows, list):
+        log.warning("unexpected SurrealDB result shape: %s", type(rows).__name__)
         return list(rows)
     if not rows:
         return []
@@ -73,12 +89,7 @@ def _unwrap(rows: Any) -> list[dict[str, Any]]:
     return list(rows)
 
 
-def _node(
-    table: str,
-    row: dict[str, Any],
-    *,
-    fallback_name: str,
-) -> dict[str, Any]:
+def _node(table: str, row: dict[str, Any], *, fallback_name: str) -> dict[str, Any]:
     uuid = str(row.get("uuid") or _record_id(row.get("id")) or fallback_name)
     name = str(row.get("name") or fallback_name)
     labels = list(row.get("labels") or [])
@@ -98,11 +109,14 @@ def _node(
         "labels": labels,
         "group_id": row.get("group_id") or "",
         "summary": row.get("summary") or "",
-        "content": row.get("content") or "",
+        # ``content`` is omitted from the bulk payload to keep responses
+        # small; the transcript modal hits ``/api/episode/{uuid}`` lazily.
         "source": row.get("source") or "",
+        "source_description": row.get("source_description") or "",
         "reference_time": _jsonable(row.get("reference_time")),
         "created_at": _jsonable(row.get("created_at")),
         "attributes": _jsonable(row.get("attributes") or {}),
+        "entity_edges": list(row.get("entity_edges") or []),
         "raw": _compact_raw(row),
     }
 
@@ -116,6 +130,7 @@ def _edge(
     name: str,
 ) -> dict[str, Any]:
     uuid = str(row.get("uuid") or f"{table}:{source}:{target}:{name}")
+    canonical_name = row.get("canonical_name") or ""
     return {
         "id": uuid,
         "uuid": uuid,
@@ -124,27 +139,44 @@ def _edge(
         "source": source,
         "target": target,
         "name": name,
+        "canonical_name": canonical_name,
+        # Display label preference: canonical_name > name > table.
+        "label": canonical_name or name or table,
         "fact": row.get("fact") or "",
         "group_id": row.get("group_id") or "",
         "episodes": list(row.get("episodes") or []),
+        # Temporal
         "valid_at": _jsonable(row.get("valid_at")),
         "invalid_at": _jsonable(row.get("invalid_at")),
         "expired_at": _jsonable(row.get("expired_at")),
         "created_at": _jsonable(row.get("created_at")),
-        # Generic temporal-state metadata (only meaningful on relates_to,
-        # but harmless on other edges where the columns are absent).
+        # State / provenance
         "status": row.get("status") or "",
-        "singleton": bool(row.get("singleton") or False),
-        "temporal": bool(row.get("temporal") or False),
-        "domain": row.get("domain") or "",
+        "polarity": row.get("polarity") or "",
         "source_type": row.get("source_type") or "",
         "confidence": row.get("confidence"),
+        "temporal": bool(row.get("temporal") or False),
+        "singleton": bool(row.get("singleton") or False),
+        "domain": row.get("domain") or "",
         "fact_key": row.get("fact_key") or "",
+        # Frame + structure
+        "relation_frame_id": row.get("relation_frame_id") or "",
+        "qualifiers": _jsonable(row.get("qualifiers") or {}),
+        "roles": _jsonable(row.get("roles") or {}),
+        # Lineage
         "supersedes": list(row.get("supersedes") or []),
         "superseded_by": row.get("superseded_by") or "",
+        "conflict_group_id": row.get("conflict_group_id") or "",
+        "derived": bool(row.get("derived") or False),
+        "derived_from": row.get("derived_from") or "",
         "attributes": _jsonable(row.get("attributes") or {}),
         "raw": _compact_raw(row),
     }
+
+
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
 
 
 class VisualizerState:
@@ -172,10 +204,10 @@ async def lifespan(app: FastAPI):
             await db.signin({"username": username, "password": password})
         await db.use(namespace, database)
         state.db = db
-        print(f"Visualizer connected to {url} ns={namespace} db={database}")
+        log.info("Visualizer connected to %s ns=%s db=%s", url, namespace, database)
     except Exception as exc:
         state.db = None
-        print(f"Visualizer could not connect to SurrealDB: {exc}")
+        log.warning("Visualizer could not connect to SurrealDB: %s", exc)
     yield
     if state.db is not None:
         await state.db.close()
@@ -206,12 +238,93 @@ async def _query(surql: str, variables: dict[str, Any] | None = None) -> list[di
         raise
 
 
+# ---------------------------------------------------------------------------
+# Filter compiler
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso(name: str, value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid {name}: {exc}") from exc
+
+
+def _build_relates_filter(
+    *,
+    group_id: str | None,
+    include_invalid: bool,
+    as_of: datetime | None,
+    status: list[str] | None,
+    source_type: list[str] | None,
+    canonical_name: list[str] | None,
+    conflict_only: bool,
+    derived_only: bool,
+    edge_visibility: str,
+    min_confidence: float | None,
+    valid_after: datetime | None,
+    valid_before: datetime | None,
+) -> tuple[str, dict[str, Any]]:
+    """Translate the request filters into a SurrealDB WHERE clause + bindings.
+
+    Every value travels as a ``$placeholder`` -- no f-string SQL.
+    """
+
+    clauses: list[str] = []
+    params: dict[str, Any] = {}
+    if group_id:
+        clauses.append("group_id = $group_id")
+        params["group_id"] = group_id
+    if not include_invalid:
+        clauses.append("(invalid_at IS NONE AND expired_at IS NONE)")
+    if as_of is not None:
+        clauses.append("(valid_at IS NONE OR valid_at <= $as_of)")
+        clauses.append("(invalid_at IS NONE OR invalid_at > $as_of)")
+        params["as_of"] = as_of
+    if status:
+        clauses.append("status IN $status")
+        params["status"] = status
+    if source_type:
+        clauses.append("source_type IN $source_type")
+        params["source_type"] = source_type
+    if canonical_name:
+        clauses.append("(canonical_name IN $canonical OR name IN $canonical)")
+        params["canonical"] = [c.lower() for c in canonical_name]
+    if conflict_only or edge_visibility == "conflicts":
+        clauses.append("conflict_group_id IS NOT NONE AND conflict_group_id != ''")
+    if derived_only or edge_visibility == "derived":
+        clauses.append("derived = true")
+    if edge_visibility == "non_derived":
+        clauses.append("(derived IS NONE OR derived = false)")
+    if edge_visibility == "invalidated":
+        clauses.append("(invalid_at IS NOT NONE OR expired_at IS NOT NONE OR status = 'superseded')")
+    if edge_visibility == "active":
+        clauses.append("(invalid_at IS NONE AND expired_at IS NONE)")
+        clauses.append("(status IS NONE OR status = '' OR status = 'active')")
+    if min_confidence is not None:
+        clauses.append("(confidence IS NONE OR confidence >= $min_conf)")
+        params["min_conf"] = float(min_confidence)
+    if valid_after is not None:
+        clauses.append("(valid_at IS NONE OR valid_at >= $valid_after)")
+        params["valid_after"] = valid_after
+    if valid_before is not None:
+        clauses.append("(valid_at IS NONE OR valid_at <= $valid_before)")
+        params["valid_before"] = valid_before
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
 @app.get("/api/groups")
 async def groups() -> dict[str, Any]:
     rows = await _query(
-        """
-        SELECT group_id, count() AS count FROM entity GROUP BY group_id;
-        """
+        "SELECT group_id, count() AS count FROM entity GROUP BY group_id;"
     )
     return {"groups": [_jsonable(row) for row in rows if row.get("group_id") is not None]}
 
@@ -223,67 +336,113 @@ async def graph(
     limit: int = Query(default=1500, ge=50, le=10000),
     aggregate_mentions: bool = Query(default=True),
     as_of: str | None = Query(default=None),
+    view: str = Query(default="truth", pattern="^(truth|raw|provenance|conflicts|timeline|frames|full|entities|episodes)$"),
+    status: list[str] | None = Query(default=None),
+    source_type: list[str] | None = Query(default=None),
+    canonical_name: list[str] | None = Query(default=None),
+    conflict_only: bool = Query(default=False),
+    derived_only: bool = Query(default=False),
+    edge_visibility: str = Query(default="all", pattern="^(all|active|invalidated|conflicts|derived|non_derived)$"),
+    min_confidence: float | None = Query(default=None, ge=0.0, le=1.0),
+    valid_after: str | None = Query(default=None),
+    valid_before: str | None = Query(default=None),
 ) -> dict[str, Any]:
     """Build the graph payload.
 
-    Parameters mirror the raw SurrealDB shape and are intentionally
-    additive so the visualizer can stay close to the underlying data:
+    ``view`` controls which tables participate:
 
-    - ``include_invalid``: keep edges whose ``invalid_at`` / ``expired_at``
-      are set. Default ``True`` so the raw graph stays visible.
-    - ``aggregate_mentions``: collapse repeated ``mentions`` rows
-      between the same (episode, entity) pair into a single link with a
-      ``count`` field. Pass ``false`` for the fully raw view.
-    - ``as_of`` (ISO 8601): only return ``relates_to`` edges that were
-      valid at the given timestamp. Combine with ``include_invalid``
-      to control whether closed edges are included before that time.
+    Semantic lenses (``truth``, ``raw``, ``provenance``, ``conflicts``,
+    ``timeline``, ``frames``) are normalized to the legacy table projections
+    below before querying.
+
+    - ``full``: episodes + entities + communities, with
+      ``mentions``, ``relates_to``, ``has_member`` edges.
+    - ``entities``: hide episode nodes and the ``mentions`` edge entirely;
+      ``relates_to.episodes`` still travels on the wire so the inspector
+      can click through to the source episodes.
+    - ``episodes``: episodes + their mentioned entities + ``mentions`` edges,
+      hiding entity-to-entity ``relates_to``.
     """
 
-    parsed_as_of: datetime | None = None
-    if as_of:
-        try:
-            parsed_as_of = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"invalid as_of: {exc}") from exc
+    parsed_as_of = _parse_iso("as_of", as_of)
+    parsed_after = _parse_iso("valid_after", valid_after)
+    parsed_before = _parse_iso("valid_before", valid_before)
 
     where_group = "WHERE group_id = $group_id" if group_id else ""
-    rel_where = []
+    base_params: dict[str, Any] = {"limit": limit}
     if group_id:
-        rel_where.append("group_id = $group_id")
-    if not include_invalid:
-        rel_where.append("(invalid_at IS NONE AND expired_at IS NONE)")
-    if parsed_as_of is not None:
-        rel_where.append("(valid_at IS NONE OR valid_at <= $as_of)")
-        rel_where.append("(invalid_at IS NONE OR invalid_at > $as_of)")
-    rel_clause = ("WHERE " + " AND ".join(rel_where)) if rel_where else ""
-    params: dict[str, Any] = {"group_id": group_id, "limit": limit}
-    if parsed_as_of is not None:
-        params["as_of"] = parsed_as_of
+        base_params["group_id"] = group_id
 
-    entities = await _query(f"SELECT * FROM entity {where_group} LIMIT $limit;", params)
-    episodes = await _query(f"SELECT * FROM episode {where_group} LIMIT $limit;", params)
-    communities = await _query(f"SELECT * FROM community {where_group} LIMIT $limit;", params)
+    view_map = {
+        "truth": "entities",
+        "raw": "full",
+        "provenance": "full",
+        "conflicts": "entities",
+        "timeline": "entities",
+        "frames": "entities",
+    }
+    api_view = view_map.get(view, view)
+    if view == "truth" and edge_visibility == "all":
+        edge_visibility = "active"
+        status = status or ["active"]
+        include_invalid = False
+    elif view == "conflicts":
+        edge_visibility = "conflicts"
+        status = status or ["needs_resolution"]
+    elif view == "raw":
+        include_invalid = True
+
+    rel_where, rel_params = _build_relates_filter(
+        group_id=group_id,
+        include_invalid=include_invalid,
+        as_of=parsed_as_of,
+        status=status,
+        source_type=source_type,
+        canonical_name=canonical_name,
+        conflict_only=conflict_only,
+        derived_only=derived_only,
+        edge_visibility=edge_visibility,
+        min_confidence=min_confidence,
+        valid_after=parsed_after,
+        valid_before=parsed_before,
+    )
+    rel_params["limit"] = limit
+
+    want_entities = api_view in ("full", "entities")
+    want_episodes = api_view in ("full", "episodes")
+    want_relates = api_view in ("full", "entities")
+    want_mentions = api_view in ("full", "episodes")
+
+    entities = await _query(
+        f"SELECT * FROM entity {where_group} LIMIT $limit;", base_params
+    ) if want_entities else []
+    episodes = await _query(
+        f"SELECT * FROM episode {where_group} LIMIT $limit;", base_params
+    ) if want_episodes else []
+    communities = await _query(
+        f"SELECT * FROM community {where_group} LIMIT $limit;", base_params
+    ) if want_entities else []
     relates = await _query(
         f"""
         SELECT *, record::id(in) AS source_uuid, record::id(out) AS target_uuid
-        FROM relates_to {rel_clause} LIMIT $limit;
+        FROM relates_to {rel_where} LIMIT $limit;
         """,
-        params,
-    )
+        rel_params,
+    ) if want_relates else []
     mentions = await _query(
         f"""
         SELECT *, record::id(in) AS source_uuid, record::id(out) AS target_uuid
         FROM mentions {where_group} LIMIT $limit;
         """,
-        params,
-    )
+        base_params,
+    ) if want_mentions else []
     members = await _query(
         f"""
         SELECT *, record::id(in) AS source_uuid, record::id(out) AS target_uuid
         FROM has_member {where_group} LIMIT $limit;
         """,
-        params,
-    )
+        base_params,
+    ) if want_entities else []
 
     nodes: dict[str, dict[str, Any]] = {}
     for row in entities:
@@ -298,15 +457,13 @@ async def graph(
 
     links: list[dict[str, Any]] = []
     for row in relates:
-        source = str(row.get("source_node_uuid") or _record_id(row.get("in")))
-        target = str(row.get("target_node_uuid") or _record_id(row.get("out")))
+        source = str(row.get("source_node_uuid") or row.get("source_uuid") or _record_id(row.get("in")))
+        target = str(row.get("target_node_uuid") or row.get("target_uuid") or _record_id(row.get("out")))
         if source in nodes and target in nodes:
-            links.append(_edge("relates_to", row, source=source, target=target, name=row.get("name") or "relates_to"))
+            links.append(_edge("relates_to", row, source=source, target=target,
+                               name=row.get("name") or "relates_to"))
 
-    if aggregate_mentions:
-        # Collapse repeated mentions between the same (episode, entity)
-        # pair into a single link with ``count``. Keeps the visual graph
-        # legible without losing the per-edge raw data on the inspector.
+    if aggregate_mentions and mentions:
         bucket: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for row in mentions:
             source = str(row.get("source_uuid") or _record_id(row.get("in")))
@@ -344,13 +501,26 @@ async def graph(
         "nodes": list(nodes.values()),
         "links": links,
         "meta": {
+            "view": view,
+            "api_view": api_view,
             "group_id": group_id,
             "include_invalid": include_invalid,
             "aggregate_mentions": aggregate_mentions,
             "as_of": parsed_as_of.isoformat() if parsed_as_of else None,
+            "filters": {
+                "status": status or [],
+                "source_type": source_type or [],
+                "canonical_name": canonical_name or [],
+                "conflict_only": conflict_only,
+                "derived_only": derived_only,
+                "edge_visibility": edge_visibility,
+                "min_confidence": min_confidence,
+                "valid_after": parsed_after.isoformat() if parsed_after else None,
+                "valid_before": parsed_before.isoformat() if parsed_before else None,
+            },
             "node_count": len(nodes),
             "link_count": len(links),
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": _utcnow_iso(),
         },
     }
 
@@ -359,13 +529,6 @@ async def graph(
 async def timeline_bounds(
     group_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Return the temporal range of ``relates_to`` edges for the slider.
-
-    The bounds are derived server-side from ``valid_at`` (lower) and
-    ``invalid_at`` / ``created_at`` (upper) so the visualizer slider
-    has a meaningful range without each client computing it.
-    """
-
     where = "WHERE group_id = $group_id" if group_id else ""
     params: dict[str, Any] = {"group_id": group_id} if group_id else {}
     rows = await _query(
@@ -380,24 +543,253 @@ async def timeline_bounds(
         params,
     )
     row = rows[0] if rows else {}
-    upper_candidates = [
-        row.get("max_valid"),
-        row.get("max_invalid"),
-        row.get("max_created"),
-    ]
-    upper = max(
-        (d for d in upper_candidates if d is not None),
-        default=None,
-    )
+    upper_candidates = [row.get("max_valid"), row.get("max_invalid"), row.get("max_created")]
+    upper = max((d for d in upper_candidates if d is not None), default=None)
     return {
         "min": _jsonable(row.get("min_valid")),
         "max": _jsonable(upper),
-        "now": datetime.utcnow().isoformat() + "Z",
+        "now": _utcnow_iso(),
         "group_id": group_id,
     }
 
 
+@app.get("/api/conflicts")
+async def conflicts(
+    group_id: str | None = Query(default=None),
+    conflict_group_id: str | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+) -> dict[str, Any]:
+    """Group ``relates_to`` edges by ``conflict_group_id``.
+
+    A group is returned when *any* member has ``status="needs_resolution"``.
+    Subject + frame metadata are joined client-side so the inspector can
+    badge each group with its directionality / cardinality / policy.
+    """
+
+    clauses = ["conflict_group_id IS NOT NONE", "conflict_group_id != ''"]
+    params: dict[str, Any] = {"limit": limit}
+    if group_id:
+        clauses.append("group_id = $group_id")
+        params["group_id"] = group_id
+    if conflict_group_id:
+        clauses.append("conflict_group_id = $cg")
+        params["cg"] = conflict_group_id
+    where = "WHERE " + " AND ".join(clauses)
+    rows = await _query(
+        f"""
+        SELECT *, record::id(in) AS source_uuid, record::id(out) AS target_uuid
+        FROM relates_to {where} LIMIT $limit;
+        """,
+        params,
+    )
+
+    groups_acc: dict[str, dict[str, Any]] = {}
+    subject_uuids: set[str] = set()
+    for row in rows:
+        cg = str(row.get("conflict_group_id") or "")
+        if not cg:
+            continue
+        source = str(row.get("source_uuid") or _record_id(row.get("in")))
+        target = str(row.get("target_uuid") or _record_id(row.get("out")))
+        edge = _edge("relates_to", row, source=source, target=target,
+                     name=row.get("name") or "relates_to")
+        bucket = groups_acc.setdefault(cg, {
+            "conflict_group_id": cg,
+            "edges": [],
+            "subject_uuid": source,
+            "needs_resolution": False,
+            "canonical_name": edge["canonical_name"] or edge["name"],
+        })
+        bucket["edges"].append(edge)
+        if edge["status"] == "needs_resolution":
+            bucket["needs_resolution"] = True
+        subject_uuids.add(source)
+
+    # Only return groups that actually contain a needs_resolution edge.
+    out_groups = [g for g in groups_acc.values() if g["needs_resolution"]]
+
+    subjects: dict[str, dict[str, Any]] = {}
+    if subject_uuids:
+        subj_rows = await _query(
+            "SELECT * FROM entity WHERE uuid IN $uuids;",
+            {"uuids": list(subject_uuids)},
+        )
+        for r in subj_rows:
+            n = _node("entity", r, fallback_name="Entity")
+            subjects[n["id"]] = {"uuid": n["id"], "name": n["name"], "group_id": n["group_id"]}
+
+    for g in out_groups:
+        g["subject"] = subjects.get(g["subject_uuid"]) or {"uuid": g["subject_uuid"]}
+
+    return {
+        "groups": out_groups,
+        "count": len(out_groups),
+        "generated_at": _utcnow_iso(),
+    }
+
+
+@app.get("/api/entity/{uuid}/timeline")
+async def entity_timeline(
+    uuid: str,
+    group_id: str | None = Query(default=None),
+    predicate: str | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+) -> dict[str, Any]:
+    """Chronological view of every fact where ``uuid`` is the subject.
+
+    Includes target stubs and the full edge so the client can render a
+    ``supersedes`` / ``superseded_by`` chain.
+    """
+
+    clauses = ["record::id(in) = $uuid"]
+    params: dict[str, Any] = {"uuid": uuid, "limit": limit}
+    if group_id:
+        clauses.append("group_id = $group_id")
+        params["group_id"] = group_id
+    if predicate:
+        clauses.append("(name = $pred OR canonical_name = $pred)")
+        params["pred"] = predicate.lower()
+    where = "WHERE " + " AND ".join(clauses)
+    rows = await _query(
+        f"""
+        SELECT *, record::id(in) AS source_uuid, record::id(out) AS target_uuid
+        FROM relates_to {where}
+        ORDER BY (valid_at OR created_at)
+        LIMIT $limit;
+        """,
+        params,
+    )
+
+    target_uuids = {str(r.get("target_uuid") or _record_id(r.get("out"))) for r in rows}
+    target_uuids.discard("")
+    targets: dict[str, dict[str, Any]] = {}
+    if target_uuids:
+        t_rows = await _query(
+            "SELECT * FROM entity WHERE uuid IN $uuids;",
+            {"uuids": list(target_uuids)},
+        )
+        for r in t_rows:
+            n = _node("entity", r, fallback_name="Entity")
+            targets[n["id"]] = {"uuid": n["id"], "name": n["name"]}
+
+    subj_rows = await _query("SELECT * FROM entity WHERE uuid = $uuid;", {"uuid": uuid})
+    subject = _node("entity", subj_rows[0], fallback_name="Entity") if subj_rows else None
+
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        source = str(row.get("source_uuid") or _record_id(row.get("in")))
+        target = str(row.get("target_uuid") or _record_id(row.get("out")))
+        edge = _edge("relates_to", row, source=source, target=target,
+                     name=row.get("name") or "relates_to")
+        edge["target"] = targets.get(target) or {"uuid": target}
+        events.append(edge)
+
+    return {
+        "subject": subject,
+        "events": events,
+        "count": len(events),
+        "generated_at": _utcnow_iso(),
+    }
+
+
+@app.get("/api/episode/{uuid}")
+async def episode_detail(
+    uuid: str,
+    group_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Full episode payload (including ``content``) for the transcript modal."""
+    clauses = ["uuid = $uuid"]
+    params: dict[str, Any] = {"uuid": uuid}
+    if group_id:
+        clauses.append("group_id = $group_id")
+        params["group_id"] = group_id
+    rows = await _query(
+        f"SELECT * FROM episode WHERE {' AND '.join(clauses)} LIMIT 1;",
+        params,
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="episode not found")
+    row = rows[0]
+    node = _node("episode", row, fallback_name="Episode")
+    node["content"] = row.get("content") or ""
+    # Mention count: cheap separate query bound by uuid.
+    m_rows = await _query(
+        "SELECT count() AS c FROM mentions WHERE record::id(in) = $uuid GROUP ALL;",
+        {"uuid": uuid},
+    )
+    node["mention_count"] = int(m_rows[0].get("c") or 0) if m_rows else 0
+    return node
+
+
+@app.get("/api/frames")
+async def frames(
+    group_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Frame catalogue for the filter dropdown.
+
+    Combines the in-process ``DEFAULT_FRAMES`` (always available) with
+    distinct ``canonical_name``/``name`` values observed in the live
+    database. Deduped by canonical name. Each frame surfaces the
+    metadata the inspector + filter UI need to render badges without
+    fabricating values.
+    """
+    try:
+        from surriti.relation_frames import DEFAULT_FRAMES
+    except Exception:
+        DEFAULT_FRAMES = ()  # type: ignore[assignment]
+
+    out: dict[str, dict[str, Any]] = {}
+    for frame in DEFAULT_FRAMES:
+        out[frame.canonical_name.lower()] = {
+            "canonical_name": frame.canonical_name,
+            "aliases": list(frame.aliases),
+            "directionality": frame.directionality,
+            "temporal_kind": frame.temporal_kind,
+            "cardinality": frame.cardinality,
+            "contradiction_policy": frame.contradiction_policy,
+            "inverse_name": frame.inverse_name,
+            "confidence": float(frame.confidence),
+            "source": "seed",
+        }
+
+    where = "WHERE group_id = $group_id" if group_id else ""
+    params: dict[str, Any] = {"group_id": group_id} if group_id else {}
+    try:
+        rows = await _query(
+            f"SELECT canonical_name, name FROM relates_to {where} GROUP BY canonical_name, name;",
+            params,
+        )
+    except Exception as exc:
+        log.warning("frames discovery query failed: %s", exc)
+        rows = []
+    for r in rows:
+        for key in (r.get("canonical_name"), r.get("name")):
+            if not key:
+                continue
+            kk = str(key).lower()
+            if kk in out:
+                continue
+            out[kk] = {
+                "canonical_name": str(key),
+                "aliases": [],
+                "directionality": "unknown",
+                "temporal_kind": "unknown",
+                "cardinality": "unknown",
+                "contradiction_policy": "coexist",
+                "inverse_name": None,
+                "confidence": 0.5,
+                "source": "discovered",
+            }
+
+    return {
+        "frames": sorted(out.values(), key=lambda f: f["canonical_name"]),
+        "count": len(out),
+        "generated_at": _utcnow_iso(),
+    }
+
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     uvicorn.run(
         "server:app",
         host=os.environ.get("VISUALIZER_HOST", "0.0.0.0"),

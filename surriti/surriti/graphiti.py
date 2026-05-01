@@ -43,6 +43,12 @@ from surriti.validators import IDENTITY_PREDICATES, repair_fact
 logger = logging.getLogger(__name__)
 
 
+def _entity_name_key(name: str) -> str:
+    """High-confidence entity key: case-insensitive, whitespace-normalized only."""
+
+    return " ".join(str(name or "").casefold().split())
+
+
 @dataclass
 class AddEpisodeResults:
     episode: EpisodicNode
@@ -376,7 +382,12 @@ class Surriti:
             ]
 
         entities = await self._upsert_entities(extraction.entities, group_id=group_id)
+        entity_by_key = {_entity_name_key(e.name): e for e in entities}
         name_to_entity = {e.name: e for e in entities}
+        for ext in extraction.entities:
+            ent = entity_by_key.get(_entity_name_key(ext.name))
+            if ent is not None:
+                name_to_entity[ext.name] = ent
 
         # Auto-resolve the speaker so the LLM can use either the stable id
         # (`default`) or the display name (`Michael`) as a subject without
@@ -1346,30 +1357,55 @@ class Surriti:
         if not extracted:
             return []
 
-        # 1. Dedupe input by name (preserve first occurrence) so the LLM
-        #    emitting "Michael" twice in one extraction doesn't trip the
-        #    unique index on the second CREATE.
+        # 1. Dedupe high-confidence case/whitespace variants in this batch
+        #    within the tenant. Fuzzy name matches stay manual.
         seen: dict[str, ExtractedEntity] = {}
         for ext in extracted:
-            if ext.name and ext.name not in seen:
-                seen[ext.name] = ext
+            key = _entity_name_key(ext.name)
+            if key and key not in seen:
+                seen[key] = ext
         deduped = list(seen.values())
 
         from surriti.search import _unwrap
 
-        # 2. Bulk lookup of every existing entity in this tenant.
+        # 2. Bulk lookup every existing entity in this tenant so exact
+        #    casefold matches reuse the canonical row and old duplicates
+        #    can be collapsed without crossing group/user boundaries.
         rows = _unwrap(await self.driver.query(
-            "SELECT * FROM entity WHERE group_id = $g AND name IN $names;",
-            {"g": group_id, "names": [e.name for e in deduped]},
+            "SELECT * FROM entity WHERE group_id = $g;",
+            {"g": group_id},
         ))
-        existing: dict[str, EntityNode] = {r["name"]: parse_entity(r) for r in rows}
+        existing_by_key: dict[str, EntityNode] = {}
+        duplicates_by_key: dict[str, list[EntityNode]] = defaultdict(list)
+        for row in rows:
+            node = parse_entity(row)
+            key = _entity_name_key(node.name)
+            if not key:
+                continue
+            if key not in existing_by_key:
+                existing_by_key[key] = node
+            else:
+                duplicates_by_key[key].append(node)
+        for key, aliases in duplicates_by_key.items():
+            await self._merge_entity_case_duplicates(
+                canonical=existing_by_key[key],
+                aliases=aliases,
+                group_id=group_id,
+            )
 
         results: list[EntityNode] = []
+        # Batch-embed all NEW entities up front (one round-trip instead of N).
+        missing = [e for e in deduped if _entity_name_key(e.name) not in existing_by_key]
+        embeddings: dict[str, list[float]] = {}
+        if missing:
+            vectors = await self.embedder.create_batch([e.name for e in missing])
+            embeddings = {e.name: v for e, v in zip(missing, vectors)}
         for ext in deduped:
-            if ext.name in existing:
-                results.append(existing[ext.name])
+            key = _entity_name_key(ext.name)
+            if key in existing_by_key:
+                results.append(existing_by_key[key])
                 continue
-            embedding = await self.embedder.create(ext.name)
+            embedding = embeddings.get(ext.name)
             node = EntityNode(
                 name=ext.name,
                 summary=ext.summary,
@@ -1402,6 +1438,7 @@ class Surriti:
                     },
                 )
                 results.append(node)
+                existing_by_key[key] = node
             except Exception as exc:
                 # Race against entity_name_uniq: a concurrent ingest (or a
                 # duplicate that slipped past dedupe) created
@@ -1418,9 +1455,45 @@ class Surriti:
                     {"g": group_id, "n": ext.name},
                 ))
                 if not fallback:
+                    fallback = _unwrap(await self.driver.query(
+                        "SELECT * FROM entity WHERE group_id = $g;",
+                        {"g": group_id},
+                    ))
+                    fallback = [
+                        row for row in fallback
+                        if _entity_name_key(row.get("name", "")) == key
+                    ][:1]
+                if not fallback:
                     raise
                 results.append(parse_entity(fallback[0]))
         return results
+
+    async def _merge_entity_case_duplicates(
+        self,
+        *,
+        canonical: EntityNode,
+        aliases: list[EntityNode],
+        group_id: str,
+    ) -> None:
+        alias_ids = [a.uuid for a in aliases if a.uuid != canonical.uuid]
+        if not alias_ids:
+            return
+
+        await self.driver.query(
+            """
+            UPDATE relates_to
+            SET in = type::record("entity", $canonical), source_node_uuid = $canonical
+            WHERE group_id = $group_id AND record::id(in) IN $aliases;
+            UPDATE relates_to
+            SET out = type::record("entity", $canonical), target_node_uuid = $canonical
+            WHERE group_id = $group_id AND record::id(out) IN $aliases;
+            UPDATE mentions
+            SET out = type::record("entity", $canonical)
+            WHERE group_id = $group_id AND record::id(out) IN $aliases;
+            DELETE entity WHERE group_id = $group_id AND uuid IN $aliases;
+            """,
+            {"group_id": group_id, "canonical": canonical.uuid, "aliases": alias_ids},
+        )
 
     async def _add_fact_edge(
         self,
