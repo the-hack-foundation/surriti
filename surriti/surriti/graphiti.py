@@ -19,6 +19,13 @@ from surriti.llm import (
     LLMClient,
 )
 from surriti.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
+from surriti.relation_frames import (
+    RelationFrame,
+    RelationFrameRegistry,
+    make_slot_key,
+    normalize_symmetric,
+    qualifier_hash,
+)
 from surriti.rerankers import CrossEncoderClient
 from surriti.search import (
     SearchConfig,
@@ -99,11 +106,49 @@ class Surriti:
         llm_client: LLMClient | None = None,
         embedder: EmbedderClient | None = None,
         cross_encoder: CrossEncoderClient | None = None,
+        *,
+        relation_frames: RelationFrameRegistry | None = None,
+        seed_default_frames: bool = True,
     ) -> None:
         self.driver = driver
         self.llm = llm_client or DummyLLMClient()
         self.embedder = embedder or DummyEmbedder(embedding_dim=driver.embedding_dim)
         self.cross_encoder = cross_encoder
+        # Generalized relation-frame layer. Defaults are seeded so brand
+        # new deployments get spouse-direction collapse, current-location
+        # supersession, and identity handling without paying an LLM
+        # round-trip on first encounter. Pass ``relation_frames=...`` to
+        # supply a pre-built registry (useful for sharing across
+        # ``Surriti`` instances) or ``seed_default_frames=False`` to
+        # opt out entirely. When no registry is passed and the LLM
+        # client implements ``classify_relation_frame``, we wire it in
+        # automatically so unknown predicates dynamically mint frames.
+        if relation_frames is None:
+            self.relation_frames = RelationFrameRegistry(
+                seed_defaults=seed_default_frames,
+                llm_classifier=self._llm_frame_classifier,
+            )
+        else:
+            self.relation_frames = relation_frames
+
+    async def _llm_frame_classifier(
+        self,
+        *,
+        predicate: str,
+        source_span: str = "",
+        sample_subject: str = "",
+        sample_object: str = "",
+    ) -> RelationFrame | None:
+        """Bridge between the registry's classifier hook and the LLM
+        adapter. Returns ``None`` (and the registry falls through) when
+        the adapter does not override the default no-op.
+        """
+        return await self.llm.classify_relation_frame(
+            predicate=predicate,
+            source_span=source_span,
+            sample_subject=sample_subject,
+            sample_object=sample_object,
+        )
 
     # ------------------------------------------------------------------ factories
     @classmethod
@@ -113,6 +158,8 @@ class Surriti:
         llm_client: LLMClient | None = None,
         embedder: EmbedderClient | None = None,
         cross_encoder: CrossEncoderClient | None = None,
+        relation_frames: RelationFrameRegistry | None = None,
+        seed_default_frames: bool = True,
     ) -> "Surriti":
         """Build a Surriti instance from environment variables.
 
@@ -129,7 +176,14 @@ class Surriti:
         """
 
         driver = SurrealDriver.from_env()
-        return cls(driver, llm_client=llm_client, embedder=embedder, cross_encoder=cross_encoder)
+        return cls(
+            driver,
+            llm_client=llm_client,
+            embedder=embedder,
+            cross_encoder=cross_encoder,
+            relation_frames=relation_frames,
+            seed_default_frames=seed_default_frames,
+        )
 
     # ------------------------------------------------------------------ lifecycle
     async def connect(self) -> "Surriti":
@@ -425,9 +479,11 @@ class Surriti:
                 )
                 invalidated_all.extend(terminated)
                 continue
-            # "assert" and "correct" both insert a new edge. "correct" is
-            # treated as singleton-asserted regardless of the LLM's flag,
-            # so the prior matching value is closed deterministically.
+            # "assert", "correct", and "qualify" all insert a new edge.
+            # "correct" is treated as singleton-asserted regardless of
+            # the LLM's flag, so the prior matching value is closed
+            # deterministically. "qualify" inserts without closing peers
+            # -- the qualifier hash naturally puts it in a distinct slot.
             if op == "correct":
                 fact.singleton = True
             edge, invalidated = await self._add_fact_edge(
@@ -1380,15 +1436,71 @@ class Surriti:
             episode.reference_time if episode else datetime.now(timezone.utc)
         )
         invalid_at = _parse_iso(fact.invalid_at)
-        fact_text = fact.fact or f"{subject.name} {fact.predicate} {obj.name}."
+
+        # ------------------------------------------------------------------
+        # Relation-frame resolution. When a frame matches the predicate
+        # (alias-aware, group-scoped first), it overrides the per-fact
+        # ``singleton``/``domain`` heuristics with data-driven policy:
+        #
+        # * ``frame.canonical_name`` becomes the stored predicate name so
+        #   ``wife_of``/``husband_of``/``married_to`` collapse onto a
+        #   single ``spouse_of`` edge across episodes and aliases.
+        # * ``frame.directionality == "symmetric"`` triggers lex-min
+        #   normalization of (subject, object) so direction-equivalent
+        #   restatements dedupe.
+        # * ``frame.cardinality == "one_current"`` drives the singleton
+        #   slot closer regardless of ``source_type`` -- the policy is
+        #   now data, not a hardcoded user-only gate.
+        # When no frame resolves, behavior is unchanged for back-compat.
+        # ------------------------------------------------------------------
+        frame = await self.relation_frames.resolve(
+            fact.predicate,
+            group_id=group_id,
+            source_span=fact.source_span or fact.fact or "",
+            sample_subject=subject.name,
+            sample_object=obj.name,
+        )
+        canonical_name = frame.canonical_name if frame else fact.predicate
+        edge_name = canonical_name
+        subj_uuid, obj_uuid = subject.uuid, obj.uuid
+        subj_node, obj_node = subject, obj
+        if frame and frame.directionality == "symmetric":
+            new_subj_uuid, new_obj_uuid = normalize_symmetric(subj_uuid, obj_uuid)
+            if (new_subj_uuid, new_obj_uuid) != (subj_uuid, obj_uuid):
+                subj_uuid, obj_uuid = new_subj_uuid, new_obj_uuid
+                subj_node, obj_node = obj, subject
+
+        # Cardinality drives slot exclusivity. Frame metadata wins; a
+        # legacy ``fact.singleton=True`` hint still triggers the closer
+        # for predicates without a registered frame. Two explicit
+        # opt-outs:
+        #   * ``operation == "qualify"`` -- the qualified variant gets
+        #     a distinct slot via its qualifier hash and must coexist.
+        #   * frame ``contradiction_policy == "uncertain"`` -- the
+        #     human-in-the-loop policy supersedes the deterministic
+        #     closer; Layer 4 will surface the conflict instead.
+        op = (fact.operation or "assert").lower()
+        is_singleton_slot = (
+            op != "qualify"
+            and not (frame is not None and frame.contradiction_policy == "uncertain")
+            and bool(
+                (frame and frame.cardinality == "one_current")
+                or (frame is None and fact.singleton and source_type == "user")
+            )
+        )
+
+        qhash = qualifier_hash(fact.qualifiers)
+        fact_text = fact.fact or f"{subj_node.name} {edge_name} {obj_node.name}."
         embedding = await self.embedder.create(fact_text)
 
         existing = await self._find_equivalent_edge(
             group_id=group_id,
-            subject_uuid=subject.uuid,
-            object_uuid=obj.uuid,
-            predicate=fact.predicate,
+            subject_uuid=subj_uuid,
+            object_uuid=obj_uuid,
+            predicate=edge_name,
             fact_text=fact_text,
+            qualifier_hash_value=qhash,
+            require_text_match=frame is None,
         )
         if existing is not None:
             if episode and episode.uuid not in existing.episodes:
@@ -1405,52 +1517,51 @@ class Surriti:
 
         edge_uuid = str(uuid4())
 
-        # Deterministic singleton-slot closer: when the incoming fact is
-        # marked ``singleton=True`` and originates from an authoritative
-        # ``user`` episode, close every active edge that shares the same
-        # (group_id, subject, predicate) and points at a DIFFERENT object.
-        # This is the generic mechanism that replaces hardcoded
-        # "exclusive predicate" lists -- the LLM (or caller) decides
-        # per-fact whether the slot is exclusive.
+        # ------------------------------------------------------------------
+        # Contradiction cascade -- explicit, ordered layers. Whichever
+        # layer fires first decides the new edge's status and the set of
+        # invalidated peers; later layers are skipped.
+        #
+        #   Layer 1: deterministic frame closure (cardinality=one_current
+        #            or legacy singleton hint -- runs ``_close_singleton_slot``).
+        #   Layer 2: explicit ``operation`` from the extractor -- ``terminate``
+        #            and the closing half of ``correct`` are handled in the
+        #            caller (``add_episode``); ``qualify`` is handled by the
+        #            slot-key construction above (distinct qualifier hash).
+        #   Layer 3: LLM semantic contradiction detection -- only when no
+        #            frame governs the predicate, or the frame's policy is
+        #            ``uncertain``. ``coexist`` short-circuits to no-op.
+        #   Layer 4: needs_resolution -- when policy is ``uncertain`` AND
+        #            the LLM returned no contradictions AND there is at
+        #            least one active same-slot peer with a different
+        #            object, mark the new edge ``needs_resolution`` and
+        #            stamp every peer with the same ``conflict_group_id``
+        #            so ``Surriti.get_conflicts()`` can surface the group.
+        # ------------------------------------------------------------------
+
+        # Layer 1: deterministic singleton closure (cardinality-driven).
         singleton_closed: list[EntityEdge] = []
-        if fact.singleton and source_type == "user":
+        if is_singleton_slot:
             singleton_closed = await self._close_singleton_slot(
                 group_id=group_id,
-                subject_uuid=subject.uuid,
-                predicate=fact.predicate,
-                keep_object_uuid=obj.uuid,
+                subject_uuid=subj_uuid,
+                predicate=edge_name,
+                keep_object_uuid=obj_uuid,
                 invalid_at=valid_at,
                 superseded_by=edge_uuid,
+                qualifier_hash_value=qhash,
             )
 
-        edge = EntityEdge(
-            uuid=edge_uuid,
-            group_id=group_id,
-            source_node_uuid=subject.uuid,
-            target_node_uuid=obj.uuid,
-            name=fact.predicate,
-            fact=fact_text,
-            fact_embedding=embedding,
-            episodes=[episode.uuid] if episode else [],
-            valid_at=valid_at,
-            invalid_at=invalid_at,
-            status="active",
-            source_type=source_type,
-            confidence=fact.confidence,
-            temporal=fact.temporal,
-            singleton=fact.singleton,
-            domain=fact.domain,
-            supersedes=[e.uuid for e in singleton_closed],
-            fact_key=make_fact_key(
-                group_id, subject.uuid, fact.predicate, obj.uuid
-            ),
-        )
+        edge_status = "active"
+        conflict_group_id: str | None = None
 
-        # Skip the LLM contradiction pass when the deterministic closer
-        # already handled this slot -- it would just burn tokens
-        # re-deciding the same exclusive case.
+        # Layer 3: LLM semantic contradiction. Skipped when:
+        # * the deterministic closer already handled this slot, OR
+        # * the frame's policy explicitly says peers coexist.
         if singleton_closed:
             invalidated = singleton_closed
+        elif frame is not None and frame.contradiction_policy == "coexist":
+            invalidated = []
         else:
             invalidated = await resolve_contradictions(
                 self.driver,
@@ -1462,6 +1573,56 @@ class Surriti:
                 new_fact_struct=fact,
                 new_edge_uuid=edge_uuid,
             )
+
+        # Layer 4: needs_resolution. When the frame says "uncertain" and
+        # Layer 3 did not pick a winner, surface every same-slot peer in
+        # one ``conflict_group_id`` so the caller can resolve manually.
+        if (
+            not invalidated
+            and frame is not None
+            and frame.contradiction_policy == "uncertain"
+        ):
+            peers = await self._find_active_slot_peers(
+                group_id=group_id,
+                subject_uuid=subj_uuid,
+                predicate=edge_name,
+                exclude_object_uuid=obj_uuid,
+                qualifier_hash_value=qhash,
+            )
+            if peers:
+                conflict_group_id = str(uuid4())
+                edge_status = "needs_resolution"
+                await self._mark_conflict_group(
+                    [p.uuid for p in peers], conflict_group_id
+                )
+
+        edge = EntityEdge(
+            uuid=edge_uuid,
+            group_id=group_id,
+            source_node_uuid=subj_uuid,
+            target_node_uuid=obj_uuid,
+            name=edge_name,
+            fact=fact_text,
+            fact_embedding=embedding,
+            episodes=[episode.uuid] if episode else [],
+            valid_at=valid_at,
+            invalid_at=invalid_at,
+            status=edge_status,
+            source_type=source_type,
+            confidence=fact.confidence,
+            temporal=fact.temporal or (frame is not None and frame.temporal_kind == "state"),
+            singleton=is_singleton_slot,
+            domain=fact.domain,
+            supersedes=[e.uuid for e in singleton_closed],
+            fact_key=make_fact_key(
+                group_id, subj_uuid, edge_name, obj_uuid, qualifier_hash=qhash
+            ),
+            relation_frame_id=frame.uuid if frame else None,
+            canonical_name=canonical_name,
+            qualifiers=dict(fact.qualifiers or {}),
+            roles=dict(fact.argument_roles or {}),
+            conflict_group_id=conflict_group_id,
+        )
 
         await self.driver.query(
             """
@@ -1484,13 +1645,20 @@ class Surriti:
                 domain: $domain,
                 supersedes: $supersedes,
                 fact_key: $fact_key,
+                relation_frame_id: $relation_frame_id,
+                canonical_name: $canonical_name,
+                qualifiers: $qualifiers,
+                roles: $roles,
+                conflict_group_id: $conflict_group_id,
+                derived: $derived,
+                derived_from: $derived_from,
                 attributes: {},
                 created_at: $created_at
             };
             """,
             {
-                "src": subject.uuid,
-                "tgt": obj.uuid,
+                "src": subj_uuid,
+                "tgt": obj_uuid,
                 "uuid": edge.uuid,
                 "group_id": edge.group_id,
                 "name": edge.name,
@@ -1508,6 +1676,13 @@ class Surriti:
                 "domain": edge.domain,
                 "supersedes": edge.supersedes,
                 "fact_key": edge.fact_key,
+                "relation_frame_id": edge.relation_frame_id,
+                "canonical_name": edge.canonical_name,
+                "qualifiers": edge.qualifiers,
+                "roles": edge.roles,
+                "conflict_group_id": edge.conflict_group_id,
+                "derived": edge.derived,
+                "derived_from": edge.derived_from,
                 "created_at": edge.created_at,
             },
         )
@@ -1522,12 +1697,16 @@ class Surriti:
         keep_object_uuid: str,
         invalid_at: datetime,
         superseded_by: str,
+        qualifier_hash_value: str = "",
     ) -> list[EntityEdge]:
         """Close active edges that share the singleton slot with the new fact.
 
         Generic mechanism (no hardcoded predicate list): every active edge
-        with the same ``(group_id, subject, predicate)`` and a DIFFERENT
-        object is invalidated and marked ``status="superseded"``.
+        with the same ``(group_id, subject, predicate, qualifier_hash)``
+        and a DIFFERENT object is invalidated and marked
+        ``status="superseded"``. ``qualifier_hash_value`` keeps qualified
+        variants (e.g. ``lives_in(Florida, season=winter)``) in distinct
+        slots from the unqualified or differently-qualified ones.
         """
 
         from surriti.search import _unwrap
@@ -1554,6 +1733,18 @@ class Surriti:
             target = row.get("target_node_uuid") or row.get("out")
             target_uuid = target.split(":", 1)[-1] if isinstance(target, str) else target
             if target_uuid == keep_object_uuid:
+                continue
+            # Skip rows that occupy a different qualifier-scoped slot
+            # (e.g. ``lives_in(Florida, season=winter)`` must not close
+            # ``lives_in(Vermont, season=summer)``). The fact_key trailing
+            # segment carries the qualifier hash when one was set, so
+            # comparing on it cleanly partitions slots without an extra
+            # column. Legacy rows (4 segments) carry no hash and only
+            # match unqualified claims.
+            row_key = row.get("fact_key") or ""
+            parts = row_key.split("::")
+            row_qhash = parts[4] if len(parts) >= 5 else ""
+            if row_qhash != qualifier_hash_value:
                 continue
             to_close.append(parse_edge(row))
         if to_close:
@@ -1617,6 +1808,177 @@ class Surriti:
                 e.invalid_at = invalid_at
                 e.status = "superseded"
         return edges
+
+    # ------------------------------------------------------------------
+    # Relation-frame public API
+    # ------------------------------------------------------------------
+
+    def register_frame(
+        self, frame: RelationFrame, *, group_id: str | None = None
+    ) -> RelationFrame:
+        """Register a :class:`RelationFrame` for use by the ingest pipeline.
+
+        Pass ``group_id=None`` (default) to register globally; pass a
+        specific tenant id to scope the frame to that tenant only.
+        """
+        return self.relation_frames.register(frame, group_id=group_id)
+
+    def get_frame(
+        self, predicate: str, *, group_id: str = ""
+    ) -> RelationFrame | None:
+        """Return the registered :class:`RelationFrame` for ``predicate``,
+        or ``None`` if no frame is registered."""
+        return self.relation_frames.get(predicate, group_id=group_id)
+
+    async def get_conflicts(
+        self, *, group_id: str, limit: int = 100
+    ) -> list[EntityEdge]:
+        """Return active edges that the contradiction engine could not
+        resolve confidently (``status == "needs_resolution"``).
+
+        Use this surface to expose unresolved-conflict groups in your
+        application and let the user pick the canonical answer.
+        """
+        from surriti.search import _unwrap
+
+        rows = _unwrap(
+            await self.driver.query(
+                """
+                SELECT * FROM relates_to
+                WHERE group_id = $group_id AND status = "needs_resolution"
+                LIMIT $limit;
+                """,
+                {"group_id": group_id, "limit": limit},
+            )
+        )
+        return [parse_edge(r) for r in rows]
+
+    async def _find_active_slot_peers(
+        self,
+        *,
+        group_id: str,
+        subject_uuid: str,
+        predicate: str,
+        exclude_object_uuid: str,
+        qualifier_hash_value: str = "",
+    ) -> list[EntityEdge]:
+        """Return active edges in the same ``(subject, predicate, qualifier)``
+        slot whose target is NOT ``exclude_object_uuid``. Powers the
+        Layer-4 ``needs_resolution`` writer in :meth:`_add_fact_edge`.
+        """
+        from surriti.search import _unwrap
+
+        rows = _unwrap(
+            await self.driver.query(
+                """
+                SELECT * FROM relates_to
+                WHERE group_id = $group_id
+                    AND in = type::record("entity", $src)
+                    AND name = $name
+                    AND status = "active"
+                    AND invalid_at IS NONE;
+                """,
+                {"group_id": group_id, "src": subject_uuid, "name": predicate},
+            )
+        )
+        peers: list[EntityEdge] = []
+        for row in rows:
+            target = row.get("target_node_uuid") or row.get("out")
+            target_uuid = target.split(":", 1)[-1] if isinstance(target, str) else target
+            if target_uuid == exclude_object_uuid:
+                continue
+            row_key = row.get("fact_key") or ""
+            parts = row_key.split("::")
+            row_qhash = parts[4] if len(parts) >= 5 else ""
+            if row_qhash != qualifier_hash_value:
+                continue
+            peers.append(parse_edge(row))
+        return peers
+
+    async def _mark_conflict_group(
+        self, edge_uuids: list[str], conflict_group_id: str
+    ) -> None:
+        """Stamp ``conflict_group_id`` onto every listed edge so the
+        whole group can be retrieved together by ``get_conflicts``."""
+        if not edge_uuids:
+            return
+        await self.driver.query(
+            """
+            UPDATE relates_to
+            SET conflict_group_id = $cg
+            WHERE uuid IN $uuids;
+            """,
+            {"uuids": edge_uuids, "cg": conflict_group_id},
+        )
+
+    def merge_frames(
+        self,
+        *,
+        source: str,
+        target: str,
+        group_id: str | None = None,
+        strategy: str = "alias",
+    ) -> RelationFrame:
+        """Fold the ``source`` frame's canonical name + aliases into ``target``.
+
+        After this call the registry resolves any prior alias of
+        ``source`` to ``target``. Historical edges keep their stored
+        ``canonical_name`` value (no DB rewrite) -- this preserves
+        provenance and stays cheap. Pass ``group_id`` to scope the merge
+        to one tenant; otherwise both frames are looked up in the
+        global catalog.
+
+        ``strategy`` is reserved for future modes (``"replace"``,
+        ``"split"``); only ``"alias"`` is implemented today.
+        """
+        if strategy != "alias":
+            raise ValueError(
+                f"Unsupported merge strategy {strategy!r}; only 'alias' is implemented."
+            )
+        src_frame = self.relation_frames.get(source, group_id=group_id or "")
+        tgt_frame = self.relation_frames.get(target, group_id=group_id or "")
+        if src_frame is None or tgt_frame is None:
+            raise KeyError(
+                f"merge_frames: unknown frame(s) source={source!r} target={target!r}"
+            )
+        if src_frame is tgt_frame:
+            return tgt_frame
+        existing = {a.lower() for a in tgt_frame.aliases}
+        new_aliases = list(tgt_frame.aliases)
+        for cand in [src_frame.canonical_name, *src_frame.aliases]:
+            key = (cand or "").strip().lower()
+            if key and key != tgt_frame.canonical_name.lower() and key not in existing:
+                new_aliases.append(key)
+                existing.add(key)
+        tgt_frame.aliases = new_aliases
+        # Re-register so the registry's alias index picks up the new keys.
+        self.relation_frames.register(tgt_frame, group_id=group_id)
+        return tgt_frame
+
+    async def current_profile(
+        self,
+        *,
+        subject_uuid: str,
+        group_id: str = "",
+        limit: int = 200,
+    ) -> dict[str, list[EntityEdge]]:
+        """Return all currently-true facts for ``subject_uuid`` grouped
+        by canonical relation name.
+
+        Convenience over :meth:`get_current_facts` for building
+        "what do you know about me right now?" surfaces. Edges that
+        carry a ``canonical_name`` (from a resolved frame) are bucketed
+        by that name; edges without one fall back to their raw
+        ``name`` so unregistered predicates still surface.
+        """
+        edges = await self.get_current_facts(
+            subject_uuid=subject_uuid, group_id=group_id, limit=limit
+        )
+        grouped: dict[str, list[EntityEdge]] = defaultdict(list)
+        for edge in edges:
+            key = edge.canonical_name or edge.name
+            grouped[key].append(edge)
+        return dict(grouped)
 
     async def get_current_fact(
         self,
@@ -1774,6 +2136,8 @@ class Surriti:
         object_uuid: str,
         predicate: str,
         fact_text: str,
+        qualifier_hash_value: str = "",
+        require_text_match: bool = True,
     ) -> EntityEdge | None:
         """Find an existing exact edge that should receive another episode support.
 
@@ -1787,7 +2151,10 @@ class Surriti:
 
         from surriti.search import _unwrap
 
-        key = make_fact_key(group_id, subject_uuid, predicate, object_uuid)
+        key = make_fact_key(
+            group_id, subject_uuid, predicate, object_uuid,
+            qualifier_hash=qualifier_hash_value,
+        )
         rows = _unwrap(
             await self.driver.query(
                 """
@@ -1800,11 +2167,18 @@ class Surriti:
                 {"group_id": group_id, "key": key},
             )
         )
-        # Only treat the existing edge as equivalent when the natural-
-        # language fact text also matches; differently-worded restatements
-        # of the same triple still flow into contradiction handling so a
-        # negation cue ("no longer ...") can invalidate the prior edge.
-        exact = next((row for row in rows if row.get("fact") == fact_text), None)
+        # When a relation frame governs the predicate, the fact_key is
+        # already a frame-aware slot key, so any same-key/same-target
+        # row counts as equivalent and the new episode just appends to
+        # its supporting list. Without a frame we keep the legacy
+        # fact-text guard so negation-cue restatements ("no longer ...")
+        # still flow into contradiction handling.
+        if require_text_match:
+            exact = next(
+                (row for row in rows if row.get("fact") == fact_text), None
+            )
+        else:
+            exact = rows[0] if rows else None
         if exact is not None:
             return parse_edge(exact)
 

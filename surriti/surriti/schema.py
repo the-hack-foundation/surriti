@@ -106,14 +106,46 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     -- this field existed; ``backfill_fact_keys()`` populates them so the
     -- unique index can be enabled after migration.
     DEFINE FIELD IF NOT EXISTS fact_key       ON relates_to TYPE string DEFAULT "";
+    -- Relation-frame metadata (generalized predicate layer). Optional
+    -- on legacy rows; populated on insert once a frame resolves.
+    DEFINE FIELD IF NOT EXISTS relation_frame_id ON relates_to TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS canonical_name    ON relates_to TYPE string DEFAULT "";
+    DEFINE FIELD IF NOT EXISTS qualifiers        ON relates_to TYPE object FLEXIBLE DEFAULT {{}};
+    DEFINE FIELD IF NOT EXISTS roles             ON relates_to TYPE object FLEXIBLE DEFAULT {{}};
+    DEFINE FIELD IF NOT EXISTS conflict_group_id ON relates_to TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS derived           ON relates_to TYPE bool DEFAULT false;
+    DEFINE FIELD IF NOT EXISTS derived_from      ON relates_to TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS relates_to_uuid_idx  ON relates_to FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS relates_to_group_idx ON relates_to FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS relates_to_active_idx ON relates_to FIELDS group_id, in, name, status;
+    DEFINE INDEX IF NOT EXISTS relates_to_canonical_idx ON relates_to FIELDS group_id, in, canonical_name, status;
+    DEFINE INDEX IF NOT EXISTS relates_to_conflict_idx ON relates_to FIELDS group_id, conflict_group_id;
     DEFINE INDEX IF NOT EXISTS relates_to_fact_key_idx ON relates_to FIELDS group_id, fact_key;
     DEFINE INDEX IF NOT EXISTS relates_to_fact_fts  ON relates_to FIELDS fact
         FULLTEXT ANALYZER surriti_en BM25 HIGHLIGHTS;
     DEFINE INDEX IF NOT EXISTS relates_to_fact_hnsw ON relates_to FIELDS fact_embedding
         HNSW DIMENSION {embedding_dim} DIST COSINE TYPE F32;
+
+    -- Relation frames (per-predicate metadata that drives generalized
+    -- temporal/contradiction reasoning without hardcoded predicate
+    -- vocabulary). One row per canonical relation type per group.
+    DEFINE TABLE IF NOT EXISTS relation_frame SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS uuid                 ON relation_frame TYPE string;
+    DEFINE FIELD IF NOT EXISTS group_id             ON relation_frame TYPE string DEFAULT "";
+    DEFINE FIELD IF NOT EXISTS canonical_name       ON relation_frame TYPE string;
+    DEFINE FIELD IF NOT EXISTS aliases              ON relation_frame TYPE array<string> DEFAULT [];
+    DEFINE FIELD IF NOT EXISTS description          ON relation_frame TYPE string DEFAULT "";
+    DEFINE FIELD IF NOT EXISTS directionality       ON relation_frame TYPE string DEFAULT "unknown";
+    DEFINE FIELD IF NOT EXISTS temporal_kind        ON relation_frame TYPE string DEFAULT "unknown";
+    DEFINE FIELD IF NOT EXISTS cardinality          ON relation_frame TYPE string DEFAULT "unknown";
+    DEFINE FIELD IF NOT EXISTS contradiction_policy ON relation_frame TYPE string DEFAULT "uncertain";
+    DEFINE FIELD IF NOT EXISTS inverse_name         ON relation_frame TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS subject_role         ON relation_frame TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS object_role          ON relation_frame TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS confidence           ON relation_frame TYPE float DEFAULT 0.5;
+    DEFINE FIELD IF NOT EXISTS created_at           ON relation_frame TYPE datetime;
+    DEFINE INDEX IF NOT EXISTS relation_frame_uuid_idx ON relation_frame FIELDS uuid UNIQUE;
+    DEFINE INDEX IF NOT EXISTS relation_frame_canon_idx ON relation_frame FIELDS group_id, canonical_name UNIQUE;
 
     DEFINE TABLE IF NOT EXISTS has_member SCHEMAFULL TYPE RELATION FROM community TO entity;
     DEFINE FIELD IF NOT EXISTS uuid       ON has_member TYPE string;

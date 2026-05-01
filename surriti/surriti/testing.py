@@ -135,6 +135,14 @@ class InMemoryDriver:
                 reverse=True,
             )
             return [rows[: v.get("limit", 200)]]
+        if "FROM relates_to" in s and 'status = "needs_resolution"' in s:
+            # get_conflicts: surface unresolved-conflict edges.
+            rows = [
+                r for r in self.records["relates_to"]
+                if r.get("group_id") == v.get("group_id")
+                and r.get("status") == "needs_resolution"
+            ]
+            return [rows[: v.get("limit", 100)]]
         if "FROM relates_to" in s and "AND in = type::record" in s and 'status = "active"' in s:
             # Singleton-slot closer / get_current_facts: filter by
             # (group_id, subject, name, active) without constraining
@@ -220,6 +228,12 @@ class InMemoryDriver:
                         if episode_uuid not in merged:
                             merged.append(episode_uuid)
                     r["episodes"] = merged
+            return [[{"ok": True}]]
+        if s.startswith("UPDATE relates_to") and "conflict_group_id = $cg" in s:
+            uuids = set(v.get("uuids") or [])
+            for r in self.records["relates_to"]:
+                if r.get("uuid") in uuids:
+                    r["conflict_group_id"] = v.get("cg")
             return [[{"ok": True}]]
         if s.startswith("UPDATE relates_to"):
             uuids = set(v.get("uuids") or [])

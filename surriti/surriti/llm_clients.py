@@ -31,6 +31,7 @@ from surriti.llm import (
     ExtractionResult,
     LLMClient,
 )
+from surriti.relation_frames import RelationFrame
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +60,18 @@ Return STRICT JSON with two arrays:
     {"name": "<a real name from the input>", "labels": ["Person"], "summary": "..."}
   ],
   "facts": [
-    {"subject": "<entity name>", "predicate": "snake_case_verb",
+    {"subject": "<entity name>",
+     "predicate": "snake_case_verb",
+     "relation_phrase": "<verbatim verb phrase from the source>",
      "object":  "<entity name>",
      "fact":    "A complete natural-language sentence.",
      "operation": "assert",
      "temporal": false,
      "singleton": false,
      "domain": null,
+     "qualifiers": {},
+     "argument_roles": {},
+     "source_span": "<verbatim slice of CURRENT EPISODE>",
      "replaces": []}
   ]
 }
@@ -95,7 +101,10 @@ FACT METADATA -- general rubric, NOT a closed list of predicates:
   describes the PRIOR state being closed. Use "correct" when the
   input explicitly replaces a previously stated value with a new one
   for the same slot ("actually it's X, not Y"; "I meant X"). Use
-  "noop" only to ignore the fact. Otherwise omit or "assert".
+  "qualify" when the input adds a scoped variant of an existing
+  state without overriding it ("I live in Florida in the winter"
+  alongside a year-round residence). Use "noop" only to ignore the
+  fact. Otherwise omit or "assert".
 - `temporal` = true when the fact describes a CURRENT state of the
   subject that can change over time (where they live, who they work
   for, what they do, how they feel, what they own, what they prefer
@@ -109,6 +118,20 @@ FACT METADATA -- general rubric, NOT a closed list of predicates:
   that share a slot. Examples of labels you might invent: "employment",
   "residence", "naming", "preference", "identity". Free text -- pick
   whatever fits.
+- `relation_phrase` = the verbatim verb phrase from the source ("is
+  the wife of", "moved to", "no longer works at"). Lets the engine
+  canonicalize alias predicates without losing the original wording.
+- `qualifiers` = optional dict of conditions that scope the claim
+  ({"season": "winter"}, {"role": "weekday"}, {"location": "remote"}).
+  Two facts that share subject+predicate+object but differ in
+  qualifiers represent distinct slots and coexist.
+- `argument_roles` = optional dict naming the semantic role each
+  argument plays ({"subject": "employee", "object": "employer"};
+  {"object_role_relative_to_subject": "wife"}). Used by the
+  direction-repair pass for symmetric/inverse-pair frames.
+- `source_span` = the verbatim slice of CURRENT EPISODE that produced
+  the fact. Forwarded to the LLM frame classifier on cold-start so a
+  brand-new predicate gets typed correctly.
 - `replaces` = optional list of prior fact descriptions this one
   closes (free text like "X works_at OldCo"). Helps `terminate` /
   `correct` find their target when wording differs.
@@ -117,22 +140,38 @@ WORKED EXAMPLES (general patterns; the predicate names are illustrative
 only -- the real ones come from the input):
 
   "I work at Acme" ->
-    {"subject":"<speaker>", "predicate":"works_at", "object":"Acme",
+    {"subject":"<speaker>", "predicate":"works_at",
+     "relation_phrase":"work at", "object":"Acme",
      "fact":"... works at Acme.",
      "operation":"assert", "temporal":true, "singleton":true,
-     "domain":"employment"}
+     "domain":"employment",
+     "argument_roles":{"subject":"employee","object":"employer"},
+     "source_span":"I work at Acme"}
 
   "I quit my job at Acme" ->
-    {"subject":"<speaker>", "predicate":"works_at", "object":"Acme",
+    {"subject":"<speaker>", "predicate":"works_at",
+     "relation_phrase":"quit my job at", "object":"Acme",
      "fact":"... quit working at Acme.",
      "operation":"terminate", "temporal":true, "singleton":true,
-     "domain":"employment"}
+     "domain":"employment",
+     "source_span":"I quit my job at Acme"}
+
+  "I live in Florida during the winter" ->
+    {"subject":"<speaker>", "predicate":"lives_in",
+     "relation_phrase":"live in", "object":"Florida",
+     "fact":"... lives in Florida during the winter.",
+     "operation":"qualify", "temporal":true, "singleton":true,
+     "domain":"residence",
+     "qualifiers":{"season":"winter"},
+     "source_span":"I live in Florida during the winter"}
 
   "I love jazz now" ->
-    {"subject":"<speaker>", "predicate":"likes", "object":"jazz",
+    {"subject":"<speaker>", "predicate":"likes",
+     "relation_phrase":"love", "object":"jazz",
      "fact":"... likes jazz.",
      "operation":"assert", "temporal":true, "singleton":false,
-     "domain":"preference"}
+     "domain":"preference",
+     "source_span":"I love jazz now"}
 
 HARD RULES (violations make the output unusable):
 - Extract facts ONLY from CURRENT EPISODE. CONTEXT is read-only.
@@ -147,6 +186,51 @@ HARD RULES (violations make the output unusable):
 - Predicates are snake_case verbs. Avoid `related_to`.
 - Each fact's `fact` is a complete natural-language sentence.
 - Return ONLY the JSON object, no commentary, no markdown fences.
+"""
+
+
+FRAME_CLASSIFICATION_SYSTEM = """\
+You classify a never-seen-before relation predicate into a generic
+frame so a temporal knowledge graph can reason over it without any
+domain-specific code. Return STRICT JSON with these keys (no others,
+no markdown):
+
+  {
+    "canonical_name":   "snake_case_verb_or_phrase",
+    "aliases":          ["other", "phrasings"],
+    "directionality":   "directed" | "symmetric" | "inverse_pair" | "unknown",
+    "temporal_kind":    "state" | "event" | "timeless" | "recurring" | "unknown",
+    "cardinality":      "one_current" | "many_current" | "many_historical" | "timeless" | "unknown",
+    "contradiction_policy": "replace" | "coexist" | "negate" | "uncertain",
+    "inverse_name":     "snake_case_inverse_or_null",
+    "subject_role":     "role_label_or_null",
+    "object_role":      "role_label_or_null",
+    "confidence":       0.0 to 1.0
+  }
+
+GUIDANCE:
+- `directionality`: "symmetric" iff swapping subject and object is
+  semantically identical ("sibling_of", "married_to"). "inverse_pair"
+  iff there is a natural inverse predicate ("parent_of"/"child_of");
+  set `inverse_name` accordingly. Otherwise "directed".
+- `temporal_kind`: "state" for ongoing facts that can change over
+  time (residence, job); "timeless" for facts that never change
+  (birthplace, parentage); "event" for point-in-time happenings;
+  "recurring" for repeating activities.
+- `cardinality`: "one_current" iff at most one such fact can be
+  simultaneously true for a subject (current employer, current
+  residence). "many_current" if multiple coexist (friendships,
+  hobbies). "many_historical" for events that accumulate. "timeless"
+  for immutable facts.
+- `contradiction_policy`: "replace" iff a new value supersedes the
+  prior one (always pair with `one_current`). "coexist" for
+  many_current/timeless facts. "negate" when the predicate carries
+  explicit truth flips. "uncertain" when conflicting claims should
+  be flagged for human resolution rather than auto-merged.
+- `confidence` reflects how sure you are about the classification
+  itself, not the underlying fact.
+
+Return JSON only.
 """
 
 
@@ -256,7 +340,11 @@ def _parse_extraction(raw: str) -> ExtractionResult:
         if not subjects or not objects:
             continue
         op_raw = (str(f.get("operation") or "assert")).strip().lower()
-        operation = op_raw if op_raw in {"assert", "terminate", "correct", "noop"} else "assert"
+        operation = (
+            op_raw
+            if op_raw in {"assert", "terminate", "correct", "qualify", "noop"}
+            else "assert"
+        )
         temporal = bool(f.get("temporal") or False)
         singleton = bool(f.get("singleton") or False)
         domain_raw = f.get("domain")
@@ -267,6 +355,28 @@ def _parse_extraction(raw: str) -> ExtractionResult:
             confidence = float(f.get("confidence")) if f.get("confidence") is not None else 1.0
         except (TypeError, ValueError):
             confidence = 1.0
+        # Generalized claim metadata -- all optional, safe defaults so
+        # older extractor outputs continue to parse.
+        relation_phrase_raw = f.get("relation_phrase")
+        relation_phrase = (
+            str(relation_phrase_raw).strip()
+            if isinstance(relation_phrase_raw, str) and relation_phrase_raw.strip()
+            else None
+        )
+        qualifiers_raw = f.get("qualifiers")
+        qualifiers = dict(qualifiers_raw) if isinstance(qualifiers_raw, dict) else {}
+        roles_raw = f.get("argument_roles")
+        argument_roles = (
+            {str(k): str(val) for k, val in roles_raw.items()}
+            if isinstance(roles_raw, dict)
+            else {}
+        )
+        source_span_raw = f.get("source_span")
+        source_span = (
+            str(source_span_raw).strip()
+            if isinstance(source_span_raw, str) and source_span_raw.strip()
+            else None
+        )
         for subject in subjects:
             for obj in objects:
                 if not subject or not obj:
@@ -290,10 +400,80 @@ def _parse_extraction(raw: str) -> ExtractionResult:
                         domain=domain,
                         replaces=list(replaces),
                         confidence=confidence,
+                        relation_phrase=relation_phrase,
+                        qualifiers=dict(qualifiers),
+                        argument_roles=dict(argument_roles),
+                        source_span=source_span,
                     )
                 )
 
     return ExtractionResult(entities=entities, facts=facts)
+
+
+def _parse_frame_classification(
+    raw: str, *, fallback_predicate: str
+) -> RelationFrame | None:
+    """Parse the JSON returned by ``FRAME_CLASSIFICATION_SYSTEM`` into a
+    :class:`RelationFrame`. Returns ``None`` when the payload is
+    unusable (missing canonical name, malformed JSON, etc.) so the
+    engine cleanly falls back to per-fact heuristics.
+    """
+    try:
+        data = json.loads(_strip_json_fences(raw))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    canonical = (str(data.get("canonical_name") or fallback_predicate)).strip().lower()
+    if not canonical:
+        return None
+    aliases_raw = data.get("aliases") or []
+    aliases = (
+        [str(a).strip().lower() for a in aliases_raw if a and str(a).strip()]
+        if isinstance(aliases_raw, list)
+        else []
+    )
+    valid = {
+        "directionality": {"directed", "symmetric", "inverse_pair", "unknown"},
+        "temporal_kind": {"state", "event", "timeless", "recurring", "unknown"},
+        "cardinality": {
+            "one_current", "many_current", "many_historical",
+            "timeless", "unknown",
+        },
+        "contradiction_policy": {"replace", "coexist", "negate", "uncertain"},
+    }
+    def _enum(key: str, default: str) -> str:
+        value = (str(data.get(key) or default)).strip().lower() or default
+        return value if value in valid[key] else default
+    inverse_raw = data.get("inverse_name")
+    inverse = (
+        str(inverse_raw).strip().lower()
+        if isinstance(inverse_raw, str) and inverse_raw.strip()
+        else None
+    )
+    subject_role_raw = data.get("subject_role")
+    object_role_raw = data.get("object_role")
+    try:
+        confidence = float(data.get("confidence")) if data.get("confidence") is not None else 0.5
+    except (TypeError, ValueError):
+        confidence = 0.5
+    try:
+        return RelationFrame(
+            canonical_name=canonical,
+            aliases=aliases,
+            directionality=_enum("directionality", "unknown"),
+            temporal_kind=_enum("temporal_kind", "unknown"),
+            cardinality=_enum("cardinality", "unknown"),
+            contradiction_policy=_enum("contradiction_policy", "uncertain"),
+            inverse_name=inverse,
+            subject_role=str(subject_role_raw).strip() or None
+                if isinstance(subject_role_raw, str) else None,
+            object_role=str(object_role_raw).strip() or None
+                if isinstance(object_role_raw, str) else None,
+            confidence=max(0.0, min(1.0, confidence)),
+        )
+    except Exception:
+        return None
 
 
 def _parse_contradictions(raw: str, n_existing: int) -> list[int]:
@@ -354,6 +534,30 @@ def _build_contradiction_user(
             + "\n".join(f"  {i}. {f}" for i, f in enumerate(existing_facts))
         )
     return "\n\n".join(parts)
+
+
+def _build_frame_classification_user(
+    *,
+    predicate: str,
+    source_span: str = "",
+    sample_subject: str = "",
+    sample_object: str = "",
+) -> str:
+    """Render the user message for ``FRAME_CLASSIFICATION_SYSTEM``.
+
+    Compact on purpose: the system prompt carries the entire schema; the
+    user message just supplies the unknown predicate plus a single
+    grounded example so the model can pick the right axes.
+    """
+    lines = [f"PREDICATE: {predicate}"]
+    if source_span:
+        lines.append(f"SOURCE SPAN: {source_span}")
+    if sample_subject or sample_object:
+        lines.append(
+            f"EXAMPLE TRIPLE: ({sample_subject or '<subject>'}) "
+            f"-[{predicate}]-> ({sample_object or '<object>'})"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +654,26 @@ class OpenAILLMClient(LLMClient):
         raw = await self._complete(CONTRADICTION_SYSTEM, user)
         return _parse_contradictions(raw, len(existing_facts))
 
+    async def classify_relation_frame(
+        self,
+        *,
+        predicate: str,
+        source_span: str = "",
+        sample_subject: str = "",
+        sample_object: str = "",
+    ) -> RelationFrame | None:
+        user = _build_frame_classification_user(
+            predicate=predicate,
+            source_span=source_span,
+            sample_subject=sample_subject,
+            sample_object=sample_object,
+        )
+        try:
+            raw = await self._complete(FRAME_CLASSIFICATION_SYSTEM, user)
+        except SurritiLLMError:
+            return None
+        return _parse_frame_classification(raw, fallback_predicate=predicate)
+
 
 # ---------------------------------------------------------------------------
 # Anthropic
@@ -545,6 +769,26 @@ class AnthropicLLMClient(LLMClient):
         )
         raw = await self._complete(CONTRADICTION_SYSTEM, user)
         return _parse_contradictions(raw, len(existing_facts))
+
+    async def classify_relation_frame(
+        self,
+        *,
+        predicate: str,
+        source_span: str = "",
+        sample_subject: str = "",
+        sample_object: str = "",
+    ) -> RelationFrame | None:
+        user = _build_frame_classification_user(
+            predicate=predicate,
+            source_span=source_span,
+            sample_subject=sample_subject,
+            sample_object=sample_object,
+        )
+        try:
+            raw = await self._complete(FRAME_CLASSIFICATION_SYSTEM, user)
+        except SurritiLLMError:
+            return None
+        return _parse_frame_classification(raw, fallback_predicate=predicate)
 
 
 __all__ = [

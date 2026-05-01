@@ -250,8 +250,16 @@ function render() {
         .attr("y2", d => d.target.y);
 
       labels
-        .attr("x", d => (d.source.x + d.target.x) / 2)
-        .attr("y", d => (d.source.y + d.target.y) / 2);
+        .attr("transform", d => {
+          const mx = (d.source.x + d.target.x) / 2;
+          const my = (d.source.y + d.target.y) / 2;
+          let angle = Math.atan2(d.target.y - d.source.y, d.target.x - d.source.x) * 180 / Math.PI;
+          // Keep text upright regardless of edge direction.
+          if (angle > 90) angle -= 180;
+          else if (angle < -90) angle += 180;
+          return `translate(${mx},${my}) rotate(${angle})`;
+        })
+        .attr("dy", "-0.35em");
 
       nodes.attr("transform", d => `translate(${d.x},${d.y})`);
     });

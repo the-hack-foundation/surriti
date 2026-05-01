@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 # Words that are too generic to be useful entity names in the dummy extractor.
 _STOPWORDS = {
@@ -34,7 +34,7 @@ class ExtractedEntity:
     labels: list[str] = field(default_factory=lambda: ["Entity"])
 
 
-FactOperation = Literal["assert", "terminate", "correct", "noop"]
+FactOperation = Literal["assert", "terminate", "correct", "qualify", "noop"]
 
 
 @dataclass
@@ -52,7 +52,8 @@ class ExtractedFact:
     # vocabulary. See EXTRACTION_SYSTEM for the rubric.
     operation: FactOperation = "assert"
     """What to do with the fact: assert (default), terminate a prior
-    matching fact, correct (terminate prior + assert new), or noop."""
+    matching fact, correct (terminate prior + assert new), qualify (add
+    a scoped variant without closing peers), or noop."""
     temporal: bool = False
     """True when the fact describes a time-varying state of the subject."""
     singleton: bool = False
@@ -66,6 +67,25 @@ class ExtractedFact:
     """Optional name hints ("<subject> <predicate> <object>") of prior
     facts this one replaces. Used by terminate/correct operations."""
     confidence: float = 1.0
+    # Generalized claim metadata (optional). Populated by extractors that
+    # emit structured claims; ignored by older extractors. The engine
+    # uses these to resolve a :class:`~surriti.relation_frames.RelationFrame`
+    # and build qualifier-aware slot keys without needing a hardcoded
+    # predicate vocabulary.
+    relation_phrase: str | None = None
+    """Original natural-language relation phrase ("is the wife of") when
+    the extractor preserves it separately from the normalized predicate."""
+    qualifiers: dict[str, Any] = field(default_factory=dict)
+    """Free-form scope qualifying the claim (e.g.
+    ``{"season": "winter"}``); hashed into the slot key so qualified
+    variants coexist with the unqualified slot."""
+    argument_roles: dict[str, str] = field(default_factory=dict)
+    """Semantic argument roles supplied by the extractor (e.g.
+    ``{"object_role_relative_to_subject": "wife"}``); used by the
+    direction-repair pass for symmetric/inverse-pair frames."""
+    source_span: str | None = None
+    """Verbatim span of the source text that produced this claim, when
+    available. Forwarded to the LLM frame classifier on cold-start."""
 
 
 @dataclass
@@ -131,6 +151,29 @@ class LLMClient(ABC):
         consume the structured ``candidates`` list and ``new_fact_struct``
         when provided to render richer prompts; stub clients are free
         to ignore them."""
+
+    async def classify_relation_frame(
+        self,
+        *,
+        predicate: str,
+        source_span: str = "",
+        sample_subject: str = "",
+        sample_object: str = "",
+    ) -> "Any | None":
+        """Optionally classify an unknown predicate into a RelationFrame.
+
+        Default returns ``None`` so adapters that don't need dynamic
+        classification keep working unchanged. Real adapters override
+        this to ask the model for ``{canonical_name, aliases,
+        directionality, temporal_kind, cardinality, contradiction_policy,
+        inverse_name, subject_role, object_role, confidence}`` and
+        return a :class:`~surriti.relation_frames.RelationFrame`.
+
+        Returning ``None`` (or raising) makes the engine fall through to
+        per-fact heuristics for that predicate.
+        """
+        del predicate, source_span, sample_subject, sample_object
+        return None
 
 
 class DummyLLMClient(LLMClient):
@@ -212,11 +255,18 @@ class DummyLLMClient(LLMClient):
 
 @dataclass
 class ScriptedResponse:
-    """Pre-baked extraction response for :class:`ScriptedLLMClient`."""
+    """Pre-baked extraction response for :class:`ScriptedLLMClient`.
+
+    ``frame`` is consumed by :meth:`ScriptedLLMClient.classify_relation_frame`
+    -- supplying one lets a test exercise the dynamic-frame-classifier
+    code path without a real LLM. Frame responses are queued separately
+    from extract responses and dispensed in order of arrival.
+    """
 
     entities: list[ExtractedEntity] = field(default_factory=list)
     facts: list[ExtractedFact] = field(default_factory=list)
     contradictions: list[int] = field(default_factory=list)
+    frame: "Any | None" = None
 
 
 class ScriptedLLMClient(LLMClient):
@@ -243,7 +293,36 @@ class ScriptedLLMClient(LLMClient):
         self._responses = list(responses)
         self._extract_calls: list[dict[str, object]] = []
         self._contradiction_calls: list[dict[str, object]] = []
+        self._classify_calls: list[dict[str, object]] = []
+        # Queue of pre-baked frames pulled from the responses on first use.
+        self._frame_queue: list[Any] = [
+            r.frame for r in self._responses if r.frame is not None
+        ]
         self._index = 0
+
+    @property
+    def classify_calls(self) -> list[dict[str, object]]:
+        return self._classify_calls
+
+    async def classify_relation_frame(
+        self,
+        *,
+        predicate: str,
+        source_span: str = "",
+        sample_subject: str = "",
+        sample_object: str = "",
+    ):
+        self._classify_calls.append(
+            {
+                "predicate": predicate,
+                "source_span": source_span,
+                "sample_subject": sample_subject,
+                "sample_object": sample_object,
+            }
+        )
+        if not self._frame_queue:
+            return None
+        return self._frame_queue.pop(0)
 
     @property
     def extract_calls(self) -> list[dict[str, object]]:

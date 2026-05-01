@@ -57,6 +57,19 @@ from surriti.llm import (
     ScriptedResponse,
 )
 from surriti.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
+from surriti.relation_frames import (
+    DEFAULT_FRAMES,
+    Cardinality,
+    ClaimOperation,
+    ContradictionPolicy,
+    Directionality,
+    RelationFrame,
+    RelationFrameRegistry,
+    TemporalKind,
+    make_slot_key,
+    normalize_symmetric,
+    qualifier_hash,
+)
 from surriti.rerankers import CrossEncoderClient, DummyCrossEncoder
 from surriti.search import Reranker, SearchConfig, SearchResults
 from surriti.search_filters import (
@@ -123,6 +136,18 @@ __all__ = [
     "make_fact_key",
     "repair_fact",
     "IDENTITY_PREDICATES",
+    # Relation frames
+    "RelationFrame",
+    "RelationFrameRegistry",
+    "DEFAULT_FRAMES",
+    "ClaimOperation",
+    "Directionality",
+    "TemporalKind",
+    "Cardinality",
+    "ContradictionPolicy",
+    "make_slot_key",
+    "normalize_symmetric",
+    "qualifier_hash",
 ]
 
 __version__ = "0.5.0"

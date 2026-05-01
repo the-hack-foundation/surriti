@@ -869,7 +869,16 @@ async def test_find_contradictions_receives_structured_candidates():
         ]
     )
     driver = FakeSurrealDriver(enforce_entity_name_uniq=True)
-    s = Surriti(driver, llm_client=llm, embedder=DummyEmbedder(embedding_dim=64))
+    # Disable default relation frames so ``works_at`` is *not* recognized
+    # as a one_current/replace slot. Without a frame the engine routes
+    # the second assertion through the LLM contradiction pass, which is
+    # what this test asserts.
+    s = Surriti(
+        driver,
+        llm_client=llm,
+        embedder=DummyEmbedder(embedding_dim=64),
+        seed_default_frames=False,
+    )
     await s.add_episode(name="e1", episode_body="x", group_id="g")
     await s.add_episode(name="e2", episode_body="y", group_id="g")
 
