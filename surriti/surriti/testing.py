@@ -99,8 +99,25 @@ class InMemoryDriver:
                 and r.get("target_node_uuid") == v.get("tgt")
                 and r.get("name") == v.get("name")
                 and r.get("invalid_at") is None
+                and (r.get("status") in (None, "active"))
             ]
             return [rows[:10]]
+        if "FROM relates_to" in s and "AND in = type::record" in s and 'status = "active"' in s:
+            # Singleton-slot closer / get_current_facts: filter by
+            # (group_id, subject, name, active) without constraining
+            # the target node (the closer keeps the matching object).
+            rows = [
+                r for r in self.records["relates_to"]
+                if r.get("group_id") == v.get("group_id")
+                and r.get("source_node_uuid") == v.get("src")
+                and (("name" not in v) or r.get("name") == v.get("name"))
+                and (r.get("status") in (None, "active"))
+                and r.get("invalid_at") is None
+            ]
+            if "domain" in v:
+                rows = [r for r in rows if r.get("domain") == v.get("domain")]
+            limit = v.get("limit", 50)
+            return [rows[:limit]]
         if "FROM relates_to" in s and "fact_embedding <|" in s:
             vec = v.get("vec")
             scored = []
@@ -177,6 +194,9 @@ class InMemoryDriver:
                 if r.get("uuid") in uuids:
                     r["invalid_at"] = v.get("invalid_at")
                     r["expired_at"] = v.get("expired_at")
+                    if 'status' in s or 'superseded' in s:
+                        r["status"] = "superseded"
+                        r["superseded_by"] = v.get("superseded_by")
             return [[{"ok": True}]]
         if s.startswith('UPDATE type::record("entity"'):
             for r in self.records["entity"]:

@@ -277,12 +277,18 @@ async def test_previous_episode_context_does_not_leak_episode_name():
         previous_episode_uuids=[first.episode.uuid],
     )
 
-    # Second call's content must contain the prior body but NOT the
-    # episode `name` ("turn-a") in any bracketed form.
+    # The prior body must NOT contaminate `content` (current episode);
+    # it now travels through the dedicated `context` channel so the model
+    # is told explicitly not to re-extract it.
     second_call_content = llm.extract_calls[1]["content"]
-    assert "hello, my name is Michael" in second_call_content
+    second_call_context = llm.extract_calls[1].get("context") or ""
+    assert second_call_content == "anything"
+    assert "hello, my name is Michael" in second_call_context
+    # The episode `name` must never appear in either channel.
     assert "[turn-a]" not in second_call_content
+    assert "[turn-a]" not in second_call_context
     assert "turn-a" not in second_call_content
+    assert "turn-a" not in second_call_context
 
 
 def test_extraction_system_prompt_has_hard_rules():
@@ -292,18 +298,19 @@ def test_extraction_system_prompt_has_hard_rules():
     from surriti.llm_clients import EXTRACTION_SYSTEM, CONTRADICTION_SYSTEM
 
     assert "subject" in EXTRACTION_SYSTEM and "object" in EXTRACTION_SYSTEM
-    assert "is_named" in EXTRACTION_SYSTEM  # identity-predicate exception
+    # Two-channel prompt structure for the temporal-state engine.
+    assert "CURRENT EPISODE" in EXTRACTION_SYSTEM
+    assert "CONTEXT" in EXTRACTION_SYSTEM
+    # Generic per-fact metadata rubric (no hardcoded predicate vocabulary).
+    assert "operation" in EXTRACTION_SYSTEM
+    assert "singleton" in EXTRACTION_SYSTEM
+    assert "temporal" in EXTRACTION_SYSTEM
+    assert "domain" in EXTRACTION_SYSTEM
+    assert "terminate" in EXTRACTION_SYSTEM
     assert "FORBIDDEN" in EXTRACTION_SYSTEM or "NEVER" in EXTRACTION_SYSTEM
-    # Positive examples for small models -- the prompt MUST teach what to
-    # extract, not just what to skip.
-    assert "is_a" in EXTRACTION_SYSTEM
-    assert "is_age" in EXTRACTION_SYSTEM
-    assert "my name is" in EXTRACTION_SYSTEM.lower()
     # Self-loop ban must be unconditional in the prompt (the speaker is the
     # subject for naming).
     assert "self-loop" in EXTRACTION_SYSTEM.lower()
-    # Bracketed/UUID metadata must be called out as not-an-entity.
-    assert "metadata" in EXTRACTION_SYSTEM.lower()
 
     assert "SAME subject" in CONTRADICTION_SYSTEM
     assert "domain" in CONTRADICTION_SYSTEM.lower()
@@ -344,3 +351,263 @@ async def test_self_loop_identity_fact_is_repaired_with_speaker_id():
     assert by_uuid[edge.source_node_uuid].name == "default"
     assert by_uuid[edge.target_node_uuid].name == "Auley"
     assert edge.name == "is_named"
+
+
+# ---------------------------------------------------------------------------
+# Generic temporal-state engine: per-fact metadata drives invalidation.
+# ---------------------------------------------------------------------------
+
+
+def _surriti():
+    return Surriti(
+        FakeSurrealDriver(enforce_entity_name_uniq=True),
+        llm_client=None,
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+
+
+@pytest.mark.asyncio
+async def test_singleton_assert_closes_prior_active_with_different_object():
+    """A second ``singleton=True`` assert on the same (subject, predicate)
+    slot must close the prior active edge deterministically -- no LLM
+    contradiction call required."""
+
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="michael"), ExtractedEntity(name="engineer")],
+                facts=[ExtractedFact(
+                    subject="michael", predicate="works_as", object="engineer",
+                    fact="michael works as an engineer.",
+                    operation="assert", singleton=True, domain="employment",
+                )],
+            ),
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="michael"), ExtractedEntity(name="blogger")],
+                facts=[ExtractedFact(
+                    subject="michael", predicate="works_as", object="blogger",
+                    fact="michael works as a food blogger.",
+                    operation="assert", singleton=True, domain="employment",
+                )],
+            ),
+        ]
+    )
+    s = Surriti(
+        FakeSurrealDriver(enforce_entity_name_uniq=True),
+        llm_client=llm,
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+
+    r1 = await s.add_episode(name="t1", episode_body="...", group_id="g")
+    r2 = await s.add_episode(name="t2", episode_body="...", group_id="g")
+
+    assert len(r2.invalidated_edges) == 1
+    assert r2.invalidated_edges[0].uuid == r1.edges[0].uuid
+    assert r2.invalidated_edges[0].status == "superseded"
+    assert r2.invalidated_edges[0].superseded_by == r2.edges[0].uuid
+    assert r2.edges[0].supersedes == [r1.edges[0].uuid]
+
+
+@pytest.mark.asyncio
+async def test_non_singleton_assert_does_not_close_prior():
+    """Non-singleton facts (e.g. ``likes``) must coexist; the closer must
+    NOT touch them even when subject + predicate match."""
+
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="alice"), ExtractedEntity(name="pizza")],
+                facts=[ExtractedFact(
+                    subject="alice", predicate="likes", object="pizza",
+                    fact="alice likes pizza.",
+                    operation="assert", singleton=False, domain="preference",
+                )],
+            ),
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="alice"), ExtractedEntity(name="sushi")],
+                facts=[ExtractedFact(
+                    subject="alice", predicate="likes", object="sushi",
+                    fact="alice likes sushi.",
+                    operation="assert", singleton=False, domain="preference",
+                )],
+            ),
+        ]
+    )
+    s = Surriti(
+        FakeSurrealDriver(enforce_entity_name_uniq=True),
+        llm_client=llm,
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+
+    await s.add_episode(name="t1", episode_body="...", group_id="g")
+    r2 = await s.add_episode(name="t2", episode_body="...", group_id="g")
+
+    assert r2.invalidated_edges == []
+
+
+@pytest.mark.asyncio
+async def test_terminate_operation_invalidates_prior_edge_no_insert():
+    """``operation="terminate"`` closes the matching active edge but
+    inserts no new edge."""
+
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="michael"), ExtractedEntity(name="engineer")],
+                facts=[ExtractedFact(
+                    subject="michael", predicate="works_as", object="engineer",
+                    fact="michael works as an engineer.",
+                    operation="assert", singleton=True, domain="employment",
+                )],
+            ),
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="michael"), ExtractedEntity(name="engineer")],
+                facts=[ExtractedFact(
+                    subject="michael", predicate="works_as", object="engineer",
+                    fact="michael no longer works as an engineer.",
+                    operation="terminate",
+                )],
+            ),
+        ]
+    )
+    s = Surriti(
+        FakeSurrealDriver(enforce_entity_name_uniq=True),
+        llm_client=llm,
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+
+    r1 = await s.add_episode(name="t1", episode_body="...", group_id="g")
+    r2 = await s.add_episode(name="t2", episode_body="...", group_id="g")
+
+    assert r2.edges == []
+    assert len(r2.invalidated_edges) == 1
+    assert r2.invalidated_edges[0].uuid == r1.edges[0].uuid
+
+
+@pytest.mark.asyncio
+async def test_noop_operation_skips_fact_entirely():
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="alice"), ExtractedEntity(name="bob")],
+                facts=[ExtractedFact(
+                    subject="alice", predicate="met", object="bob",
+                    operation="noop",
+                )],
+            ),
+        ]
+    )
+    s = Surriti(
+        FakeSurrealDriver(enforce_entity_name_uniq=True),
+        llm_client=llm,
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+    r = await s.add_episode(name="t1", episode_body="...", group_id="g")
+    assert r.edges == []
+    assert r.invalidated_edges == []
+
+
+@pytest.mark.asyncio
+async def test_source_type_assistant_skips_singleton_closer():
+    """Only ``source_type="user"`` triggers the deterministic singleton
+    closer. Assistant/tool/system facts are advisory and must not
+    silently nuke prior user truth."""
+
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="michael"), ExtractedEntity(name="engineer")],
+                facts=[ExtractedFact(
+                    subject="michael", predicate="works_as", object="engineer",
+                    operation="assert", singleton=True, domain="employment",
+                )],
+            ),
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="michael"), ExtractedEntity(name="blogger")],
+                facts=[ExtractedFact(
+                    subject="michael", predicate="works_as", object="blogger",
+                    operation="assert", singleton=True, domain="employment",
+                )],
+            ),
+        ]
+    )
+    s = Surriti(
+        FakeSurrealDriver(enforce_entity_name_uniq=True),
+        llm_client=llm,
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+
+    await s.add_episode(name="t1", episode_body="...", group_id="g", source_type="user")
+    r2 = await s.add_episode(
+        name="t2", episode_body="...", group_id="g", source_type="assistant"
+    )
+    assert r2.invalidated_edges == []
+
+
+@pytest.mark.asyncio
+async def test_get_current_facts_returns_only_active_edges():
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="michael"), ExtractedEntity(name="engineer")],
+                facts=[ExtractedFact(
+                    subject="michael", predicate="works_as", object="engineer",
+                    operation="assert", singleton=True, domain="employment",
+                )],
+            ),
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="michael"), ExtractedEntity(name="blogger")],
+                facts=[ExtractedFact(
+                    subject="michael", predicate="works_as", object="blogger",
+                    operation="assert", singleton=True, domain="employment",
+                )],
+            ),
+        ]
+    )
+    s = Surriti(
+        FakeSurrealDriver(enforce_entity_name_uniq=True),
+        llm_client=llm,
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+
+    r1 = await s.add_episode(name="t1", episode_body="...", group_id="g")
+    r2 = await s.add_episode(name="t2", episode_body="...", group_id="g")
+    michael_uuid = r1.edges[0].source_node_uuid
+
+    current = await s.get_current_facts(subject_uuid=michael_uuid, group_id="g")
+    assert len(current) == 1
+    assert current[0].uuid == r2.edges[0].uuid
+    assert current[0].status == "active"
+
+    one = await s.get_current_fact(
+        subject_uuid=michael_uuid, predicate="works_as", group_id="g"
+    )
+    assert one is not None and one.uuid == r2.edges[0].uuid
+
+
+@pytest.mark.asyncio
+async def test_context_kwarg_is_passed_separately_from_current_episode():
+    """Sanity: previous episode body is passed via the dedicated
+    ``context`` kwarg, never concatenated onto ``content``."""
+
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(entities=[ExtractedEntity(name="alice")]),
+            ScriptedResponse(entities=[ExtractedEntity(name="bob")]),
+        ]
+    )
+    s = Surriti(
+        FakeSurrealDriver(enforce_entity_name_uniq=True),
+        llm_client=llm,
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+    first = await s.add_episode(name="e1", episode_body="alice content", group_id="g")
+    await s.add_episode(
+        name="e2", episode_body="bob content", group_id="g",
+        previous_episode_uuids=[first.episode.uuid],
+    )
+
+    second = llm.extract_calls[1]
+    assert second["content"] == "bob content"
+    assert "alice content" in (second.get("context") or "")
+    assert "alice content" not in second["content"]

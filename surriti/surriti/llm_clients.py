@@ -38,8 +38,20 @@ logger = logging.getLogger(__name__)
 # Prompt templates
 # ---------------------------------------------------------------------------
 EXTRACTION_SYSTEM = """\
-You are a knowledge-graph extractor. Read the user's text and return STRICT \
-JSON with two arrays:
+You are a knowledge-graph extractor. Your input has two clearly fenced \
+sections:
+
+  CONTEXT (read-only, do NOT extract):
+    <prior episodes for reference -- use only to resolve pronouns and
+     to recognise entities; never re-emit a fact whose source text
+     lives only in this section>
+
+  CURRENT EPISODE (extract from this only):
+    <the new text -- every fact you emit must come from THIS section>
+
+If the CONTEXT block is omitted there is no prior context to consider.
+
+Return STRICT JSON with two arrays:
 
 {
   "entities": [
@@ -48,45 +60,90 @@ JSON with two arrays:
   "facts": [
     {"subject": "<entity name>", "predicate": "snake_case_verb",
      "object":  "<entity name>",
-     "fact":    "A complete natural-language sentence."}
+     "fact":    "A complete natural-language sentence.",
+     "operation": "assert",
+     "temporal": false,
+     "singleton": false,
+     "domain": null,
+     "replaces": []}
   ]
 }
 
-WHAT COUNTS AS A FACT (extract these):
-- Self-introductions: "my name is X" / "I'm X" / "call me X" -> a fact
-  using the speaker as subject and predicate `is_named`.
-- Properties of the speaker: "I am 5 months old" -> `is_age`;
-  "I am a baby" -> `is_a`; "I work at Acme" -> `works_at`;
-  "I live in Berlin" -> `lives_in`; "I like pizza" -> `likes`;
-  "I am learning to crawl" -> `is_learning`;
-  "my birthday is October 14" -> `has_birthday`;
-  "I will be 33" -> `is_age`.
-- Properties of other named entities: "Alice works at Acme" -> a fact.
-- Compound sentences: "my name is Auley and I am 5 months old" -> TWO
-  facts (one `is_named`, one `is_age`).
-- VALUES become entities too: dates ("October 14"), ages ("33"),
-  places ("Berlin"), companies ("Acme") must appear in the `entities`
-  array AND be used as the `object` of the fact. NEVER use a literal
-  placeholder like "speaker" or "value" as subject or object.
+WHAT COUNTS AS A FACT (extract these from CURRENT EPISODE):
+- Self-introductions and properties of the speaker ("my name is X",
+  "I'm X", "I am 5 months old", "I work at Acme", "I live in Berlin",
+  "I like pizza", "my birthday is October 14").
+- Properties of other named entities ("Alice works at Acme").
+- Compound sentences split into one fact per claim.
+- VALUES become entities too: dates, ages, places, companies must
+  appear in `entities` AND be the `object` of the fact. NEVER use a
+  literal placeholder like "speaker" or "value" as subject or object.
 - When in doubt, extract.
 
-WHAT TO SKIP (return no fact for these, but mention any named entities):
-- Pure interjections with no claim: "hi", "thanks", "ok", "lol", "hmm".
-- Pure questions: "where do I work?", "what's my name?".
+WHAT TO SKIP (return no fact, but mention any named entities):
+- Pure interjections ("hi", "thanks", "ok", "hmm").
+- Pure questions ("where do I work?", "what's my name?").
+- Vague placeholder objects: if the object would be a meaningless
+  filler like "world", "everywhere", "thing", "something", "nothing",
+  "someone", DROP the fact entirely. Such words are not entities.
+
+FACT METADATA -- general rubric, NOT a closed list of predicates:
+- `operation` (default "assert"). Use "terminate" when the input
+  explicitly negates a previously true state ("I quit X", "I no
+  longer X", "X is not true anymore", "I stopped X"). The fact then
+  describes the PRIOR state being closed. Use "correct" when the
+  input explicitly replaces a previously stated value with a new one
+  for the same slot ("actually it's X, not Y"; "I meant X"). Use
+  "noop" only to ignore the fact. Otherwise omit or "assert".
+- `temporal` = true when the fact describes a CURRENT state of the
+  subject that can change over time (where they live, who they work
+  for, what they do, how they feel, what they own, what they prefer
+  right now).
+- `singleton` = true when the subject can hold only ONE such value
+  true at a time (people live in one place, hold one current job
+  title, have one current age, have one current employer).
+- `domain` = a short free-form bucket label (one or two words) you
+  pick to group facts that obviously describe the same slot, so the
+  engine can scope contradictions. Use the SAME label across facts
+  that share a slot. Examples of labels you might invent: "employment",
+  "residence", "naming", "preference", "identity". Free text -- pick
+  whatever fits.
+- `replaces` = optional list of prior fact descriptions this one
+  closes (free text like "X works_at OldCo"). Helps `terminate` /
+  `correct` find their target when wording differs.
+
+WORKED EXAMPLES (general patterns; the predicate names are illustrative
+only -- the real ones come from the input):
+
+  "I work at Acme" ->
+    {"subject":"<speaker>", "predicate":"works_at", "object":"Acme",
+     "fact":"... works at Acme.",
+     "operation":"assert", "temporal":true, "singleton":true,
+     "domain":"employment"}
+
+  "I quit my job at Acme" ->
+    {"subject":"<speaker>", "predicate":"works_at", "object":"Acme",
+     "fact":"... quit working at Acme.",
+     "operation":"terminate", "temporal":true, "singleton":true,
+     "domain":"employment"}
+
+  "I love jazz now" ->
+    {"subject":"<speaker>", "predicate":"likes", "object":"jazz",
+     "fact":"... likes jazz.",
+     "operation":"assert", "temporal":true, "singleton":false,
+     "domain":"preference"}
 
 HARD RULES (violations make the output unusable):
-- NEVER invent entities, predicates, or relations not supported by the
-  input. Do NOT use placeholder names like Alice, Bob, Acme, Foo, Bar
-  unless they appear in the text.
-- NEVER emit a self-loop fact (subject == object). "Michael knows
-  Michael" is FORBIDDEN. For naming, the subject is the SPEAKER (see the
-  speaker context appended below) and the object is the new name --
-  they are different entities.
-- Tokens that look like internal metadata -- bracketed labels (`[chat]`,
-  `[turn-a]`), bare UUIDs -- are NOT entities. Ignore them entirely.
+- Extract facts ONLY from CURRENT EPISODE. CONTEXT is read-only.
+- NEVER invent entities, predicates, or relations not supported by
+  the input. Do NOT use placeholder names like Alice, Bob, Acme, Foo,
+  Bar unless they appear in the text.
+- NEVER emit a self-loop fact (subject == object). For naming, the
+  subject is the SPEAKER and the object is the new name.
+- Tokens that look like internal metadata -- bracketed labels
+  (`[chat]`, `[turn-a]`), bare UUIDs -- are NOT entities. Ignore them.
 - Use the EXACT entity name strings inside facts (subject/object).
-- Predicates are snake_case verbs (is_named, is_a, is_age, works_at,
-  lives_in, likes, knows, is_brother_of, ...). Avoid `related_to`.
+- Predicates are snake_case verbs. Avoid `related_to`.
 - Each fact's `fact` is a complete natural-language sentence.
 - Return ONLY the JSON object, no commentary, no markdown fences.
 """
@@ -123,8 +180,18 @@ def _build_extraction_user(
     group_id: str,
     entity_types: dict[str, type] | None,
     custom_instructions: str | None,
+    context: str | None = None,
 ) -> str:
-    parts = [f"Episode (group_id={group_id!r}):", content.strip()]
+    parts: list[str] = []
+    if context and context.strip():
+        parts.append(
+            "CONTEXT (read-only, do NOT extract; use only for pronoun/"
+            "entity resolution):\n" + context.strip()
+        )
+    parts.append(
+        f"CURRENT EPISODE (group_id={group_id!r}; extract from this only):\n"
+        + content.strip()
+    )
     if entity_types:
         parts.append("Allowed entity types: " + ", ".join(entity_types.keys()))
     if custom_instructions:
@@ -187,6 +254,18 @@ def _parse_extraction(raw: str) -> ExtractionResult:
         fact_text_raw = f.get("fact")
         if not subjects or not objects:
             continue
+        op_raw = (str(f.get("operation") or "assert")).strip().lower()
+        operation = op_raw if op_raw in {"assert", "terminate", "correct", "noop"} else "assert"
+        temporal = bool(f.get("temporal") or False)
+        singleton = bool(f.get("singleton") or False)
+        domain_raw = f.get("domain")
+        domain = str(domain_raw).strip().lower() or None if isinstance(domain_raw, str) else None
+        replaces_raw = f.get("replaces") or []
+        replaces = [str(x).strip() for x in replaces_raw if x and str(x).strip()] if isinstance(replaces_raw, list) else []
+        try:
+            confidence = float(f.get("confidence")) if f.get("confidence") is not None else 1.0
+        except (TypeError, ValueError):
+            confidence = 1.0
         for subject in subjects:
             for obj in objects:
                 if not subject or not obj:
@@ -204,6 +283,12 @@ def _parse_extraction(raw: str) -> ExtractionResult:
                         fact=fact_text,
                         valid_at=f.get("valid_at") or None,
                         invalid_at=f.get("invalid_at") or None,
+                        operation=operation,
+                        temporal=temporal,
+                        singleton=singleton,
+                        domain=domain,
+                        replaces=list(replaces),
+                        confidence=confidence,
                     )
                 )
 
@@ -284,12 +369,14 @@ class OpenAILLMClient(LLMClient):
         group_id: str = "",
         entity_types: dict[str, type] | None = None,
         custom_instructions: str | None = None,
+        context: str | None = None,
     ) -> ExtractionResult:
         user = _build_extraction_user(
             content,
             group_id=group_id,
             entity_types=entity_types,
             custom_instructions=custom_instructions,
+            context=context,
         )
         raw = await self._complete(EXTRACTION_SYSTEM, user)
         return _parse_extraction(raw)
@@ -371,12 +458,14 @@ class AnthropicLLMClient(LLMClient):
         group_id: str = "",
         entity_types: dict[str, type] | None = None,
         custom_instructions: str | None = None,
+        context: str | None = None,
     ) -> ExtractionResult:
         user = _build_extraction_user(
             content,
             group_id=group_id,
             entity_types=entity_types,
             custom_instructions=custom_instructions,
+            context=context,
         )
         raw = await self._complete(EXTRACTION_SYSTEM, user)
         return _parse_extraction(raw)

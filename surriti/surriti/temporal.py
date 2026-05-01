@@ -49,6 +49,7 @@ async def invalidate_edges(
     edge_uuids: Iterable[str],
     *,
     invalid_at: datetime,
+    superseded_by: str | None = None,
 ) -> None:
     uuids = list(edge_uuids)
     if not uuids:
@@ -57,13 +58,15 @@ async def invalidate_edges(
     await driver.query(
         """
         UPDATE relates_to
-        SET invalid_at = $invalid_at, expired_at = $expired_at
+        SET invalid_at = $invalid_at, expired_at = $expired_at,
+            status = "superseded", superseded_by = $superseded_by
         WHERE uuid IN $uuids AND (invalid_at IS NONE OR invalid_at > $invalid_at);
         """,
         {
             "uuids": uuids,
             "invalid_at": invalid_at,
             "expired_at": expired_at,
+            "superseded_by": superseded_by,
         },
     )
 

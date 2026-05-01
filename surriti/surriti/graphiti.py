@@ -29,7 +29,7 @@ from surriti.search import (
     search_nodes,
 )
 from surriti.search_filters import SearchFilters
-from surriti.temporal import resolve_contradictions
+from surriti.temporal import invalidate_edges, resolve_contradictions
 from surriti.utils import parse_community, parse_edge, parse_entity, parse_episode
 
 logger = logging.getLogger(__name__)
@@ -180,6 +180,7 @@ class Surriti:
         saga_previous_episode_uuid: str | None = None,
         speaker_id: str | None = None,
         speaker_name: str | None = None,
+        source_type: str = "user",
     ) -> AddEpisodeResults:
         """Process a new episode end-to-end.
 
@@ -205,9 +206,13 @@ class Surriti:
         ref_time = reference_time or datetime.now(timezone.utc)
 
         # Graphiti supplies recent episodes as extraction context by default.
-        # Surriti keeps the prompt compact by passing only prior content, never
-        # episode names/metadata, so small models do not extract turn labels.
-        context_text = episode_body
+        # Surriti keeps the prompt compact by passing only prior content,
+        # never episode names/metadata, so small models do not extract turn
+        # labels. As of the temporal-state refactor we also pass the prior
+        # text in a SEPARATE ``context`` channel rather than concatenating
+        # it onto the current episode -- this stops small models from
+        # re-extracting facts that were already persisted from earlier
+        # turns.
         if previous_episode_uuids is None:
             ctx = await self._fetch_recent_episode_contents(
                 reference_time=ref_time,
@@ -216,8 +221,6 @@ class Surriti:
             )
         else:
             ctx = await self._fetch_episode_contents(previous_episode_uuids)
-        if ctx:
-            context_text = f"{ctx}\n---\n{episode_body}"
 
         episode = EpisodicNode(
             uuid=uuid or str(uuid4()),
@@ -277,10 +280,11 @@ class Surriti:
             )
 
         extraction = await self.llm.extract(
-            context_text,
+            episode_body,
             group_id=group_id,
             entity_types=entity_types,
             custom_instructions=custom_extraction_instructions,
+            context=ctx or None,
         )
         logger.debug(
             "extract -> entities=%r facts=%r",
@@ -395,12 +399,33 @@ class Surriti:
                         fact.subject, fact.predicate, fact.object,
                     )
                     continue
+            op = (fact.operation or "assert").lower()
+            if op == "noop":
+                continue
+            if op == "terminate":
+                # Locate any active edge matching (subject, predicate, obj)
+                # in this group and close it. No new edge is inserted.
+                terminated = await self._terminate_matching_edge(
+                    group_id=group_id,
+                    subject_uuid=subject.uuid,
+                    object_uuid=obj.uuid,
+                    predicate=fact.predicate,
+                    invalid_at=ref_time,
+                )
+                invalidated_all.extend(terminated)
+                continue
+            # "assert" and "correct" both insert a new edge. "correct" is
+            # treated as singleton-asserted regardless of the LLM's flag,
+            # so the prior matching value is closed deterministically.
+            if op == "correct":
+                fact.singleton = True
             edge, invalidated = await self._add_fact_edge(
                 fact=fact,
                 subject=subject,
                 obj=obj,
                 episode=episode,
                 group_id=group_id,
+                source_type=source_type,
             )
             edges.append(edge)
             invalidated_all.extend(invalidated)
@@ -1338,6 +1363,7 @@ class Surriti:
         obj: EntityNode,
         episode: EpisodicNode | None,
         group_id: str,
+        source_type: str = "user",
     ) -> tuple[EntityEdge, list[EntityEdge]]:
         valid_at = _parse_iso(fact.valid_at) or (
             episode.reference_time if episode else datetime.now(timezone.utc)
@@ -1366,8 +1392,28 @@ class Surriti:
                 )
             return existing, []
 
+        edge_uuid = str(uuid4())
+
+        # Deterministic singleton-slot closer: when the incoming fact is
+        # marked ``singleton=True`` and originates from an authoritative
+        # ``user`` episode, close every active edge that shares the same
+        # (group_id, subject, predicate) and points at a DIFFERENT object.
+        # This is the generic mechanism that replaces hardcoded
+        # "exclusive predicate" lists -- the LLM (or caller) decides
+        # per-fact whether the slot is exclusive.
+        singleton_closed: list[EntityEdge] = []
+        if fact.singleton and source_type == "user":
+            singleton_closed = await self._close_singleton_slot(
+                group_id=group_id,
+                subject_uuid=subject.uuid,
+                predicate=fact.predicate,
+                keep_object_uuid=obj.uuid,
+                invalid_at=valid_at,
+                superseded_by=edge_uuid,
+            )
+
         edge = EntityEdge(
-            uuid=str(uuid4()),
+            uuid=edge_uuid,
             group_id=group_id,
             source_node_uuid=subject.uuid,
             target_node_uuid=obj.uuid,
@@ -1377,16 +1423,29 @@ class Surriti:
             episodes=[episode.uuid] if episode else [],
             valid_at=valid_at,
             invalid_at=invalid_at,
+            status="active",
+            source_type=source_type,
+            confidence=fact.confidence,
+            temporal=fact.temporal,
+            singleton=fact.singleton,
+            domain=fact.domain,
+            supersedes=[e.uuid for e in singleton_closed],
         )
 
-        invalidated = await resolve_contradictions(
-            self.driver,
-            llm=self.llm,
-            new_fact=fact_text,
-            new_fact_embedding=embedding,
-            new_valid_at=valid_at,
-            group_id=group_id,
-        )
+        # Skip the LLM contradiction pass when the deterministic closer
+        # already handled this slot -- it would just burn tokens
+        # re-deciding the same exclusive case.
+        if singleton_closed:
+            invalidated = singleton_closed
+        else:
+            invalidated = await resolve_contradictions(
+                self.driver,
+                llm=self.llm,
+                new_fact=fact_text,
+                new_fact_embedding=embedding,
+                new_valid_at=valid_at,
+                group_id=group_id,
+            )
 
         await self.driver.query(
             """
@@ -1400,6 +1459,14 @@ class Surriti:
                 episodes: $episodes,
                 valid_at: $valid_at,
                 invalid_at: $invalid_at,
+                status: $status,
+                polarity: $polarity,
+                source_type: $source_type,
+                confidence: $confidence,
+                temporal: $temporal,
+                singleton: $singleton,
+                domain: $domain,
+                supersedes: $supersedes,
                 attributes: {},
                 created_at: $created_at
             };
@@ -1415,10 +1482,188 @@ class Surriti:
                 "episodes": edge.episodes,
                 "valid_at": edge.valid_at,
                 "invalid_at": edge.invalid_at,
+                "status": edge.status,
+                "polarity": edge.polarity,
+                "source_type": edge.source_type,
+                "confidence": edge.confidence,
+                "temporal": edge.temporal,
+                "singleton": edge.singleton,
+                "domain": edge.domain,
+                "supersedes": edge.supersedes,
                 "created_at": edge.created_at,
             },
         )
         return edge, invalidated
+
+    async def _close_singleton_slot(
+        self,
+        *,
+        group_id: str,
+        subject_uuid: str,
+        predicate: str,
+        keep_object_uuid: str,
+        invalid_at: datetime,
+        superseded_by: str,
+    ) -> list[EntityEdge]:
+        """Close active edges that share the singleton slot with the new fact.
+
+        Generic mechanism (no hardcoded predicate list): every active edge
+        with the same ``(group_id, subject, predicate)`` and a DIFFERENT
+        object is invalidated and marked ``status="superseded"``.
+        """
+
+        from surriti.search import _unwrap
+
+        rows = _unwrap(
+            await self.driver.query(
+                """
+                SELECT * FROM relates_to
+                WHERE group_id = $group_id
+                    AND in = type::record("entity", $src)
+                    AND name = $name
+                    AND status = "active"
+                    AND invalid_at IS NONE;
+                """,
+                {
+                    "group_id": group_id,
+                    "src": subject_uuid,
+                    "name": predicate,
+                },
+            )
+        )
+        to_close: list[EntityEdge] = []
+        for row in rows:
+            target = row.get("target_node_uuid") or row.get("out")
+            target_uuid = target.split(":", 1)[-1] if isinstance(target, str) else target
+            if target_uuid == keep_object_uuid:
+                continue
+            to_close.append(parse_edge(row))
+        if to_close:
+            await invalidate_edges(
+                self.driver,
+                [e.uuid for e in to_close],
+                invalid_at=invalid_at,
+                superseded_by=superseded_by,
+            )
+            for e in to_close:
+                e.invalid_at = invalid_at
+                e.status = "superseded"
+                e.superseded_by = superseded_by
+        return to_close
+
+    async def _terminate_matching_edge(
+        self,
+        *,
+        group_id: str,
+        subject_uuid: str,
+        object_uuid: str,
+        predicate: str,
+        invalid_at: datetime,
+    ) -> list[EntityEdge]:
+        """Close every active edge matching (subject, predicate, object).
+
+        Used to implement ``ExtractedFact.operation == "terminate"`` --
+        the user said the prior fact is no longer true, so we close it
+        without inserting anything new.
+        """
+
+        from surriti.search import _unwrap
+
+        rows = _unwrap(
+            await self.driver.query(
+                """
+                SELECT * FROM relates_to
+                WHERE group_id = $group_id
+                    AND in = type::record("entity", $src)
+                    AND out = type::record("entity", $tgt)
+                    AND name = $name
+                    AND status = "active"
+                    AND invalid_at IS NONE;
+                """,
+                {
+                    "group_id": group_id,
+                    "src": subject_uuid,
+                    "tgt": object_uuid,
+                    "name": predicate,
+                },
+            )
+        )
+        edges = [parse_edge(r) for r in rows]
+        if edges:
+            await invalidate_edges(
+                self.driver,
+                [e.uuid for e in edges],
+                invalid_at=invalid_at,
+            )
+            for e in edges:
+                e.invalid_at = invalid_at
+                e.status = "superseded"
+        return edges
+
+    async def get_current_fact(
+        self,
+        *,
+        subject_uuid: str,
+        predicate: str,
+        group_id: str = "",
+    ) -> EntityEdge | None:
+        """Return the single live edge for a (subject, predicate) slot, or None.
+
+        Generic current-state resolver: walks ``relates_to`` for the most
+        recent ``active`` edge with the given subject and predicate. No
+        canonical-predicate translation -- whatever string the extractor
+        used IS the predicate.
+        """
+
+        edges = await self.get_current_facts(
+            subject_uuid=subject_uuid,
+            group_id=group_id,
+            predicate=predicate,
+            limit=1,
+        )
+        return edges[0] if edges else None
+
+    async def get_current_facts(
+        self,
+        *,
+        subject_uuid: str,
+        group_id: str = "",
+        predicate: str | None = None,
+        domain: str | None = None,
+        limit: int = 50,
+    ) -> list[EntityEdge]:
+        """Return all live edges for a subject, optionally scoped to predicate or domain.
+
+        Useful for "what do you know about me currently?" recall without
+        relying on hybrid search to surface every active fact.
+        """
+
+        from surriti.search import _unwrap
+
+        clauses = [
+            "group_id = $group_id",
+            'in = type::record("entity", $src)',
+            'status = "active"',
+            "invalid_at IS NONE",
+        ]
+        params: dict[str, Any] = {
+            "group_id": group_id,
+            "src": subject_uuid,
+            "limit": int(limit),
+        }
+        if predicate is not None:
+            clauses.append("name = $name")
+            params["name"] = predicate
+        if domain is not None:
+            clauses.append("domain = $domain")
+            params["domain"] = domain
+        surql = (
+            "SELECT * FROM relates_to WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY valid_at DESC LIMIT $limit;"
+        )
+        rows = _unwrap(await self.driver.query(surql, params))
+        return [parse_edge(r) for r in rows]
 
     async def _find_equivalent_edge(
         self,

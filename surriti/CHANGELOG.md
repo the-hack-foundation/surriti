@@ -6,6 +6,61 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Generic temporal-state engine.** `ExtractedFact` carries new
+  per-fact metadata that drives invalidation without any hardcoded
+  predicate vocabulary:
+  - `operation: Literal["assert","terminate","correct","noop"]`
+  - `temporal: bool`, `singleton: bool`, `domain: str | None`,
+    `replaces: list[str]`, `confidence: float`
+  The LLM (or caller) tags each fact and the engine reasons over those
+  flags. `terminate` closes the matching active edge with no insert;
+  `correct` is treated as singleton-asserted; `noop` is skipped.
+- **Deterministic singleton-slot closer.** When `fact.singleton=True`
+  and `source_type=="user"`, `_add_fact_edge` closes every active edge
+  on the same `(group_id, subject, predicate)` slot pointing at a
+  different object before inserting the new edge — no LLM
+  contradiction call needed. Skipped when `source_type` is
+  `"assistant"`/`"tool"`/`"system"` so model-generated facts cannot
+  silently nuke prior user truth.
+- **Two-channel extraction prompt.** `LLMClient.extract` gained a
+  `context: str | None` kwarg. Prior episode bodies now travel through
+  a dedicated read-only `CONTEXT` fence in the prompt (clearly marked
+  "do NOT extract"), instead of being concatenated onto the current
+  episode. This stops small models from re-extracting facts that were
+  already persisted in earlier turns.
+- `EntityEdge` mirrors the new metadata fields (`status`, `polarity`,
+  `source_type`, `confidence`, `temporal`, `singleton`, `domain`,
+  `supersedes`, `superseded_by`) with safe defaults so existing code
+  is unaffected.
+- `relates_to` schema gained the matching nine fields plus a composite
+  `relates_to_active_idx ON FIELDS group_id, in, name, status` for the
+  singleton-closer hot path.
+- `Graphiti.get_current_fact(...)` and `Graphiti.get_current_facts(...)`
+  return live edges (`status="active" AND invalid_at IS NONE`),
+  optionally scoped by predicate or domain — the generic answer to
+  "what's currently true about this subject?" without going through
+  hybrid search.
+- `add_episode` accepts `source_type: str = "user"` to mark the
+  provenance of facts in the episode.
+
+### Changed
+- `EXTRACTION_SYSTEM` rewritten around the per-fact metadata rubric:
+  fenced `CONTEXT` (read-only) + `CURRENT EPISODE` sections; generic
+  `temporal`/`singleton`/`domain` explanations (no hardcoded
+  predicates); `operation` rubric covering "I quit X"/"no longer
+  X"/"stopped X" → `terminate`, "actually X not Y" → `correct`; rule
+  to drop facts whose object is a vague placeholder
+  (`world`/`everywhere`/`thing`/`something`/`nothing`/`someone`).
+- `temporal.invalidate_edges` now also sets `status="superseded"` and
+  optional `superseded_by` on the closed rows.
+- `search._filter_valid` excludes rows whose `status` is set and not
+  `"active"`.
+- `myapp/service.py`: stripped the hardcoded predicate examples from
+  `EXTRACTION_INSTRUCTIONS` (predicates are now whatever snake_case
+  verb fits) and tags both `add_episode` call sites with
+  `source_type="user"`.
+
 ### Fixed
 - `add_episode` now **auto-resolves** `speaker_id` / `speaker_name` against
   the LLM's extracted entity list. Previously, when the model emitted

@@ -151,6 +151,12 @@ def _filter_valid(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if expired_at and expired_at <= now:
             continue
+        # Generic status guard: only "active" edges count as current truth.
+        # Older rows that pre-date the field default to "active" by virtue of
+        # the schema DEFAULT, so this is backwards-compatible.
+        status = e.get("status")
+        if status is not None and status != "active":
+            continue
         out.append(e)
     return out
 

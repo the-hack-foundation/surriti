@@ -215,20 +215,17 @@ class SendRequest(BaseModel):
 EXTRACTION_INSTRUCTIONS = (
     "Extraction rules:\n"
     "1. Extract entities (people, places, organisations, foods, hobbies, "
-    "topics) that are mentioned in the input. Things like 'pizza', "
-    "'pasta', 'developer', 'Eds Pizza', 'Mark' are all valid entities.\n"
+    "topics) that are mentioned in the input.\n"
     "2. Pronouns are NOT entities. Never emit 'I', 'me', 'my', 'you', "
     "'he', 'she', 'they', 'user', 'assistant', or generic 'person' as "
     "entity names. When the speaker says 'I'/'my'/'me', resolve it to "
     "the user's known name from earlier context (e.g. 'Michael') and "
     "use that name as the entity.\n"
-    "3. Predicate names must describe the actual relation. Good "
-    "predicates: works_at, works_with, worked_with, lives_in, likes, "
-    "dislikes, prefers, used_to_like, favorite_food, "
-    "favorite_restaurant, knows, owns, is_a. Avoid 'related_to' unless "
-    "absolutely nothing else fits.\n"
-    "4. Do not invent example entities such as Alice, Bob, or Acme "
-    "Corp. Only use names that appear in the input or earlier context.\n"
+    "3. Predicate names must describe the actual relation as a "
+    "snake_case verb phrase. Pick whatever verb fits the sentence; "
+    "do NOT translate to a fixed vocabulary.\n"
+    "4. Do not invent example entities (Alice, Bob, Acme Corp, etc.). "
+    "Only use names that appear in the input or earlier context.\n"
     "5. If a single statement involves multiple objects (e.g. 'Peter "
     "and Matt'), emit one separate fact per object.\n"
     "6. If the message is a greeting, question, or acknowledgement "
@@ -436,6 +433,7 @@ async def _run_turn(req: SendRequest) -> None:
                     custom_extraction_instructions=EXTRACTION_INSTRUCTIONS,
                     speaker_id=req.user_id,
                     speaker_name=speaker_name,
+                    source_type="user",
                 )
                 # Bootstrap display_name from any is_named edge that points
                 # from the user_id to a real name. Self-healing: future
@@ -542,6 +540,7 @@ async def prompt(req: PromptRequest) -> PromptResponse:
                 custom_extraction_instructions=EXTRACTION_INSTRUCTIONS,
                 speaker_id=req.user_id,
                 speaker_name=speaker_name,
+                source_type="user",
             )
             await _bootstrap_display_name(req.user_id, stored, current=speaker_name)
         except Exception as exc:

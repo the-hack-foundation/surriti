@@ -118,9 +118,10 @@ async def test_previous_episode_uuids_thread_context_into_extractor():
     )
 
     second_call = llm.extract_calls[1]
-    # Concatenated context includes both previous episode body and current one
-    assert "alice content" in second_call["content"]
-    assert "bob content" in second_call["content"]
+    # Prior episode body now travels in the dedicated `context` channel
+    # (read-only for the extractor); the current episode goes in `content`.
+    assert second_call["content"] == "bob content"
+    assert "alice content" in (second_call.get("context") or "")
 
 
 @pytest.mark.asyncio

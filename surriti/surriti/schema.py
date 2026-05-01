@@ -90,8 +90,20 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     DEFINE FIELD IF NOT EXISTS expired_at     ON relates_to TYPE option<datetime>;
     DEFINE FIELD IF NOT EXISTS attributes     ON relates_to TYPE object FLEXIBLE DEFAULT {{}};
     DEFINE FIELD IF NOT EXISTS created_at     ON relates_to TYPE datetime;
+    -- Generic temporal-state metadata: enables the singleton-slot closer
+    -- and current-state queries without a hardcoded predicate vocabulary.
+    DEFINE FIELD IF NOT EXISTS status         ON relates_to TYPE string DEFAULT "active";
+    DEFINE FIELD IF NOT EXISTS polarity       ON relates_to TYPE string DEFAULT "positive";
+    DEFINE FIELD IF NOT EXISTS source_type    ON relates_to TYPE string DEFAULT "user";
+    DEFINE FIELD IF NOT EXISTS confidence     ON relates_to TYPE float DEFAULT 1.0;
+    DEFINE FIELD IF NOT EXISTS temporal       ON relates_to TYPE bool DEFAULT false;
+    DEFINE FIELD IF NOT EXISTS singleton      ON relates_to TYPE bool DEFAULT false;
+    DEFINE FIELD IF NOT EXISTS domain         ON relates_to TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS supersedes     ON relates_to TYPE array<string> DEFAULT [];
+    DEFINE FIELD IF NOT EXISTS superseded_by  ON relates_to TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS relates_to_uuid_idx  ON relates_to FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS relates_to_group_idx ON relates_to FIELDS group_id;
+    DEFINE INDEX IF NOT EXISTS relates_to_active_idx ON relates_to FIELDS group_id, in, name, status;
     DEFINE INDEX IF NOT EXISTS relates_to_fact_fts  ON relates_to FIELDS fact
         FULLTEXT ANALYZER surriti_en BM25 HIGHLIGHTS;
     DEFINE INDEX IF NOT EXISTS relates_to_fact_hnsw ON relates_to FIELDS fact_embedding

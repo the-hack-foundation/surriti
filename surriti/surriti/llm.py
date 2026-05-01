@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Literal
 
 # Words that are too generic to be useful entity names in the dummy extractor.
 _STOPWORDS = {
@@ -33,14 +34,38 @@ class ExtractedEntity:
     labels: list[str] = field(default_factory=lambda: ["Entity"])
 
 
+FactOperation = Literal["assert", "terminate", "correct", "noop"]
+
+
 @dataclass
 class ExtractedFact:
     subject: str
     predicate: str
     object: str
-    fact: str
+    fact: str = ""
+    """Natural-language sentence form. Defaults to empty; the engine
+    falls back to ``"<subject> <predicate> <object>."`` when blank."""
     valid_at: str | None = None  # ISO 8601 timestamp; None = unknown
     invalid_at: str | None = None
+    # Generic temporal-state metadata. The LLM (or caller) sets these per
+    # fact; the engine reasons over them without any hardcoded predicate
+    # vocabulary. See EXTRACTION_SYSTEM for the rubric.
+    operation: FactOperation = "assert"
+    """What to do with the fact: assert (default), terminate a prior
+    matching fact, correct (terminate prior + assert new), or noop."""
+    temporal: bool = False
+    """True when the fact describes a time-varying state of the subject."""
+    singleton: bool = False
+    """True when the subject can hold only ONE active value of this
+    predicate at a time. Triggers the deterministic singleton-slot closer
+    on assert."""
+    domain: str | None = None
+    """Short free-form bucket label (e.g. "employment", "residence") used
+    to scope contradiction comparisons. Free text, never an enum."""
+    replaces: list[str] = field(default_factory=list)
+    """Optional name hints ("<subject> <predicate> <object>") of prior
+    facts this one replaces. Used by terminate/correct operations."""
+    confidence: float = 1.0
 
 
 @dataclass
@@ -58,8 +83,16 @@ class LLMClient(ABC):
         group_id: str = "",
         entity_types: dict[str, type] | None = None,
         custom_instructions: str | None = None,
+        context: str | None = None,
     ) -> ExtractionResult:
-        ...
+        """Extract entities + facts from ``content``.
+
+        ``content`` is the **current episode** to extract from. ``context``
+        is optional read-only prior text (e.g. recent episodes) supplied
+        purely for pronoun/entity resolution; facts whose source is in
+        ``context`` should NOT be re-emitted. Implementations are free to
+        ignore ``context`` (e.g. heuristic stubs) but real adapters MUST
+        present it to the model in a clearly-fenced block."""
 
     @abstractmethod
     async def find_contradictions(
@@ -87,7 +120,9 @@ class DummyLLMClient(LLMClient):
         group_id: str = "",
         entity_types: dict[str, type] | None = None,
         custom_instructions: str | None = None,
+        context: str | None = None,
     ) -> ExtractionResult:
+        # The dummy extractor ignores ``context`` -- it's heuristic-only.
         text = content or ""
         all_names: list[str] = []
         seen: set[str] = set()
@@ -193,10 +228,12 @@ class ScriptedLLMClient(LLMClient):
         group_id: str = "",
         entity_types: dict[str, type] | None = None,
         custom_instructions: str | None = None,
+        context: str | None = None,
     ) -> ExtractionResult:
         self._extract_calls.append(
             {
                 "content": content,
+                "context": context,
                 "group_id": group_id,
                 "entity_types": list((entity_types or {}).keys()),
                 "custom_instructions": custom_instructions,

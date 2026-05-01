@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Surriti Graph Visualizer</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Graph controls">
+        <div class="brand">
+          <div class="mark">S</div>
+          <div>
+            <h1>Surriti Graph</h1>
+            <p>SurrealDB knowledge map</p>
+          </div>
+        </div>
+
+        <label class="field">
+          <span>Group</span>
+          <input id="groupInput" type="text" placeholder="all groups">
+        </label>
+
+        <label class="field">
+          <span>Search</span>
+          <input id="searchInput" type="search" placeholder="entity, fact, edge">
+        </label>
+
+        <div class="toggles" aria-label="Node filters">
+          <label><input class="kindToggle" type="checkbox" value="entity" checked> Entities</label>
+          <label><input class="kindToggle" type="checkbox" value="episode" checked> Episodes</label>
+          <label><input class="kindToggle" type="checkbox" value="community" checked> Communities</label>
+          <label><input id="invalidToggle" type="checkbox" checked> Invalidated facts</label>
+        </div>
+
+        <div class="toolbar">
+          <button id="refreshBtn" type="button">Refresh</button>
+          <button id="fitBtn" type="button">Fit</button>
+          <button id="freezeBtn" type="button">Freeze</button>
+        </div>
+
+        <section class="metrics" aria-label="Graph metrics">
+          <div><span id="nodeCount">0</span><small>nodes</small></div>
+          <div><span id="linkCount">0</span><small>edges</small></div>
+          <div><span id="groupCount">0</span><small>groups</small></div>
+        </section>
+
+        <section class="legend" aria-label="Legend">
+          <div><i class="dot entity"></i>Entity</div>
+          <div><i class="dot episode"></i>Episode</div>
+          <div><i class="dot community"></i>Community</div>
+          <div><i class="line relates"></i>Fact</div>
+          <div><i class="line mentions"></i>Mention</div>
+          <div><i class="line invalid"></i>Invalidated</div>
+        </section>
+      </aside>
+
+      <main class="stage">
+        <div id="status" class="status">Loading graph...</div>
+        <svg id="graph" role="img" aria-label="Interactive Surriti graph"></svg>
+      </main>
+
+      <aside class="inspector" aria-label="Selection details">
+        <div class="inspector-head">
+          <span id="selectionKind">Nothing selected</span>
+          <button id="clearBtn" type="button">Clear</button>
+        </div>
+        <div id="details" class="details">
+          <p class="empty">Select a node or relationship to inspect its facts, timestamps, attributes, and neighbors.</p>
+        </div>
+      </aside>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
