@@ -102,6 +102,39 @@ class InMemoryDriver:
                 and (r.get("status") in (None, "active"))
             ]
             return [rows[:10]]
+        if "FROM relates_to" in s and "fact_key = $key" in s:
+            # _find_equivalent_edge primary lookup.
+            rows = [
+                r for r in self.records["relates_to"]
+                if r.get("group_id") == v.get("group_id")
+                and r.get("fact_key") == v.get("key")
+                and r.get("invalid_at") is None
+            ]
+            return [rows[:10]]
+        if "FROM relates_to" in s and "valid_at <= $as_of" in s:
+            # get_facts_as_of: edges valid at the given timestamp.
+            rows = []
+            for r in self.records["relates_to"]:
+                if r.get("group_id") != v.get("group_id"):
+                    continue
+                if r.get("source_node_uuid") != v.get("src"):
+                    continue
+                va = r.get("valid_at")
+                if va is not None and va > v.get("as_of"):
+                    continue
+                ia = r.get("invalid_at")
+                if ia is not None and ia <= v.get("as_of"):
+                    continue
+                if "name" in v and r.get("name") != v.get("name"):
+                    continue
+                if "domain" in v and r.get("domain") != v.get("domain"):
+                    continue
+                rows.append(r)
+            rows.sort(
+                key=lambda r: (r.get("valid_at") is not None, r.get("valid_at")),
+                reverse=True,
+            )
+            return [rows[: v.get("limit", 200)]]
         if "FROM relates_to" in s and "AND in = type::record" in s and 'status = "active"' in s:
             # Singleton-slot closer / get_current_facts: filter by
             # (group_id, subject, name, active) without constraining

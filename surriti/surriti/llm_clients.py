@@ -25,6 +25,7 @@ from typing import Any
 
 from surriti.errors import SurritiConfigError, SurritiLLMError
 from surriti.llm import (
+    ContradictionCandidate,
     ExtractedEntity,
     ExtractedFact,
     ExtractionResult,
@@ -306,6 +307,55 @@ def _parse_contradictions(raw: str, n_existing: int) -> list[int]:
     return [int(i) for i in idxs if isinstance(i, int) and 0 <= i < n_existing]
 
 
+def _build_contradiction_user(
+    new_fact: str,
+    existing_facts: list[str],
+    *,
+    candidates: list[ContradictionCandidate] | None = None,
+    new_fact_struct: ExtractedFact | None = None,
+) -> str:
+    """Render the contradiction-detection user prompt.
+
+    When structured ``candidates`` (and optionally ``new_fact_struct``)
+    are provided, the prompt includes per-candidate subject/predicate/
+    object/domain lines so the model can apply the same-domain rule
+    without guessing from natural-language text alone.
+    """
+
+    parts: list[str] = []
+    if new_fact_struct is not None:
+        parts.append(
+            "NEW FACT:\n"
+            f"  text:      {new_fact}\n"
+            f"  subject:   {new_fact_struct.subject}\n"
+            f"  predicate: {new_fact_struct.predicate}\n"
+            f"  object:    {new_fact_struct.object}\n"
+            f"  domain:    {new_fact_struct.domain or '<none>'}\n"
+            f"  operation: {new_fact_struct.operation}"
+        )
+    else:
+        parts.append(f"NEW FACT: {new_fact}")
+
+    if candidates:
+        rendered = []
+        for idx, cand in enumerate(candidates):
+            rendered.append(
+                f"  {idx}.\n"
+                f"     text:      {cand.fact}\n"
+                f"     subject:   {cand.subject}\n"
+                f"     predicate: {cand.predicate}\n"
+                f"     object:    {cand.object}\n"
+                f"     domain:    {cand.domain or '<none>'}"
+            )
+        parts.append("PRIOR FACTS (indexed):\n" + "\n".join(rendered))
+    else:
+        parts.append(
+            "PRIOR FACTS (indexed):\n"
+            + "\n".join(f"  {i}. {f}" for i, f in enumerate(existing_facts))
+        )
+    return "\n\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # OpenAI
 # ---------------------------------------------------------------------------
@@ -382,13 +432,20 @@ class OpenAILLMClient(LLMClient):
         return _parse_extraction(raw)
 
     async def find_contradictions(
-        self, new_fact: str, existing_facts: list[str]
+        self,
+        new_fact: str,
+        existing_facts: list[str],
+        *,
+        candidates: list[ContradictionCandidate] | None = None,
+        new_fact_struct: ExtractedFact | None = None,
     ) -> list[int]:
         if not existing_facts:
             return []
-        user = (
-            f"NEW FACT: {new_fact}\n\nPRIOR FACTS (indexed):\n"
-            + "\n".join(f"  {i}. {f}" for i, f in enumerate(existing_facts))
+        user = _build_contradiction_user(
+            new_fact,
+            existing_facts,
+            candidates=candidates,
+            new_fact_struct=new_fact_struct,
         )
         raw = await self._complete(CONTRADICTION_SYSTEM, user)
         return _parse_contradictions(raw, len(existing_facts))
@@ -471,13 +528,20 @@ class AnthropicLLMClient(LLMClient):
         return _parse_extraction(raw)
 
     async def find_contradictions(
-        self, new_fact: str, existing_facts: list[str]
+        self,
+        new_fact: str,
+        existing_facts: list[str],
+        *,
+        candidates: list[ContradictionCandidate] | None = None,
+        new_fact_struct: ExtractedFact | None = None,
     ) -> list[int]:
         if not existing_facts:
             return []
-        user = (
-            f"NEW FACT: {new_fact}\n\nPRIOR FACTS (indexed):\n"
-            + "\n".join(f"  {i}. {f}" for i, f in enumerate(existing_facts))
+        user = _build_contradiction_user(
+            new_fact,
+            existing_facts,
+            candidates=candidates,
+            new_fact_struct=new_fact_struct,
         )
         raw = await self._complete(CONTRADICTION_SYSTEM, user)
         return _parse_contradictions(raw, len(existing_facts))

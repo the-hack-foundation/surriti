@@ -74,6 +74,27 @@ class ExtractionResult:
     facts: list[ExtractedFact] = field(default_factory=list)
 
 
+@dataclass
+class ContradictionCandidate:
+    """Structured view of an existing edge passed to contradiction detection.
+
+    The contradiction layer historically saw only the natural-language
+    ``fact`` string. That hides the structured signal — subject,
+    predicate, object, domain, temporal validity — that the LLM needs
+    to reason about same-domain conflicts. Adapters that receive a
+    ``candidates`` list should render these fields in their prompt.
+    """
+
+    uuid: str
+    subject: str
+    predicate: str
+    object: str
+    fact: str
+    domain: str | None = None
+    valid_at: str | None = None
+    invalid_at: str | None = None
+
+
 class LLMClient(ABC):
     @abstractmethod
     async def extract(
@@ -96,9 +117,20 @@ class LLMClient(ABC):
 
     @abstractmethod
     async def find_contradictions(
-        self, new_fact: str, existing_facts: list[str]
+        self,
+        new_fact: str,
+        existing_facts: list[str],
+        *,
+        candidates: list[ContradictionCandidate] | None = None,
+        new_fact_struct: ExtractedFact | None = None,
     ) -> list[int]:
-        """Return the indexes in ``existing_facts`` invalidated by ``new_fact``."""
+        """Return the indexes in ``existing_facts`` invalidated by ``new_fact``.
+
+        ``new_fact`` and ``existing_facts`` are the natural-language
+        fact strings (kept for back-compat). Real adapters should also
+        consume the structured ``candidates`` list and ``new_fact_struct``
+        when provided to render richer prompts; stub clients are free
+        to ignore them."""
 
 
 class DummyLLMClient(LLMClient):
@@ -156,8 +188,15 @@ class DummyLLMClient(LLMClient):
         return ExtractionResult(entities=entities, facts=facts)
 
     async def find_contradictions(
-        self, new_fact: str, existing_facts: list[str]
+        self,
+        new_fact: str,
+        existing_facts: list[str],
+        *,
+        candidates: list[ContradictionCandidate] | None = None,
+        new_fact_struct: ExtractedFact | None = None,
     ) -> list[int]:
+        # The dummy client ignores structured info -- it is heuristic-only.
+        del candidates, new_fact_struct
         cues = ("not ", "no longer", "moved", "changed", "stopped", "former")
         new_tokens = {t.lower() for t in re.findall(r"\w+", new_fact) if len(t) > 2}
         contradicted: list[int] = []
@@ -243,10 +282,20 @@ class ScriptedLLMClient(LLMClient):
         return ExtractionResult(entities=list(resp.entities), facts=list(resp.facts))
 
     async def find_contradictions(
-        self, new_fact: str, existing_facts: list[str]
+        self,
+        new_fact: str,
+        existing_facts: list[str],
+        *,
+        candidates: list[ContradictionCandidate] | None = None,
+        new_fact_struct: ExtractedFact | None = None,
     ) -> list[int]:
         self._contradiction_calls.append(
-            {"new_fact": new_fact, "existing_facts": list(existing_facts)}
+            {
+                "new_fact": new_fact,
+                "existing_facts": list(existing_facts),
+                "candidates": list(candidates) if candidates else [],
+                "new_fact_struct": new_fact_struct,
+            }
         )
         # Re-use the next scripted response's `contradictions` payload, but do
         # not advance `_index` so contradictions can be paired with extracts.

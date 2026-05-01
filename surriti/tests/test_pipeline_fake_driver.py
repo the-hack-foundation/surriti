@@ -611,3 +611,274 @@ async def test_context_kwarg_is_passed_separately_from_current_episode():
     assert second["content"] == "bob content"
     assert "alice content" in (second.get("context") or "")
     assert "alice content" not in second["content"]
+
+
+# ---------------------------------------------------------------------------
+# New surface: validators, fact_key dedupe, as-of queries, structured
+# contradiction candidates.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_repair_fact_drops_lives_in_world_filler():
+    """Banned placeholder objects ("world", "earth") for location
+    predicates are dropped before they reach the graph."""
+
+    from surriti.validators import repair_fact
+
+    bad = ExtractedFact("Michael", "lives_in", "world", "Michael lives in world.")
+    assert repair_fact(bad) is None
+
+    good = ExtractedFact("Michael", "lives_in", "Berlin", "Michael lives in Berlin.")
+    assert repair_fact(good) is good
+
+
+@pytest.mark.asyncio
+async def test_repair_fact_rewrites_identity_self_loop_with_speaker_id():
+    from surriti.validators import repair_fact
+
+    fact = ExtractedFact("Michael", "is_named", "Michael", "Michael is named Michael.")
+    out = repair_fact(fact, speaker_id="default")
+    assert out is not None
+    assert out.subject == "default"
+    assert out.object == "Michael"
+
+
+@pytest.mark.asyncio
+async def test_repair_fact_drops_unrepaired_self_loops():
+    from surriti.validators import repair_fact
+
+    bad = ExtractedFact("Alice", "knows", "Alice", "Alice knows Alice.")
+    assert repair_fact(bad) is None
+
+
+@pytest.mark.asyncio
+async def test_lives_in_world_dropped_at_episode_ingest():
+    """Integration: the validator runs inside add_episode."""
+
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="Michael"), ExtractedEntity(name="world")],
+                facts=[
+                    ExtractedFact(
+                        "Michael", "lives_in", "world",
+                        "Michael lives in world.",
+                    ),
+                ],
+            ),
+        ]
+    )
+    s = Surriti(
+        FakeSurrealDriver(enforce_entity_name_uniq=True),
+        llm_client=llm,
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+    result = await s.add_episode(name="e1", episode_body="x", group_id="g")
+    # The placeholder fact must not produce a ``relates_to`` edge.
+    assert all(e.name != "lives_in" for e in result.edges)
+
+
+@pytest.mark.asyncio
+async def test_fact_key_is_set_on_insert():
+    """Every persisted edge gets a deterministic fact_key."""
+
+    from surriti.edges import make_fact_key
+
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="Alice"), ExtractedEntity(name="Acme")],
+                facts=[ExtractedFact("Alice", "works_at", "Acme", "Alice works at Acme.")],
+            ),
+        ]
+    )
+    driver = FakeSurrealDriver(enforce_entity_name_uniq=True)
+    s = Surriti(driver, llm_client=llm, embedder=DummyEmbedder(embedding_dim=64))
+    result = await s.add_episode(name="e1", episode_body="x", group_id="g")
+
+    assert result.edges
+    edge = result.edges[0]
+    expected = make_fact_key("g", edge.source_node_uuid, "works_at", edge.target_node_uuid)
+    assert edge.fact_key == expected
+    rows = driver.records["relates_to"]
+    assert any(r.get("fact_key") == expected for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_repeat_episode_dedupes_via_fact_key():
+    """Re-emitting the same triple in a later episode reuses the existing
+    edge instead of creating a duplicate."""
+
+    fact = ExtractedFact("Alice", "works_at", "Acme", "Alice works at Acme.")
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="Alice"), ExtractedEntity(name="Acme")],
+                facts=[fact],
+            ),
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="Alice"), ExtractedEntity(name="Acme")],
+                facts=[fact],
+            ),
+        ]
+    )
+    driver = FakeSurrealDriver(enforce_entity_name_uniq=True)
+    s = Surriti(driver, llm_client=llm, embedder=DummyEmbedder(embedding_dim=64))
+    r1 = await s.add_episode(name="e1", episode_body="x", group_id="g")
+    r2 = await s.add_episode(name="e2", episode_body="y", group_id="g")
+
+    relates = driver.records["relates_to"]
+    assert len(relates) == 1, "duplicate triple must reuse the existing edge"
+    # The single row should now reference both episodes.
+    assert {ep for ep in relates[0].get("episodes", [])} >= {
+        r1.episode.uuid, r2.episode.uuid,
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_facts_as_of_returns_only_valid_at_timestamp():
+    """An edge that becomes invalid at T should appear in queries before
+    T and disappear in queries at/after T."""
+
+    from datetime import datetime, timedelta, timezone
+
+    fact1 = ExtractedFact(
+        "Alice", "works_at", "Acme", "Alice works at Acme.",
+        temporal=True, singleton=True, domain="employment",
+    )
+    fact2 = ExtractedFact(
+        "Alice", "works_at", "Globex", "Alice works at Globex.",
+        temporal=True, singleton=True, domain="employment",
+    )
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="Alice"), ExtractedEntity(name="Acme")],
+                facts=[fact1],
+            ),
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="Alice"), ExtractedEntity(name="Globex")],
+                facts=[fact2],
+            ),
+        ]
+    )
+    driver = FakeSurrealDriver(enforce_entity_name_uniq=True)
+    s = Surriti(driver, llm_client=llm, embedder=DummyEmbedder(embedding_dim=64))
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    t1 = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    r1 = await s.add_episode(
+        name="e1", episode_body="x", group_id="g", reference_time=t0,
+    )
+    await s.add_episode(
+        name="e2", episode_body="y", group_id="g", reference_time=t1,
+    )
+
+    alice_uuid = next(n.uuid for n in r1.nodes if n.name == "Alice")
+
+    # Before t1: only Acme should be valid.
+    before = await s.get_facts_as_of(
+        subject_uuid=alice_uuid,
+        as_of=t0 + timedelta(days=10),
+        group_id="g",
+        predicate="works_at",
+    )
+    targets_before = {e.target_node_uuid for e in before}
+    acme_uuid = next(n.uuid for n in r1.nodes if n.name == "Acme")
+    assert acme_uuid in targets_before
+    assert all(e.target_node_uuid == acme_uuid for e in before)
+
+    # At/after t1: only Globex should be valid (Acme closed by singleton).
+    after = await s.get_facts_as_of(
+        subject_uuid=alice_uuid,
+        as_of=t1 + timedelta(days=1),
+        group_id="g",
+        predicate="works_at",
+    )
+    assert after, "expected at least one edge valid after the switch"
+    assert acme_uuid not in {e.target_node_uuid for e in after}
+
+
+@pytest.mark.asyncio
+async def test_get_state_as_of_collapses_to_one_edge_per_slot():
+    from datetime import datetime, timezone
+
+    fact = ExtractedFact(
+        "Alice", "works_at", "Acme", "Alice works at Acme.",
+        temporal=True, singleton=True, domain="employment",
+    )
+    llm = ScriptedLLMClient(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="Alice"), ExtractedEntity(name="Acme")],
+                facts=[fact],
+            ),
+        ]
+    )
+    driver = FakeSurrealDriver(enforce_entity_name_uniq=True)
+    s = Surriti(driver, llm_client=llm, embedder=DummyEmbedder(embedding_dim=64))
+    r = await s.add_episode(
+        name="e1", episode_body="x", group_id="g",
+        reference_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    alice_uuid = next(n.uuid for n in r.nodes if n.name == "Alice")
+    state = await s.get_state_as_of(
+        subject_uuid=alice_uuid,
+        as_of=datetime(2026, 12, 1, tzinfo=timezone.utc),
+        group_id="g",
+    )
+    assert state, "expected at least one slot in the as-of state map"
+    # Each key is (predicate, target_uuid).
+    assert all(isinstance(k, tuple) and len(k) == 2 for k in state.keys())
+
+
+@pytest.mark.asyncio
+async def test_find_contradictions_receives_structured_candidates():
+    """The temporal layer forwards a structured candidate list to the
+    LLM client, on top of the legacy fact-string list."""
+
+    from surriti.llm import ContradictionCandidate
+
+    captured: list[dict] = []
+
+    class Spy(ScriptedLLMClient):
+        async def find_contradictions(self, new_fact, existing_facts, **kwargs):
+            captured.append({
+                "new_fact": new_fact,
+                "existing_facts": list(existing_facts),
+                "candidates": list(kwargs.get("candidates") or []),
+                "new_fact_struct": kwargs.get("new_fact_struct"),
+            })
+            return []
+
+    llm = Spy(
+        [
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="Alice"), ExtractedEntity(name="Acme")],
+                facts=[ExtractedFact(
+                    "Alice", "works_at", "Acme", "Alice works at Acme.",
+                    temporal=True, domain="employment",
+                )],
+            ),
+            ScriptedResponse(
+                entities=[ExtractedEntity(name="Alice"), ExtractedEntity(name="Globex")],
+                facts=[ExtractedFact(
+                    "Alice", "works_at", "Globex", "Alice works at Globex.",
+                    temporal=True, domain="employment",
+                )],
+            ),
+        ]
+    )
+    driver = FakeSurrealDriver(enforce_entity_name_uniq=True)
+    s = Surriti(driver, llm_client=llm, embedder=DummyEmbedder(embedding_dim=64))
+    await s.add_episode(name="e1", episode_body="x", group_id="g")
+    await s.add_episode(name="e2", episode_body="y", group_id="g")
+
+    # The first contradiction call (for episode 2) should carry structured
+    # candidates with subject/predicate/object/domain populated.
+    assert captured, "expected at least one find_contradictions call"
+    last = captured[-1]
+    assert last["new_fact_struct"] is not None
+    assert last["new_fact_struct"].predicate == "works_at"
+    assert last["candidates"], "structured candidates should be forwarded"
+    assert all(isinstance(c, ContradictionCandidate) for c in last["candidates"])
+    assert last["candidates"][0].domain == "employment"

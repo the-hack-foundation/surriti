@@ -10,6 +10,31 @@ from pydantic import Field
 from surriti.nodes import _Base, utc_now
 
 
+def make_fact_key(
+    group_id: str,
+    subject_uuid: str,
+    predicate: str,
+    object_uuid: str,
+) -> str:
+    """Deterministic dedupe key for a (subject, predicate, object) triple.
+
+    Used to populate ``relates_to.fact_key`` on insert and to look up
+    equivalent edges across episodes without relying on natural-language
+    fact-text comparison. The format is intentionally simple and stable:
+
+        ``"<group_id>::<subject_uuid>::<predicate_lower>::<object_uuid>"``
+    """
+
+    return "::".join(
+        (
+            (group_id or "").strip(),
+            (subject_uuid or "").strip(),
+            (predicate or "").strip().lower(),
+            (object_uuid or "").strip(),
+        )
+    )
+
+
 class _Edge(_Base):
     source_node_uuid: str
     target_node_uuid: str
@@ -57,6 +82,12 @@ class EntityEdge(_Edge):
     closer fires)."""
     superseded_by: str | None = None
     """UUID of the edge that closed this one (set on the closed edge)."""
+
+    fact_key: str = ""
+    """Deterministic ``(group_id, subject, predicate, object)`` key used
+    to dedupe equivalent triples across episodes. Computed by
+    :func:`make_fact_key` on insert; backfilled for legacy rows by the
+    schema migration helper."""
 
     attributes: dict[str, Any] = Field(default_factory=dict)
 

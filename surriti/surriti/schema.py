@@ -101,9 +101,15 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     DEFINE FIELD IF NOT EXISTS domain         ON relates_to TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS supersedes     ON relates_to TYPE array<string> DEFAULT [];
     DEFINE FIELD IF NOT EXISTS superseded_by  ON relates_to TYPE option<string>;
+    -- Deterministic dedupe key (group_id::subject_uuid::predicate::object_uuid).
+    -- Empty default keeps backward compatibility with rows written before
+    -- this field existed; ``backfill_fact_keys()`` populates them so the
+    -- unique index can be enabled after migration.
+    DEFINE FIELD IF NOT EXISTS fact_key       ON relates_to TYPE string DEFAULT "";
     DEFINE INDEX IF NOT EXISTS relates_to_uuid_idx  ON relates_to FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS relates_to_group_idx ON relates_to FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS relates_to_active_idx ON relates_to FIELDS group_id, in, name, status;
+    DEFINE INDEX IF NOT EXISTS relates_to_fact_key_idx ON relates_to FIELDS group_id, fact_key;
     DEFINE INDEX IF NOT EXISTS relates_to_fact_fts  ON relates_to FIELDS fact
         FULLTEXT ANALYZER surriti_en BM25 HIGHLIGHTS;
     DEFINE INDEX IF NOT EXISTS relates_to_fact_hnsw ON relates_to FIELDS fact_embedding
@@ -126,3 +132,42 @@ ALL_TABLES: tuple[str, ...] = (
     "entity",
     "community",
 )
+
+
+async def backfill_fact_keys(driver) -> int:
+    """Populate ``relates_to.fact_key`` for legacy rows lacking it.
+
+    Returns the number of edges updated. Safe to run repeatedly: rows
+    that already have a non-empty ``fact_key`` are skipped. Run once
+    after upgrading from a Surriti version that did not write fact keys
+    on insert; subsequent inserts populate the field automatically.
+    """
+
+    from surriti.search import _unwrap
+
+    rows = _unwrap(
+        await driver.query(
+            """
+            SELECT uuid, group_id, name,
+                record::id(in)  AS subject_uuid,
+                record::id(out) AS object_uuid
+            FROM relates_to WHERE fact_key = "" OR fact_key IS NONE;
+            """
+        )
+    )
+    updated = 0
+    for row in rows:
+        key = "::".join(
+            (
+                str(row.get("group_id") or "").strip(),
+                str(row.get("subject_uuid") or "").strip(),
+                str(row.get("name") or "").strip().lower(),
+                str(row.get("object_uuid") or "").strip(),
+            )
+        )
+        await driver.query(
+            "UPDATE relates_to SET fact_key = $key WHERE uuid = $uuid;",
+            {"key": key, "uuid": row.get("uuid")},
+        )
+        updated += 1
+    return updated

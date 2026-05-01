@@ -32,6 +32,7 @@
           <label><input class="kindToggle" type="checkbox" value="episode" checked> Episodes</label>
           <label><input class="kindToggle" type="checkbox" value="community" checked> Communities</label>
           <label><input id="invalidToggle" type="checkbox" checked> Invalidated facts</label>
+          <label><input id="aggregateToggle" type="checkbox" checked> Aggregate mentions</label>
         </div>
 
         <div class="toolbar">
@@ -39,6 +40,14 @@
           <button id="fitBtn" type="button">Fit</button>
           <button id="freezeBtn" type="button">Freeze</button>
         </div>
+
+        <section class="timeline" aria-label="Temporal playback">
+          <div class="timeline-head">
+            <label><input id="asOfToggle" type="checkbox"> As-of mode</label>
+            <span id="asOfLabel" class="muted">live</span>
+          </div>
+          <input id="asOfSlider" type="range" min="0" max="100" value="100" disabled>
+        </section>
 
         <section class="metrics" aria-label="Graph metrics">
           <div><span id="nodeCount">0</span><small>nodes</small></div>

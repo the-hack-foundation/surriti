@@ -19,7 +19,7 @@ from typing import Iterable
 
 from surriti.driver import SurrealDriver
 from surriti.edges import EntityEdge
-from surriti.llm import LLMClient
+from surriti.llm import ContradictionCandidate, ExtractedFact, LLMClient
 from surriti.search import _fulltext_search_edges, _vector_search_edges, _unwrap
 from surriti.utils import parse_edge
 
@@ -80,26 +80,66 @@ async def resolve_contradictions(
     new_valid_at: datetime,
     group_id: str,
     similarity_limit: int = 10,
+    new_fact_struct: ExtractedFact | None = None,
+    new_edge_uuid: str | None = None,
 ) -> list[EntityEdge]:
-    """Run the full contradiction pipeline. Returns the invalidated edges."""
+    """Run the full contradiction pipeline. Returns the invalidated edges.
 
-    candidates = await find_similar_edges(
+    When ``new_fact_struct`` is supplied, structured
+    :class:`~surriti.llm.ContradictionCandidate` records are built from
+    the similar edges and forwarded to the LLM client so the prompt can
+    reason about subject/predicate/object/domain explicitly. When
+    ``new_edge_uuid`` is supplied, invalidated edges are stamped with
+    ``superseded_by`` pointing at it.
+    """
+
+    candidates_edges = await find_similar_edges(
         driver,
         fact=new_fact,
         fact_embedding=new_fact_embedding,
         group_id=group_id,
         limit=similarity_limit,
     )
-    if not candidates:
+    if not candidates_edges:
         return []
 
-    fact_strings = [c.fact for c in candidates]
-    contradicted_idx = await llm.find_contradictions(new_fact, fact_strings)
+    fact_strings = [c.fact for c in candidates_edges]
+
+    # Build structured candidates whenever we have a new ExtractedFact in
+    # scope. Stub clients ignore them; production clients use them.
+    structured: list[ContradictionCandidate] | None = None
+    if new_fact_struct is not None:
+        structured = []
+        for edge in candidates_edges:
+            structured.append(
+                ContradictionCandidate(
+                    uuid=edge.uuid,
+                    subject=edge.source_node_uuid,
+                    predicate=edge.name,
+                    object=edge.target_node_uuid,
+                    fact=edge.fact,
+                    domain=edge.domain,
+                    valid_at=edge.valid_at.isoformat() if edge.valid_at else None,
+                    invalid_at=edge.invalid_at.isoformat() if edge.invalid_at else None,
+                )
+            )
+
+    contradicted_idx = await llm.find_contradictions(
+        new_fact,
+        fact_strings,
+        candidates=structured,
+        new_fact_struct=new_fact_struct,
+    )
     if not contradicted_idx:
         return []
 
-    invalidated = [candidates[i] for i in contradicted_idx if 0 <= i < len(candidates)]
+    invalidated = [
+        candidates_edges[i] for i in contradicted_idx if 0 <= i < len(candidates_edges)
+    ]
     await invalidate_edges(
-        driver, [e.uuid for e in invalidated], invalid_at=new_valid_at
+        driver,
+        [e.uuid for e in invalidated],
+        invalid_at=new_valid_at,
+        superseded_by=new_edge_uuid,
     )
     return invalidated

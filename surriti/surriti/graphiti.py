@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from surriti.driver import SurrealDriver
-from surriti.edges import CommunityEdge, EntityEdge, EpisodicEdge
+from surriti.edges import CommunityEdge, EntityEdge, EpisodicEdge, make_fact_key
 from surriti.embedder import DummyEmbedder, EmbedderClient
 from surriti.llm import (
     DummyLLMClient,
@@ -31,6 +31,7 @@ from surriti.search import (
 from surriti.search_filters import SearchFilters
 from surriti.temporal import invalidate_edges, resolve_contradictions
 from surriti.utils import parse_community, parse_edge, parse_entity, parse_episode
+from surriti.validators import IDENTITY_PREDICATES, repair_fact
 
 logger = logging.getLogger(__name__)
 
@@ -346,13 +347,48 @@ class Surriti:
                 entities.append(speaker_ents[0])
 
         # Predicates that *legitimately* connect an entity to itself
-        # (identity/aliasing). Everything else with subject == object is LLM
-        # garbage we drop as defence-in-depth on top of the system prompt.
-        _IDENTITY_PREDICATES = {"is_named", "is_called", "is_self", "is_aka"}
+        # (identity/aliasing). Imported from the shared validator so the
+        # add-episode loop and the standalone validator agree.
+        _IDENTITY_PREDICATES = IDENTITY_PREDICATES
 
         edges: list[EntityEdge] = []
         invalidated_all: list[EntityEdge] = []
         for fact in extraction.facts:
+            # Run the deterministic post-extraction repair pass first.
+            # This normalises predicates, drops banned placeholder
+            # objects ("lives_in world"), and rewrites identity
+            # self-loops to the speaker's stable id when possible.
+            original_subject = fact.subject
+            repaired = repair_fact(
+                fact,
+                speaker_id=speaker_id,
+                speaker_name=speaker_name,
+            )
+            if repaired is None:
+                logger.debug(
+                    "Validator dropped fact %r -[%s]-> %r",
+                    original_subject, fact.predicate, fact.object,
+                )
+                continue
+            fact = repaired
+
+            # If the validator rewrote the subject to the speaker_id
+            # (identity self-loop repair) we need to make sure that
+            # entity exists in this episode's name->entity map.
+            if (
+                speaker_id
+                and fact.subject == speaker_id
+                and speaker_id != original_subject
+                and fact.subject not in name_to_entity
+            ):
+                speaker_ents = await self._upsert_entities(
+                    [ExtractedEntity(name=speaker_id, labels=["User"])],
+                    group_id=group_id,
+                )
+                name_to_entity[speaker_id] = speaker_ents[0]
+                if speaker_ents[0].uuid not in {e.uuid for e in entities}:
+                    entities.append(speaker_ents[0])
+
             subject = name_to_entity.get(fact.subject)
             obj = name_to_entity.get(fact.object)
             if subject is None or obj is None:
@@ -364,41 +400,16 @@ class Surriti:
                     list(name_to_entity.keys()),
                 )
                 continue
-            predicate = (fact.predicate or "").lower()
-            if subject.uuid == obj.uuid:
-                # Speaker-aware repair: small models often emit
-                # "Auley is_named Auley" when the speaker's stable id is
-                # "default". Rewrite the subject to the speaker's id so
-                # the naming edge connects two distinct entities.
-                if (
-                    speaker_id
-                    and predicate in _IDENTITY_PREDICATES
-                    and fact.subject != speaker_id
-                    and speaker_id != fact.object
-                ):
-                    speaker_ents = await self._upsert_entities(
-                        [ExtractedEntity(name=speaker_id, labels=["User"])],
-                        group_id=group_id,
-                    )
-                    subject = speaker_ents[0]
-                    name_to_entity[speaker_id] = subject
-                    if subject.uuid not in {e.uuid for e in entities}:
-                        entities.append(subject)
-                    logger.debug(
-                        "Rewrote self-loop identity fact subject %r -> %r",
-                        fact.subject, speaker_id,
-                    )
-                elif predicate in _IDENTITY_PREDICATES and not speaker_id:
-                    # Identity predicate but no speaker context to repair
-                    # with -- keep the self-loop as a fallback so we don't
-                    # lose the naming entirely.
-                    pass
-                else:
-                    logger.debug(
-                        "Skipping self-loop fact %r -[%s]-> %r",
-                        fact.subject, fact.predicate, fact.object,
-                    )
-                    continue
+            predicate = fact.predicate
+            if subject.uuid == obj.uuid and predicate not in _IDENTITY_PREDICATES:
+                # Identity-predicate self-loops without a repair path
+                # are kept by the validator; everything else with
+                # subject==object after repair is unsalvageable.
+                logger.debug(
+                    "Skipping post-repair self-loop %r -[%s]-> %r",
+                    fact.subject, fact.predicate, fact.object,
+                )
+                continue
             op = (fact.operation or "assert").lower()
             if op == "noop":
                 continue
@@ -1430,6 +1441,9 @@ class Surriti:
             singleton=fact.singleton,
             domain=fact.domain,
             supersedes=[e.uuid for e in singleton_closed],
+            fact_key=make_fact_key(
+                group_id, subject.uuid, fact.predicate, obj.uuid
+            ),
         )
 
         # Skip the LLM contradiction pass when the deterministic closer
@@ -1445,6 +1459,8 @@ class Surriti:
                 new_fact_embedding=embedding,
                 new_valid_at=valid_at,
                 group_id=group_id,
+                new_fact_struct=fact,
+                new_edge_uuid=edge_uuid,
             )
 
         await self.driver.query(
@@ -1467,6 +1483,7 @@ class Surriti:
                 singleton: $singleton,
                 domain: $domain,
                 supersedes: $supersedes,
+                fact_key: $fact_key,
                 attributes: {},
                 created_at: $created_at
             };
@@ -1490,6 +1507,7 @@ class Surriti:
                 "singleton": edge.singleton,
                 "domain": edge.domain,
                 "supersedes": edge.supersedes,
+                "fact_key": edge.fact_key,
                 "created_at": edge.created_at,
             },
         )
@@ -1665,6 +1683,89 @@ class Surriti:
         rows = _unwrap(await self.driver.query(surql, params))
         return [parse_edge(r) for r in rows]
 
+    async def get_facts_as_of(
+        self,
+        *,
+        subject_uuid: str,
+        as_of: datetime,
+        group_id: str = "",
+        predicate: str | None = None,
+        domain: str | None = None,
+        limit: int = 200,
+    ) -> list[EntityEdge]:
+        """Return edges that were valid at the given timestamp.
+
+        An edge is valid "as of" ``as_of`` when its ``valid_at`` is at
+        or before ``as_of`` AND its ``invalid_at`` is either unset or
+        strictly after ``as_of``. The query is generic and uses no
+        hardcoded predicate vocabulary -- pass ``predicate`` or
+        ``domain`` to scope the result.
+        """
+
+        from surriti.search import _unwrap
+
+        clauses = [
+            "group_id = $group_id",
+            'in = type::record("entity", $src)',
+            "(valid_at IS NONE OR valid_at <= $as_of)",
+            "(invalid_at IS NONE OR invalid_at > $as_of)",
+        ]
+        params: dict[str, Any] = {
+            "group_id": group_id,
+            "src": subject_uuid,
+            "as_of": as_of,
+            "limit": int(limit),
+        }
+        if predicate is not None:
+            clauses.append("name = $name")
+            params["name"] = predicate
+        if domain is not None:
+            clauses.append("domain = $domain")
+            params["domain"] = domain
+        surql = (
+            "SELECT * FROM relates_to WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY valid_at DESC LIMIT $limit;"
+        )
+        rows = _unwrap(await self.driver.query(surql, params))
+        return [parse_edge(r) for r in rows]
+
+    async def get_state_as_of(
+        self,
+        *,
+        subject_uuid: str,
+        as_of: datetime,
+        group_id: str = "",
+        predicate: str | None = None,
+        domain: str | None = None,
+    ) -> dict[tuple[str, str], EntityEdge]:
+        """Return the latest valid edge per ``(predicate, object)`` slot.
+
+        Convenience reducer for visualizer "as of" rendering: collapses
+        the raw list from :meth:`get_facts_as_of` to one edge per slot,
+        keeping the one with the most recent ``valid_at``.
+        """
+
+        edges = await self.get_facts_as_of(
+            subject_uuid=subject_uuid,
+            as_of=as_of,
+            group_id=group_id,
+            predicate=predicate,
+            domain=domain,
+        )
+        latest: dict[tuple[str, str], EntityEdge] = {}
+        for edge in edges:
+            key = (edge.name, edge.target_node_uuid)
+            existing = latest.get(key)
+            if existing is None:
+                latest[key] = edge
+                continue
+            ev = edge.valid_at or datetime.min.replace(tzinfo=timezone.utc)
+            xv = existing.valid_at or datetime.min.replace(tzinfo=timezone.utc)
+            if ev > xv:
+                latest[key] = edge
+        return latest
+
     async def _find_equivalent_edge(
         self,
         *,
@@ -1676,13 +1777,38 @@ class Surriti:
     ) -> EntityEdge | None:
         """Find an existing exact edge that should receive another episode support.
 
-        This is the SurrealDB-native approximation of Graphiti's edge
-        resolution pass for repeated facts. Near-duplicate facts still go
-        through contradiction handling so temporal changes are not masked.
+        Primary lookup is the deterministic ``fact_key`` (group_id +
+        subject + predicate + object). For backward compatibility with
+        rows written before ``fact_key`` existed, falls back to a
+        triple-match query and exact ``fact`` text comparison. Near-
+        duplicate facts still go through contradiction handling so
+        temporal changes are not masked.
         """
 
         from surriti.search import _unwrap
 
+        key = make_fact_key(group_id, subject_uuid, predicate, object_uuid)
+        rows = _unwrap(
+            await self.driver.query(
+                """
+                SELECT * FROM relates_to
+                WHERE group_id = $group_id
+                    AND fact_key = $key
+                    AND invalid_at IS NONE
+                LIMIT 10;
+                """,
+                {"group_id": group_id, "key": key},
+            )
+        )
+        # Only treat the existing edge as equivalent when the natural-
+        # language fact text also matches; differently-worded restatements
+        # of the same triple still flow into contradiction handling so a
+        # negation cue ("no longer ...") can invalidate the prior edge.
+        exact = next((row for row in rows if row.get("fact") == fact_text), None)
+        if exact is not None:
+            return parse_edge(exact)
+
+        # Legacy fallback for rows that pre-date the fact_key field.
         rows = _unwrap(
             await self.driver.query(
                 """

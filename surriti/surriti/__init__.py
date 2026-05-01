@@ -28,7 +28,7 @@ See ``examples/`` for fuller scenarios.
 
 from surriti._logging import setup_logging
 from surriti.driver import SurrealDriver
-from surriti.edges import CommunityEdge, EntityEdge, EpisodicEdge
+from surriti.edges import CommunityEdge, EntityEdge, EpisodicEdge, make_fact_key
 from surriti.embedder import DummyEmbedder, EmbedderClient, OpenAIEmbedder
 from surriti.errors import (
     SurritiConfigError,
@@ -47,6 +47,7 @@ from surriti.graphiti import (
     Surriti,
 )
 from surriti.llm import (
+    ContradictionCandidate,
     DummyLLMClient,
     ExtractedEntity,
     ExtractedFact,
@@ -64,6 +65,7 @@ from surriti.search_filters import (
     PropertyFilter,
     SearchFilters,
 )
+from surriti.validators import IDENTITY_PREDICATES, repair_fact
 
 __all__ = [
     # Core facade
@@ -85,6 +87,7 @@ __all__ = [
     "EpisodicEdge",
     "EpisodicNode",
     # LLM
+    "ContradictionCandidate",
     "DummyLLMClient",
     "ExtractedEntity",
     "ExtractedFact",
@@ -117,6 +120,9 @@ __all__ = [
     "SurritiSchemaError",
     # Helpers
     "setup_logging",
+    "make_fact_key",
+    "repair_fact",
+    "IDENTITY_PREDICATES",
 ]
 
 __version__ = "0.5.0"

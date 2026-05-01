@@ -146,12 +146,14 @@ async def test_scripted_contradiction_invalidates_previous_edge():
         ]
     )
 
-    async def find_contradictions(new_fact, prior_facts):  # noqa: ARG001
+    async def find_contradictions(new_fact, prior_facts, **kwargs):  # noqa: ARG001
         # Replays the response queue's contradiction hints. The first call
         # to extract popped the first response; subsequent contradiction
         # calls correspond to the *next* extract result. To keep this test
         # deterministic, contradict any prior fact mentioning "Acme" when the
-        # incoming fact mentions "Globex".
+        # incoming fact mentions "Globex". The ``**kwargs`` bucket absorbs
+        # the structured ``candidates`` / ``new_fact_struct`` parameters
+        # that the temporal layer now forwards to real adapters.
         if "Globex" in new_fact and any("Acme" in p for p in prior_facts):
             return list(range(len(prior_facts)))
         return []
