@@ -18,8 +18,8 @@ const detailsEl = document.querySelector("#details");
 const conflictListEl = document.querySelector("#conflictList");
 const timelineViewEl = document.querySelector("#timelineView");
 const conflictBadgeEl = document.querySelector("#conflictBadge");
-const aliasListEl = document.querySelector("#aliasList");
-const aliasBadgeEl = document.querySelector("#aliasBadge");
+const aliasListEl = document.querySelector("#aliasList");const aliasBadgeEl = document.querySelector("#aliasBadge");
+const dossierViewEl = document.querySelector("#dossierView");
 const frameHealthEl = document.querySelector("#frameHealth");
 const selectionKindEl = document.querySelector("#selectionKind");
 const transcriptModal = document.querySelector("#transcriptModal");
@@ -622,6 +622,7 @@ function selectItem(item, type) {
   renderDetails(item, type);
   switchTab("inspector");
   if (type === "node" && item.kind === "entity") loadTimeline(item.id);
+  if (type === "node" && item.kind === "entity") loadDossier(item.id);
   updateFocus();
   persistState();
 }
@@ -1130,13 +1131,61 @@ async function loadTimeline(uuid) {
     timelineViewEl.innerHTML = `<p class="empty">Failed to load timeline: ${escapeHtml(err.message)}</p>`;
   }
 }
+// ---------- Dossier tab ----------
+async function loadDossier(uuid) {
+  if (!dossierViewEl) return;
+  const params = new URLSearchParams();
+  const group = controls.group.value.trim();
+  if (group) params.set("group_id", group);
+  dossierViewEl.innerHTML = `<p class="empty">Loading dossier…</p>`;
+  try {
+    const res = await fetch(`/api/entity/${encodeURIComponent(uuid)}/profile?${params}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    renderDossier(await res.json());
+  } catch (err) {
+    dossierViewEl.innerHTML = `<p class="empty">Failed to load dossier: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function renderDossier(data) {
+  const aliases = (data.aliases || []).filter(a => a && a !== data.canonical_name);
+  const aliasChips = aliases.length
+    ? `<div class="pill-row">${aliases.map(a => `<span class="pill">${escapeHtml(a)}</span>`).join("")}</div>`
+    : `<p class="empty">No alias variants recorded.</p>`;
+  const facts = (data.facts || []).slice(0, 30).map(f => `
+    <div class="fact-row">
+      <span class="pill">${escapeHtml(f.canonical_name || f.name || "relates_to")}</span>
+      <span class="obj">${escapeHtml(f.fact || "")}</span>
+    </div>
+  `).join("");
+  const salience = typeof data.salience === "number" ? data.salience.toFixed(2) : data.salience;
+  dossierViewEl.innerHTML = `
+    <section class="detail-block">
+      <h2>${escapeHtml(data.canonical_name || data.name || "Entity")}</h2>
+      <div class="pill-row">
+        <span class="pill">salience ${salience}</span>
+        <span class="pill">mentions ${data.mention_count || 0}</span>
+        ${data.last_seen_at ? `<span class="pill">last seen ${escapeHtml(String(data.last_seen_at))}</span>` : ""}
+      </div>
+      ${data.profile_summary ? `<p>${escapeHtml(data.profile_summary)}</p>` : `<p class="empty">No dossier summary yet.</p>`}
+    </section>
+    <section class="detail-block">
+      <h3>Aliases</h3>
+      ${aliasChips}
+    </section>
+    <section class="detail-block">
+      <h3>Recent facts</h3>
+      ${facts || `<p class="empty">No facts recorded.</p>`}
+    </section>
+  `;
+}
+
 function renderTimeline(data) {
   const events = data.events || [];
   if (!events.length) {
     timelineViewEl.innerHTML = `<p class="empty">No facts recorded for ${escapeHtml((data.subject && data.subject.name) || "this entity")}.</p>`;
     return;
-  }
-  // Build supersedes index for chain rendering.
+  }  // Build supersedes index for chain rendering.
   const byUuid = new Map(events.map(e => [e.uuid, e]));
   const cards = events.map((e, i) => {
     const cls = timelineClass(e);

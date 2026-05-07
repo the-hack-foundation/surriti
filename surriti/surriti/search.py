@@ -24,7 +24,13 @@ from surriti.rerankers import (
     rrf,
 )
 from surriti.search_filters import SearchFilters, edge_passes_filters, node_passes_filters
-from surriti.utils import parse_community, parse_edge, parse_entity, parse_episode
+from surriti.utils import (
+    _strip_record_id,
+    parse_community,
+    parse_edge,
+    parse_entity,
+    parse_episode,
+)
 
 DEFAULT_LIMIT = 10
 RRF_K = 60  # Standard Reciprocal Rank Fusion smoothing constant.
@@ -176,6 +182,7 @@ async def hybrid_search(
     query_embedding: list[float] | None,
     group_id: str | None = None,
     config: SearchConfig | None = None,
+    ego_filter: list[str] | None = None,
 ) -> SearchResults:
     cfg = config or SearchConfig()
     rankings: list[list[str]] = []
@@ -203,6 +210,17 @@ async def hybrid_search(
     if cfg.only_valid:
         candidates = _filter_valid(candidates)
     candidates = [c for c in candidates if edge_passes_filters(c, cfg.filters)]
+
+    # Ego filter: keep only edges whose source or target is in the
+    # provided uuid set. Used by ``Surriti.recall`` to limit fact
+    # retrieval to the entities mentioned in the user's query.
+    if ego_filter:
+        ego = set(ego_filter)
+        candidates = [
+            c for c in candidates
+            if _strip_record_id(c.get("in")) in ego
+            or _strip_record_id(c.get("out")) in ego
+        ]
 
     candidates = await _apply_reranker(
         driver=driver,

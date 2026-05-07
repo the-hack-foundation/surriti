@@ -50,6 +50,17 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     DEFINE FIELD IF NOT EXISTS attributes     ON entity TYPE object FLEXIBLE DEFAULT {{}};
     DEFINE FIELD IF NOT EXISTS name_embedding ON entity TYPE option<array<float>>;
     DEFINE FIELD IF NOT EXISTS created_at     ON entity TYPE datetime;
+    -- Dossier / profile fields. All have safe defaults so existing rows
+    -- migrate forward without backfill. ``profiles.refresh_entity_profiles``
+    -- materialises the derived fields after each ingest.
+    DEFINE FIELD IF NOT EXISTS canonical_name    ON entity TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS aliases           ON entity TYPE array<string> DEFAULT [];
+    DEFINE FIELD IF NOT EXISTS profile_summary   ON entity TYPE string DEFAULT "";
+    DEFINE FIELD IF NOT EXISTS profile_embedding ON entity TYPE option<array<float>>;
+    DEFINE FIELD IF NOT EXISTS salience          ON entity TYPE float DEFAULT 0;
+    DEFINE FIELD IF NOT EXISTS mention_count     ON entity TYPE int DEFAULT 0;
+    DEFINE FIELD IF NOT EXISTS last_seen_at      ON entity TYPE option<datetime>;
+    DEFINE FIELD IF NOT EXISTS merged_into       ON entity TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS entity_uuid_idx     ON entity FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS entity_group_idx    ON entity FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS entity_name_uniq    ON entity FIELDS group_id, name UNIQUE;
@@ -57,8 +68,30 @@ def schema_ddl(embedding_dim: int = 768) -> str:
         FULLTEXT ANALYZER surriti_en BM25 HIGHLIGHTS;
     DEFINE INDEX IF NOT EXISTS entity_summary_fts  ON entity FIELDS summary
         FULLTEXT ANALYZER surriti_en BM25 HIGHLIGHTS;
+    DEFINE INDEX IF NOT EXISTS entity_profile_fts  ON entity FIELDS profile_summary
+        FULLTEXT ANALYZER surriti_en BM25 HIGHLIGHTS;
     DEFINE INDEX IF NOT EXISTS entity_name_hnsw    ON entity FIELDS name_embedding
         HNSW DIMENSION {embedding_dim} DIST COSINE TYPE F32;
+    DEFINE INDEX IF NOT EXISTS entity_profile_hnsw ON entity FIELDS profile_embedding
+        HNSW DIMENSION {embedding_dim} DIST COSINE TYPE F32;
+
+    -- Entity aliases (canonical-resolution layer). Each row is a
+    -- known surface form of an entity in a tenant. Lookup by
+    -- ``(group_id, normalized_alias)`` is the fast path before any
+    -- semantic / LLM resolution happens.
+    DEFINE TABLE IF NOT EXISTS entity_alias SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS uuid                ON entity_alias TYPE string;
+    DEFINE FIELD IF NOT EXISTS group_id            ON entity_alias TYPE string;
+    DEFINE FIELD IF NOT EXISTS alias               ON entity_alias TYPE string;
+    DEFINE FIELD IF NOT EXISTS normalized_alias    ON entity_alias TYPE string;
+    DEFINE FIELD IF NOT EXISTS entity_uuid         ON entity_alias TYPE string;
+    DEFINE FIELD IF NOT EXISTS confidence          ON entity_alias TYPE float DEFAULT 1.0;
+    DEFINE FIELD IF NOT EXISTS source_episode_uuid ON entity_alias TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS created_at          ON entity_alias TYPE datetime;
+    DEFINE INDEX IF NOT EXISTS entity_alias_uuid_idx   ON entity_alias FIELDS uuid UNIQUE;
+    DEFINE INDEX IF NOT EXISTS entity_alias_lookup     ON entity_alias FIELDS group_id, normalized_alias;
+    DEFINE INDEX IF NOT EXISTS entity_alias_unique     ON entity_alias FIELDS group_id, normalized_alias UNIQUE;
+    DEFINE INDEX IF NOT EXISTS entity_alias_entity_idx ON entity_alias FIELDS group_id, entity_uuid;
 
     -- Community ---------------------------------------------------------
     DEFINE TABLE IF NOT EXISTS community SCHEMAFULL;
@@ -162,6 +195,7 @@ ALL_TABLES: tuple[str, ...] = (
     "has_member",
     "episode",
     "entity",
+    "entity_alias",
     "community",
 )
 

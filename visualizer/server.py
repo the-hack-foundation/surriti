@@ -346,6 +346,8 @@ async def graph(
     min_confidence: float | None = Query(default=None, ge=0.0, le=1.0),
     valid_after: str | None = Query(default=None),
     valid_before: str | None = Query(default=None),
+    ego_uuid: str | None = Query(default=None),
+    ego_hops: int = Query(default=1, ge=1, le=2),
 ) -> dict[str, Any]:
     """Build the graph payload.
 
@@ -489,6 +491,34 @@ async def graph(
         target = str(row.get("target_uuid") or _record_id(row.get("out")))
         if source in nodes and target in nodes:
             links.append(_edge("has_member", row, source=source, target=target, name="has_member"))
+
+    # ------------------------------------------------------------------
+    # Ego clamp -- LOD mode used by the "Ego" view in the visualizer.
+    # We BFS from ``ego_uuid`` over the already-built link list (cheap,
+    # all the filtering is done) and prune nodes/links that fall outside
+    # the requested hop radius. Edges anchored at unknown nodes are
+    # dropped so the canvas stays clean.
+    # ------------------------------------------------------------------
+    if ego_uuid and ego_uuid in nodes:
+        adjacency: dict[str, set[str]] = {}
+        for link in links:
+            adjacency.setdefault(link["source"], set()).add(link["target"])
+            adjacency.setdefault(link["target"], set()).add(link["source"])
+        keep: set[str] = {ego_uuid}
+        frontier: set[str] = {ego_uuid}
+        for _ in range(ego_hops):
+            next_frontier: set[str] = set()
+            for nid in frontier:
+                for nb in adjacency.get(nid, ()):
+                    if nb not in keep:
+                        keep.add(nb)
+                        next_frontier.add(nb)
+            frontier = next_frontier
+        nodes = {nid: n for nid, n in nodes.items() if nid in keep}
+        links = [
+            link for link in links
+            if link["source"] in nodes and link["target"] in nodes
+        ]
 
     degree: dict[str, int] = {node_id: 0 for node_id in nodes}
     for link in links:
@@ -652,9 +682,12 @@ async def entity_timeline(
     where = "WHERE " + " AND ".join(clauses)
     rows = await _query(
         f"""
-        SELECT *, record::id(in) AS source_uuid, record::id(out) AS target_uuid
+        SELECT *,
+            record::id(in) AS source_uuid,
+            record::id(out) AS target_uuid,
+            time::unix(valid_at OR created_at) AS sort_ts
         FROM relates_to {where}
-        ORDER BY (valid_at OR created_at)
+        ORDER BY sort_ts
         LIMIT $limit;
         """,
         params,
@@ -688,6 +721,85 @@ async def entity_timeline(
         "subject": subject,
         "events": events,
         "count": len(events),
+        "generated_at": _utcnow_iso(),
+    }
+
+
+@app.get("/api/entity/{uuid}/profile")
+async def entity_profile(
+    uuid: str,
+    group_id: str | None = Query(default=None),
+    fact_limit: int = Query(default=20, ge=1, le=200),
+) -> dict[str, Any]:
+    """Dossier payload for a single entity.
+
+    Returns the canonical name, alias chips, dossier summary,
+    salience / mention metadata, and the most recent valid facts where
+    the entity is on either side. This is the data the visualizer's
+    Dossier panel renders.
+    """
+
+    e_clauses = ["uuid = $uuid"]
+    e_params: dict[str, Any] = {"uuid": uuid}
+    if group_id:
+        e_clauses.append("group_id = $group_id")
+        e_params["group_id"] = group_id
+    e_rows = await _query(
+        f"SELECT * FROM entity WHERE {' AND '.join(e_clauses)} LIMIT 1;",
+        e_params,
+    )
+    if not e_rows:
+        raise HTTPException(status_code=404, detail="entity not found")
+    row = e_rows[0]
+
+    # Aliases that resolve TO this entity.
+    a_clauses = ["entity_uuid = $uuid"]
+    a_params: dict[str, Any] = {"uuid": uuid}
+    if group_id:
+        a_clauses.append("group_id = $group_id")
+        a_params["group_id"] = group_id
+    aliases = await _query(
+        f"SELECT alias, normalized_alias, confidence, source_episode_uuid "
+        f"FROM entity_alias WHERE {' AND '.join(a_clauses)};",
+        a_params,
+    )
+
+    # Top facts (recency-ordered, both directions).
+    f_clauses = ["(record::id(in) = $uuid OR record::id(out) = $uuid)"]
+    f_params: dict[str, Any] = {"uuid": uuid, "limit": fact_limit}
+    if group_id:
+        f_clauses.append("group_id = $group_id")
+        f_params["group_id"] = group_id
+    f_clauses.append("(invalid_at IS NONE OR invalid_at = NONE)")
+    facts = await _query(
+        f"""
+        SELECT *,
+            record::id(in) AS source_uuid,
+            record::id(out) AS target_uuid,
+            time::unix(valid_at OR created_at) AS sort_ts
+        FROM relates_to WHERE {' AND '.join(f_clauses)}
+        ORDER BY sort_ts DESC
+        LIMIT $limit;
+        """,
+        f_params,
+    )
+
+    return {
+        "uuid": str(row.get("uuid") or uuid),
+        "group_id": row.get("group_id"),
+        "name": row.get("name"),
+        "canonical_name": row.get("canonical_name") or row.get("name"),
+        "aliases": list(row.get("aliases") or []),
+        "alias_records": [_jsonable(a) for a in aliases],
+        "labels": list(row.get("labels") or []),
+        "summary": row.get("summary") or "",
+        "profile_summary": row.get("profile_summary") or "",
+        "salience": row.get("salience") or 0,
+        "mention_count": row.get("mention_count") or 0,
+        "last_seen_at": _jsonable(row.get("last_seen_at")),
+        "merged_into": row.get("merged_into"),
+        "attributes": _jsonable(row.get("attributes") or {}),
+        "facts": [_jsonable(f) for f in facts],
         "generated_at": _utcnow_iso(),
     }
 

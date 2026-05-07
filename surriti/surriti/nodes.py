@@ -49,6 +49,32 @@ class EntityNode(_Base):
     summary: str = ""
     labels: list[str] = Field(default_factory=lambda: ["Entity"])
     attributes: dict[str, Any] = Field(default_factory=dict)
+    # Dossier / profile fields. ``profiles.refresh_entity_profiles``
+    # materialises these after each ingest. Kept optional so existing
+    # callers and stored rows are unaffected.
+    canonical_name: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    profile_summary: str = ""
+    profile_embedding: list[float] | None = None
+    salience: float = 0.0
+    mention_count: int = 0
+    last_seen_at: datetime | None = None
+    merged_into: str | None = None
+
+
+class EntityAlias(_Base):
+    """A known surface form of an entity within a tenant.
+
+    Stored in the ``entity_alias`` table. ``normalized_alias`` is the
+    casefolded / whitespace-collapsed form used for O(1) lookup before
+    semantic / LLM resolution runs.
+    """
+
+    alias: str
+    normalized_alias: str
+    entity_uuid: str
+    confidence: float = 1.0
+    source_episode_uuid: str | None = None
 
 
 class CommunityNode(_Base):

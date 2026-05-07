@@ -50,6 +50,28 @@ class InMemoryDriver:
         if s.startswith('CREATE type::record("episode"'):
             self._insert("episode", v)
             return [[{"ok": True}]]
+        if s.startswith('CREATE type::record("entity_alias"'):
+            # Enforce the (group_id, normalized_alias) unique index so
+            # alias writes converge in tests just like in production.
+            for r in self.records["entity_alias"]:
+                if (
+                    r.get("group_id") == v.get("group_id")
+                    and r.get("normalized_alias") == v.get("normalized_alias")
+                ):
+                    raise RuntimeError(
+                        "Database index entity_alias_unique already contains "
+                        f"[{v.get('group_id')!r}, {v.get('normalized_alias')!r}]"
+                    )
+            self._insert("entity_alias", v)
+            return [[{"ok": True}]]
+        if s.startswith("SELECT * FROM entity_alias WHERE group_id"):
+            wanted = set(v.get("aliases") or [])
+            rows = [
+                r for r in self.records["entity_alias"]
+                if r.get("group_id") == v.get("g")
+                and r.get("normalized_alias") in wanted
+            ]
+            return [rows]
         if s.startswith('CREATE type::record("entity"'):
             if self.enforce_entity_name_uniq:
                 for r in self.records["entity"]:
@@ -84,6 +106,26 @@ class InMemoryDriver:
                 if r.get("group_id") == v.get("g") and r.get("name") == v.get("n")
             ]
             return [rows[:1]]
+        if s.startswith("SELECT * FROM entity WHERE group_id") and "uuid = $u" in s:
+            rows = [
+                r for r in self.records["entity"]
+                if r.get("group_id") == v.get("g") and r.get("uuid") == v.get("u")
+            ]
+            return [rows[:1]]
+        if s.startswith("SELECT * FROM entity WHERE group_id") and "uuid IN" in s:
+            wanted = set(v.get("u") or [])
+            rows = [
+                r for r in self.records["entity"]
+                if r.get("group_id") == v.get("g") and r.get("uuid") in wanted
+            ]
+            return [rows]
+        if s.startswith("SELECT uuid FROM entity WHERE group_id"):
+            rows = [
+                {"uuid": r.get("uuid")}
+                for r in self.records["entity"]
+                if r.get("group_id") == v.get("g")
+            ]
+            return [rows]
         if s.startswith("SELECT * FROM entity WHERE group_id"):
             names = set(v.get("names") or [])
             rows = [
@@ -159,6 +201,20 @@ class InMemoryDriver:
             if "domain" in v:
                 rows = [r for r in rows if r.get("domain") == v.get("domain")]
             limit = v.get("limit", 50)
+            return [rows[:limit]]
+        if "FROM relates_to" in s and "(in = $rec OR out = $rec)" in s:
+            rec = v.get("rec", "")
+            uuid_part = rec.split(":", 1)[1] if ":" in rec else rec
+            rows = [
+                r for r in self.records["relates_to"]
+                if r.get("group_id") == v.get("g")
+                and (
+                    r.get("source_node_uuid") == uuid_part
+                    or r.get("target_node_uuid") == uuid_part
+                )
+                and r.get("invalid_at") is None
+            ]
+            limit = int(v.get("lim") or 30)
             return [rows[:limit]]
         if "FROM relates_to" in s and "fact_embedding <|" in s:
             vec = v.get("vec")
@@ -274,6 +330,20 @@ class InMemoryDriver:
                         r["labels"] = v["labels"]
                     if "attributes" in v:
                         r["attributes"] = v["attributes"]
+                    # Profile / dossier fields written by
+                    # surriti.profiles.refresh_entity_profiles.
+                    for key in (
+                        "profile_summary",
+                        "profile_embedding",
+                        "mention_count",
+                        "salience",
+                        "last_seen_at",
+                        "canonical_name",
+                        "aliases",
+                        "merged_into",
+                    ):
+                        if key in v:
+                            r[key] = v[key]
             return [[{"ok": True}]]
         return [[]]
 

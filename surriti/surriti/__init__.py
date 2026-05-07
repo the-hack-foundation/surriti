@@ -43,6 +43,7 @@ from surriti.graphiti import (
     AddEpisodeResults,
     AddTripletResults,
     Graphiti,
+    MemoryContext,
     RawEpisode,
     Surriti,
 )
@@ -56,7 +57,7 @@ from surriti.llm import (
     ScriptedLLMClient,
     ScriptedResponse,
 )
-from surriti.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
+from surriti.nodes import CommunityNode, EntityAlias, EntityNode, EpisodeType, EpisodicNode
 from surriti.relation_frames import (
     DEFAULT_FRAMES,
     Cardinality,
@@ -79,6 +80,8 @@ from surriti.search_filters import (
     SearchFilters,
 )
 from surriti.validators import IDENTITY_PREDICATES, repair_fact
+from surriti.entity_resolution import ResolvedEntity, resolve_entity_mentions
+from surriti.profiles import backfill_profiles, refresh_entity_profiles
 
 __all__ = [
     # Core facade
@@ -88,12 +91,14 @@ __all__ = [
     "AddBulkEpisodeResults",
     "AddEpisodeResults",
     "AddTripletResults",
+    "MemoryContext",
     "RawEpisode",
     # Driver / schema
     "SurrealDriver",
     # Node & edge models
     "CommunityEdge",
     "CommunityNode",
+    "EntityAlias",
     "EntityEdge",
     "EntityNode",
     "EpisodeType",
@@ -134,8 +139,12 @@ __all__ = [
     # Helpers
     "setup_logging",
     "make_fact_key",
-    "repair_fact",
-    "IDENTITY_PREDICATES",
+    "repair_fact",    "IDENTITY_PREDICATES",
+    # Entity resolution + dossier profiles
+    "ResolvedEntity",
+    "resolve_entity_mentions",
+    "refresh_entity_profiles",
+    "backfill_profiles",
     # Relation frames
     "RelationFrame",
     "RelationFrameRegistry",

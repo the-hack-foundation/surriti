@@ -10,7 +10,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 from surriti.edges import CommunityEdge, EntityEdge, EpisodicEdge
-from surriti.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
+from surriti.nodes import (
+    CommunityNode,
+    EntityAlias,
+    EntityNode,
+    EpisodeType,
+    EpisodicNode,
+)
 
 
 def _coerce_dt(value: Any) -> datetime | None:
@@ -62,6 +68,27 @@ def parse_entity(row: dict[str, Any]) -> EntityNode:
         labels=list(row.get("labels") or ["Entity"]),
         attributes=dict(row.get("attributes") or {}),
         name_embedding=row.get("name_embedding"),
+        created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
+        canonical_name=row.get("canonical_name"),
+        aliases=list(row.get("aliases") or []),
+        profile_summary=row.get("profile_summary", "") or "",
+        profile_embedding=row.get("profile_embedding"),
+        salience=float(row.get("salience") or 0.0),
+        mention_count=int(row.get("mention_count") or 0),
+        last_seen_at=_coerce_dt(row.get("last_seen_at")),
+        merged_into=row.get("merged_into"),
+    )
+
+
+def parse_entity_alias(row: dict[str, Any]) -> EntityAlias:
+    return EntityAlias(
+        uuid=row.get("uuid") or _strip_record_id(row.get("id")),
+        group_id=row.get("group_id", ""),
+        alias=row.get("alias", ""),
+        normalized_alias=row.get("normalized_alias", ""),
+        entity_uuid=row.get("entity_uuid", ""),
+        confidence=float(row.get("confidence") or 1.0),
+        source_episode_uuid=row.get("source_episode_uuid"),
         created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
     )
 

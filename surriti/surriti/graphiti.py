@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -91,6 +92,27 @@ class RawEpisode:
     uuid: str | None = None
 
 
+@dataclass
+class MemoryContext:
+    """Result of :meth:`Surriti.recall` -- a query-focused memory bundle.
+
+    Render any subset directly into a prompt:
+    ``profiles`` are the dossier paragraphs for entities the query
+    mentions, ``facts`` are the most relevant edges (already
+    ego-filtered when entities resolved), and ``episodes`` /
+    ``communities`` are populated only at ``depth="deep"``.
+    ``resolved_entities`` lets callers explain or audit *why* a given
+    profile / fact appears.
+    """
+
+    query: str
+    profiles: list[EntityNode] = field(default_factory=list)
+    facts: list[EntityEdge] = field(default_factory=list)
+    episodes: list[EpisodicNode] = field(default_factory=list)
+    communities: list[CommunityNode] = field(default_factory=list)
+    resolved_entities: list[dict] = field(default_factory=list)
+
+
 class Surriti:
     """Graphiti-compatible facade backed by SurrealDB.
 
@@ -115,11 +137,30 @@ class Surriti:
         *,
         relation_frames: RelationFrameRegistry | None = None,
         seed_default_frames: bool = True,
+        alias_resolution: bool = True,
+        alias_resolution_threshold: float = 0.86,
+        alias_resolution_llm: bool = True,
+        profile_refresh: str = "async",
+        profile_summary_max_facts: int = 30,
     ) -> None:
         self.driver = driver
         self.llm = llm_client or DummyLLMClient()
         self.embedder = embedder or DummyEmbedder(embedding_dim=driver.embedding_dim)
         self.cross_encoder = cross_encoder
+        # Alias resolution / dossier knobs. ``alias_resolution`` gates the
+        # whole layered pipeline; ``profile_refresh`` controls when
+        # ``profiles.refresh_entity_profiles`` runs after add_episode.
+        # All defaults are tuned to "good for production" -- opt out only
+        # for cost/latency-sensitive paths.
+        if profile_refresh not in ("sync", "async", "off"):
+            raise ValueError(
+                "profile_refresh must be one of 'sync', 'async', 'off'"
+            )
+        self.alias_resolution_enabled = alias_resolution
+        self.alias_resolution_threshold = float(alias_resolution_threshold)
+        self.alias_resolution_llm = alias_resolution_llm
+        self.profile_refresh_mode = profile_refresh
+        self.profile_summary_max_facts = int(profile_summary_max_facts)
         # Generalized relation-frame layer. Defaults are seeded so brand
         # new deployments get spouse-direction collapse, current-location
         # supersession, and identity handling without paying an LLM
@@ -166,6 +207,11 @@ class Surriti:
         cross_encoder: CrossEncoderClient | None = None,
         relation_frames: RelationFrameRegistry | None = None,
         seed_default_frames: bool = True,
+        alias_resolution: bool = True,
+        alias_resolution_threshold: float = 0.86,
+        alias_resolution_llm: bool = True,
+        profile_refresh: str = "async",
+        profile_summary_max_facts: int = 30,
     ) -> "Surriti":
         """Build a Surriti instance from environment variables.
 
@@ -189,6 +235,11 @@ class Surriti:
             cross_encoder=cross_encoder,
             relation_frames=relation_frames,
             seed_default_frames=seed_default_frames,
+            alias_resolution=alias_resolution,
+            alias_resolution_threshold=alias_resolution_threshold,
+            alias_resolution_llm=alias_resolution_llm,
+            profile_refresh=profile_refresh,
+            profile_summary_max_facts=profile_summary_max_facts,
         )
 
     # ------------------------------------------------------------------ lifecycle
@@ -381,7 +432,12 @@ class Surriti:
                 if f.subject in keep_names and f.object in keep_names
             ]
 
-        entities = await self._upsert_entities(extraction.entities, group_id=group_id)
+        entities = await self._upsert_entities(
+            extraction.entities,
+            group_id=group_id,
+            episode_uuid=episode.uuid,
+            episode_context=episode_body,
+        )
         entity_by_key = {_entity_name_key(e.name): e for e in entities}
         name_to_entity = {e.name: e for e in entities}
         for ext in extraction.entities:
@@ -526,6 +582,29 @@ class Surriti:
             communities, community_edges = await self.build_communities(
                 group_id=group_id
             )
+
+        # Touched-only profile refresh. ``async`` schedules a fire-and-forget
+        # task so the caller's add_episode latency stays unchanged; ``sync``
+        # blocks for callers that want guaranteed-fresh dossiers (tests,
+        # eval runs); ``off`` skips entirely. Either way, we only refresh
+        # entities this episode actually touched.
+        if entities and self.profile_refresh_mode != "off":
+            from surriti.profiles import refresh_entity_profiles
+
+            entity_uuids = [e.uuid for e in entities if e.uuid]
+            if entity_uuids:
+                coro = refresh_entity_profiles(
+                    driver=self.driver,
+                    embedder=self.embedder,
+                    llm=self.llm,
+                    group_id=group_id,
+                    entity_uuids=entity_uuids,
+                    max_facts=self.profile_summary_max_facts,
+                )
+                if self.profile_refresh_mode == "sync":
+                    await coro
+                else:
+                    asyncio.create_task(coro)
 
         return AddEpisodeResults(
             episode=episode,
@@ -965,6 +1044,142 @@ class Surriti:
             )
         return results
 
+    async def recall(
+        self,
+        query: str,
+        *,
+        group_id: str,
+        depth: str = "normal",
+        as_of: datetime | None = None,
+        limit: int = 20,
+    ) -> "MemoryContext":
+        """Build a query-focused memory context.
+
+        ``recall`` is the read-side counterpart of ``add_episode``: it
+        resolves the entities mentioned in ``query`` (alias-aware,
+        no-create), pulls their dossiers, and fetches an ego-filtered
+        slice of facts. The result is a structured bundle the caller can
+        render directly into a prompt without juggling search options.
+
+        ``depth``:
+
+        * ``"fast"`` -- profiles + top-``limit`` facts; one DB roundtrip.
+        * ``"normal"`` -- adds a hybrid edge search restricted to the
+          resolved entities' ego graph.
+        * ``"deep"`` -- ``normal`` plus a free-text search over episodes
+          and communities; useful for "tell me everything about" prompts.
+
+        ``as_of`` is reserved for time-travel queries; current build
+        ignores it and returns the latest valid state.
+        """
+
+        from surriti.entity_resolution import resolve_entity_mentions
+        from surriti.llm import ExtractedEntity
+        from surriti.search import _unwrap
+
+        del as_of  # reserved for future bitemporal querying
+
+        if depth not in ("fast", "normal", "deep"):
+            raise ValueError("depth must be one of 'fast', 'normal', 'deep'")
+
+        # 1. Cheap query→entities extraction. We avoid a full LLM extract()
+        #    here -- recall is on the hot read path. Instead we do an
+        #    alias-aware lookup against the existing entity index using a
+        #    bag-of-words sweep: every distinct token in the query is
+        #    tested as a potential mention. Spurious mentions get filtered
+        #    out by the resolver (none of the four stages match) and cost
+        #    only one bulk SELECT.
+        tokens = [t for t in (query or "").replace(",", " ").split() if len(t) > 1]
+        # Also try multi-word windows up to length 3 so "Drexel University"
+        # resolves as one mention rather than two.
+        mentions: list[ExtractedEntity] = []
+        seen: set[str] = set()
+        words = tokens
+        for n in (3, 2, 1):
+            for i in range(0, max(0, len(words) - n + 1)):
+                phrase = " ".join(words[i : i + n])
+                key = phrase.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                mentions.append(ExtractedEntity(name=phrase, labels=["Entity"]))
+
+        resolved = []
+        if mentions:
+            resolved = await resolve_entity_mentions(
+                driver=self.driver,
+                embedder=self.embedder,
+                llm=self.llm,
+                mentions=mentions,
+                group_id=group_id,
+                episode_context=query,
+                threshold=self.alias_resolution_threshold,
+                use_llm=False,  # tiebreak is too expensive for the hot path
+                create_missing=False,
+            )
+
+        ego_uuids = [r.canonical_uuid for r in resolved if r.canonical_uuid]
+        # Deduplicate while preserving order.
+        ego_uuids = list(dict.fromkeys(ego_uuids))
+
+        # 2. Profiles for the ego entities.
+        profiles: list[EntityNode] = []
+        if ego_uuids:
+            rows = _unwrap(
+                await self.driver.query(
+                    "SELECT * FROM entity WHERE group_id = $g AND uuid IN $u;",
+                    {"g": group_id, "u": ego_uuids},
+                )
+            )
+            profiles = [parse_entity(r) for r in rows]
+
+        # 3. Facts. Free-text + vector hybrid; ego_filter clamps to the
+        #    resolved entities when present.
+        embedding = await self.embedder.create(query) if query else None
+        cfg = SearchConfig(limit=limit, candidate_limit=max(limit * 4, 40))
+        edge_results = await hybrid_search(
+            self.driver,
+            query=query,
+            query_embedding=embedding,
+            group_id=group_id,
+            config=cfg,
+            ego_filter=ego_uuids if ego_uuids else None,
+        )
+        facts = edge_results.edges
+
+        episodes: list[EpisodicNode] = []
+        communities: list[CommunityNode] = []
+        if depth == "deep":
+            episodes = await search_episodes(
+                self.driver, query=query, group_id=group_id, limit=limit
+            )
+            communities = await search_communities(
+                self.driver,
+                query=query,
+                query_embedding=embedding,
+                group_id=group_id,
+                limit=limit,
+            )
+
+        return MemoryContext(
+            query=query,
+            profiles=profiles,
+            facts=facts,
+            episodes=episodes,
+            communities=communities,
+            resolved_entities=[
+                {
+                    "mention": r.mention.name,
+                    "uuid": r.canonical_uuid,
+                    "name": r.canonical_name,
+                    "resolution": r.resolution,
+                    "confidence": r.confidence,
+                }
+                for r in resolved
+                if r.canonical_uuid is not None
+            ],
+        )
+
     async def get_nodes_and_edges_by_episode(
         self, episode_uuids: list[str]
     ) -> SearchResults:
@@ -1342,20 +1557,59 @@ class Surriti:
             return parse_entity(fallback[0])
 
     async def _upsert_entities(
-        self, extracted: list[ExtractedEntity], *, group_id: str
+        self,
+        extracted: list[ExtractedEntity],
+        *,
+        group_id: str,
+        episode_uuid: str | None = None,
+        episode_context: str = "",
     ) -> list[EntityNode]:
         """Insert new entities; reuse existing ones by ``(group_id, name)``.
 
-        Idempotent under any input duplication and tolerant to a race against
-        the ``entity_name_uniq`` index: if a CREATE collides we re-SELECT
-        and reuse the now-existing row instead of bubbling the error up.
-        Tenant isolation is enforced by ``entity_name_uniq`` on
-        ``(group_id, name)`` — entities with the same name in different
-        ``group_id``s are deliberately distinct nodes.
+        When ``alias_resolution`` is on (the default), each extracted
+        mention is first run through :func:`resolve_entity_mentions`,
+        which short-circuits on alias hits, exact-name matches, and
+        confident semantic matches against the entity name HNSW index
+        before falling back to the legacy create / case-merge path.
+
+        Idempotent under any input duplication and tolerant to a race
+        against the ``entity_name_uniq`` index: if a CREATE collides we
+        re-SELECT and reuse the now-existing row instead of bubbling the
+        error up. Tenant isolation is enforced by ``entity_name_uniq``
+        on ``(group_id, name)`` -- entities with the same name in
+        different ``group_id``s are deliberately distinct nodes.
         """
 
         if not extracted:
             return []
+
+        # ------------------------------------------------------------------
+        # Stage 0 -- canonical resolution (alias / exact / semantic / LLM).
+        # Surface forms that resolve to an existing entity skip the rest of
+        # the pipeline and reuse the canonical row directly. Mentions that
+        # remain "new" fall through to the legacy create logic below.
+        # ------------------------------------------------------------------
+        from surriti.entity_resolution import (
+            ResolvedEntity,
+            normalize_alias,
+            resolve_entity_mentions,
+        )
+
+        resolved_by_mention: dict[str, ResolvedEntity] = {}
+        if self.alias_resolution_enabled:
+            resolved_list = await resolve_entity_mentions(
+                driver=self.driver,
+                embedder=self.embedder,
+                llm=self.llm,
+                mentions=extracted,
+                group_id=group_id,
+                episode_context=episode_context,
+                threshold=self.alias_resolution_threshold,
+                use_llm=self.alias_resolution_llm,
+                episode_uuid=episode_uuid,
+            )
+            for r in resolved_list:
+                resolved_by_mention[r.mention.name] = r
 
         # 1. Dedupe high-confidence case/whitespace variants in this batch
         #    within the tenant. Fuzzy name matches stay manual.
@@ -1393,6 +1647,22 @@ class Surriti:
                 group_id=group_id,
             )
 
+        # Fold semantic / LLM resolutions into the existing-row map keyed
+        # by the *mention's* casefold key so the rest of the pipeline
+        # transparently reuses them.
+        if resolved_by_mention:
+            uuid_to_node = {n.uuid: n for n in existing_by_key.values()}
+            for ext in extracted:
+                hit = resolved_by_mention.get(ext.name)
+                if hit is None or hit.canonical_uuid is None:
+                    continue
+                key = _entity_name_key(ext.name)
+                if not key or key in existing_by_key:
+                    continue
+                node = uuid_to_node.get(hit.canonical_uuid) or hit.existing
+                if node is not None:
+                    existing_by_key[key] = node
+
         results: list[EntityNode] = []
         # Batch-embed all NEW entities up front (one round-trip instead of N).
         missing = [e for e in deduped if _entity_name_key(e.name) not in existing_by_key]
@@ -1424,6 +1694,8 @@ class Surriti:
                         labels: $labels,
                         attributes: {},
                         name_embedding: $emb,
+                        canonical_name: $canonical_name,
+                        aliases: $aliases,
                         created_at: $created_at
                     };
                     """,
@@ -1434,6 +1706,8 @@ class Surriti:
                         "summary": node.summary,
                         "labels": node.labels,
                         "emb": node.name_embedding,
+                        "canonical_name": node.name,
+                        "aliases": [node.name],
                         "created_at": node.created_at,
                     },
                 )
