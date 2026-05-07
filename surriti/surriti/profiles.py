@@ -162,24 +162,46 @@ async def refresh_entity_profiles(
             mention_count = int(entity.mention_count or 0) + 1
             salience = float(entity.salience or 0.0) + 1.0
 
-            await driver.query(
-                """
-                UPDATE type::record("entity", $uuid) SET
-                    profile_summary = $profile_summary,
-                    profile_embedding = $profile_embedding,
-                    mention_count = $mention_count,
-                    salience = $salience,
-                    last_seen_at = $last_seen_at;
-                """,
-                {
-                    "uuid": uuid,
-                    "profile_summary": summary,
-                    "profile_embedding": embedding,
-                    "mention_count": mention_count,
-                    "salience": salience,
-                    "last_seen_at": utc_now(),
-                },
-            )
+            # Only include profile_embedding in the UPDATE when we have a
+            # valid non-empty vector.  An empty embedding (e.g. when the
+            # entity has no facts yet) would violate SurrealDB's dimension
+            # constraint and cause a spurious error.
+            if embedding:
+                await driver.query(
+                    """
+                    UPDATE type::record("entity", $uuid) SET
+                        profile_summary = $profile_summary,
+                        profile_embedding = $profile_embedding,
+                        mention_count = $mention_count,
+                        salience = $salience,
+                        last_seen_at = $last_seen_at;
+                    """,
+                    {
+                        "uuid": uuid,
+                        "profile_summary": summary,
+                        "profile_embedding": embedding,
+                        "mention_count": mention_count,
+                        "salience": salience,
+                        "last_seen_at": utc_now(),
+                    },
+                )
+            else:
+                await driver.query(
+                    """
+                    UPDATE type::record("entity", $uuid) SET
+                        profile_summary = $profile_summary,
+                        mention_count = $mention_count,
+                        salience = $salience,
+                        last_seen_at = $last_seen_at;
+                    """,
+                    {
+                        "uuid": uuid,
+                        "profile_summary": summary,
+                        "mention_count": mention_count,
+                        "salience": salience,
+                        "last_seen_at": utc_now(),
+                    },
+                )
             refreshed += 1
         except Exception as exc:
             logger.warning("profile refresh failed for entity %s: %s", uuid, exc)

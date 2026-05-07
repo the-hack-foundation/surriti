@@ -1,0 +1,22 @@
+# Build context is the parent directory; keep it tight.
+# Only `legba/`, `surriti/`, and `visualizer/` are needed by the Dockerfiles.
+graphiti/
+myapp/
+frontend/
+**/.git/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/node_modules/
+**/.venv/
+**/venv/
+**/*.egg-info/
+**/dist/
+**/build/
+legba/state/
+legba/persona_input/
+legba/persona_output/
+legba/minio_data/
+legba/.env
+**/*.log
