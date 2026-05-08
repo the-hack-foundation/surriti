@@ -72,9 +72,12 @@ OPENAI_API_KEY=sk-...
 Spin up SurrealDB locally:
 
 ```bash
-docker run --rm -p 8000:8000 surrealdb/surrealdb:v2.1.4 \
+docker run --rm -p 8000:8000 surrealdb/surrealdb:latest \
   start --user root --pass root memory
 ```
+
+> **Note:** Surriti 0.5.x requires **SurrealDB 3.x** and the `surrealdb>=2.0,<3` Python SDK.
+> Replace `latest` with a specific `v3.x.y` tag to pin your version.
 
 ---
 
@@ -101,11 +104,11 @@ The same data store lets you do hybrid retrieval out of the box:
 
 | Concept | Surreal table | Description |
 |---|---|---|
-| **EpisodicNode** | `episodic_node` | A raw input chunk (chat turn, doc, json blob). |
-| **EntityNode**   | `entity_node`   | A canonical thing (person, org, product...). |
-| **EpisodicEdge** | `mentions`      | "this episode mentioned this entity". |
-| **EntityEdge**   | `relates_to`    | A temporally-scoped fact between two entities. |
-| **CommunityNode**| `community_node`| A cluster discovered by Leiden. |
+| **EpisodicNode** | `episode`    | A raw input chunk (chat turn, doc, json blob). |
+| **EntityNode**   | `entity`     | A canonical thing (person, org, product...). |
+| **EpisodicEdge** | `mentions`   | "this episode mentioned this entity". |
+| **EntityEdge**   | `relates_to` | A temporally-scoped fact between two entities. |
+| **CommunityNode**| `community`  | A cluster discovered by Leiden. |
 
 Everything is just `pydantic` v2 models so you can integrate with
 LangGraph, LlamaIndex, raw FastAPI, etc.

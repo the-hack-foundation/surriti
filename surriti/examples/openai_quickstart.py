@@ -2,10 +2,12 @@
 
 Prerequisites
 -------------
-1. SurrealDB running at ws://localhost:8000/rpc:
+1. SurrealDB 3.x running at ws://localhost:8000/rpc:
 
-    docker run --rm -p 8000:8000 surrealdb/surrealdb:v2.1.4 \\
+    docker run --rm -p 8000:8000 surrealdb/surrealdb:latest \\
         start --user root --pass root memory
+
+   Pin to a specific v3.x.y tag in production (e.g. ``surrealdb/surrealdb:v3.0.0``).
 
 2. Install the OpenAI extra and set OPENAI_API_KEY:
 

@@ -96,6 +96,7 @@ services:
       SURRITI_SURREAL_URL:  "ws://surrealdb:8000/rpc"
       SURRITI_SURREAL_NS:   "myapp"
       SURRITI_SURREAL_DB:   "myapp"
+      # WARNING: root/root are dev/local defaults — override in production.
       SURRITI_SURREAL_USER: "root"
       SURRITI_SURREAL_PASS: "root"
     depends_on:

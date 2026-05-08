@@ -76,6 +76,8 @@ VLLM_WAIT_S   = float(os.environ.get("VLLM_WAIT_S", "30"))
 SURREAL_URL  = os.environ.get("SURRITI_SURREAL_URL",  "ws://surrealdb:8000/rpc")
 SURREAL_NS   = os.environ.get("SURRITI_SURREAL_NS",   "myapp")
 SURREAL_DB   = os.environ.get("SURRITI_SURREAL_DB",   "myapp")
+# WARNING: "root"/"root" are dev/local defaults only. Set these env vars to
+# strong credentials before any non-local deployment.
 SURREAL_USER = os.environ.get("SURRITI_SURREAL_USER", "root")
 SURREAL_PASS = os.environ.get("SURRITI_SURREAL_PASS", "root")
 
