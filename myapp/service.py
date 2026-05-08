@@ -122,7 +122,7 @@ def _is_authorized(*, x_api_key: str | None, authorization: str | None, client_h
     return bool(presented) and secrets.compare_digest(presented, SURRITI_API_KEY)
 
 
-async def _require_api_key(
+async def _verify_auth(
     request: Request,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None),
@@ -517,7 +517,7 @@ async def _run_turn(req: SendRequest) -> None:
 # ---------------------------------------------------------------------------
 # Endpoints -- streaming
 # ---------------------------------------------------------------------------
-@app.post("/send", dependencies=[Depends(_require_api_key)])
+@app.post("/send", dependencies=[Depends(_verify_auth)])
 async def send(req: SendRequest) -> dict:
     """Queue a streaming turn. The events are pushed to ``/ws/{session_id}``."""
     if req.session_id not in _sessions:
@@ -556,7 +556,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Endpoints -- legacy / diagnostic
 # ---------------------------------------------------------------------------
-@app.post("/prompt", response_model=PromptResponse, dependencies=[Depends(_require_api_key)])
+@app.post("/prompt", response_model=PromptResponse, dependencies=[Depends(_verify_auth)])
 async def prompt(req: PromptRequest) -> PromptResponse:
     recalled: list[str] = []
     if _memory is not None:
@@ -610,7 +610,7 @@ async def prompt(req: PromptRequest) -> PromptResponse:
     return PromptResponse(response=response_text, recalled_facts=recalled)
 
 
-@app.get("/memory/{user_id}", dependencies=[Depends(_require_api_key)])
+@app.get("/memory/{user_id}", dependencies=[Depends(_verify_auth)])
 async def get_memory(user_id: str) -> dict:
     """List EVERY entity and edge stored under ``group_id == user_id``."""
     if _memory is None:
@@ -642,7 +642,7 @@ async def get_memory(user_id: str) -> dict:
     }
 
 
-@app.delete("/memory/{user_id}", dependencies=[Depends(_require_api_key)])
+@app.delete("/memory/{user_id}", dependencies=[Depends(_verify_auth)])
 async def delete_memory(user_id: str) -> dict:
     """Wipe every entity, edge, episode, and mention for ``group_id == user_id``.
 
@@ -667,7 +667,7 @@ async def delete_memory(user_id: str) -> dict:
     return {"status": "ok", "user_id": user_id, "tables_cleared": deleted}
 
 
-@app.get("/health", dependencies=[Depends(_require_api_key)])
+@app.get("/health", dependencies=[Depends(_verify_auth)])
 def health() -> dict:
     return {
         "status": "ok",

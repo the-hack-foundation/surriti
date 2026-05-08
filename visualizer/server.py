@@ -259,7 +259,9 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    if request.url.path.startswith("/api") and not _is_authorized(request):
+    path_parts = [p for p in request.url.path.split("/") if p]
+    is_api_route = bool(path_parts) and path_parts[0] == "api"
+    if is_api_route and not _is_authorized(request):
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})
     return await call_next(request)
 
