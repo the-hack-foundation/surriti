@@ -39,7 +39,6 @@ import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
-from typing import Any
 
 import httpx
 import uvicorn
