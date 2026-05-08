@@ -63,6 +63,17 @@ class ExtractedFact:
     domain: str | None = None
     """Short free-form bucket label (e.g. "employment", "residence") used
     to scope contradiction comparisons. Free text, never an enum."""
+    memory_class: str = "objective"
+    """Closed-vocabulary tag for the *kind* of fact this is. One of:
+    ``"objective"`` (verifiable claim about the world — default),
+    ``"preference"`` (soft user wish about the assistant or world),
+    ``"style"`` (communication-style directive),
+    ``"constraint"`` (hard rule / forbidden action),
+    ``"trait"`` (persistent personal trait/value),
+    ``"sentiment"`` (emotional pattern / opinion).
+    Drives kind-aware singleton closure (cross-class facts coexist) and
+    always-pinned recall for subjective classes (preference/style/constraint).
+    Persisted on the edge in ``attributes['memory_class']``."""
     replaces: list[str] = field(default_factory=list)
     """Optional name hints ("<subject> <predicate> <object>") of prior
     facts this one replaces. Used by terminate/correct operations."""

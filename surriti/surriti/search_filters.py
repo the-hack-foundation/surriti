@@ -51,6 +51,10 @@ class SearchFilters:
     created_at: list[list[DateFilter]] = field(default_factory=list)
     expired_at: list[list[DateFilter]] = field(default_factory=list)
     property_filters: list[PropertyFilter] = field(default_factory=list)
+    edge_memory_classes: list[str] | None = None
+    """If set, only return edges whose ``attributes['memory_class']`` is
+    in this list. ``None`` (default) = no constraint. Legacy rows with
+    no memory_class attribute are treated as ``"objective"``."""
 
 
 def _date_clause_matches(value: datetime | None, clauses: list[list[DateFilter]]) -> bool:
@@ -101,6 +105,11 @@ def edge_passes_filters(edge_row: dict[str, Any], filters: SearchFilters | None)
             return False
     for pf in filters.property_filters:
         if not _eval_property(edge_row, pf):
+            return False
+    if filters.edge_memory_classes is not None:
+        attrs = edge_row.get("attributes") or {}
+        cls = str(attrs.get("memory_class") or "objective").strip().lower() or "objective"
+        if cls not in filters.edge_memory_classes:
             return False
     return True
 

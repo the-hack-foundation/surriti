@@ -126,6 +126,9 @@ def parse_edge(row: dict[str, Any]) -> EntityEdge:
         derived=bool(row.get("derived") or False),
         derived_from=row.get("derived_from"),
         attributes=dict(row.get("attributes") or {}),
+        memory_class=str(
+            (row.get("attributes") or {}).get("memory_class") or "objective"
+        ).strip().lower() or "objective",
         created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
     )
 

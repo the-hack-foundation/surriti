@@ -122,6 +122,12 @@ class EntityEdge(_Edge):
     derived_from: str | None = None
     """UUID of the source edge this one was derived from."""
 
+    memory_class: str = "objective"
+    """Closed-vocabulary kind tag carried from :class:`ExtractedFact`.
+    See ``ExtractedFact.memory_class`` for values. Persisted in
+    ``attributes['memory_class']`` on the row so legacy rows (without
+    the field set) default to ``"objective"`` on read."""
+
     attributes: dict[str, Any] = Field(default_factory=dict)
 
 

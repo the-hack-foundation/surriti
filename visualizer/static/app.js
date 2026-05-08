@@ -44,6 +44,7 @@ const controls = {
   export: document.querySelector("#exportBtn"),
   kinds: Array.from(document.querySelectorAll(".kindToggle")),
   sources: Array.from(document.querySelectorAll(".sourceToggle")),
+  memoryClasses: Array.from(document.querySelectorAll(".mcToggle")),
   views: Array.from(document.querySelectorAll('input[name="view"]')),
   frameSearch: document.querySelector("#frameSearch"),
   frameList: document.querySelector("#frameList"),
@@ -67,6 +68,11 @@ const palette = {
   mentions: "var(--mention)",
   has_member: "var(--member)",
   invalid: "var(--bad)",
+  mc_preference: "var(--mc-preference)",
+  mc_style: "var(--mc-style)",
+  mc_constraint: "var(--mc-constraint)",
+  mc_trait: "var(--mc-trait)",
+  mc_sentiment: "var(--mc-sentiment)",
 };
 
 // ---------- State ----------
@@ -161,6 +167,7 @@ function persistState() {
       kinds: controls.kinds.filter(c => c.checked).map(c => c.value),
       statusPreset: controls.statusPreset.value,
       sources: controls.sources.filter(c => c.checked).map(c => c.value),
+      memoryClasses: controls.memoryClasses.filter(c => c.checked).map(c => c.value),
       edgeVisibility: controls.edgeVisibility.value,
       aggregate: controls.aggregate.checked,
       minConfidence: controls.minConfidence.value,
@@ -188,6 +195,7 @@ function applyPersisted(p) {
   if (typeof p.group === "string") controls.group.value = p.group;
   if (Array.isArray(p.kinds)) controls.kinds.forEach(c => c.checked = p.kinds.includes(c.value));
   if (Array.isArray(p.sources)) controls.sources.forEach(c => c.checked = p.sources.includes(c.value));
+  if (Array.isArray(p.memoryClasses)) controls.memoryClasses.forEach(c => c.checked = p.memoryClasses.includes(c.value));
   if (typeof p.statusPreset === "string") controls.statusPreset.value = p.statusPreset;
   else if (Array.isArray(p.statuses)) controls.statusPreset.value = "all";
   if (typeof p.edgeVisibility === "string") controls.edgeVisibility.value = p.edgeVisibility;
@@ -317,6 +325,16 @@ function filteredGraph() {
   const allowed = new Set(nodes.map(n => n.id));
   links = links.filter(l => allowed.has(idOf(l.source)) && allowed.has(idOf(l.target)));
 
+  // Memory class client-side filter
+  const mcClasses = new Set(controls.memoryClasses.filter(c => c.checked).map(c => c.value));
+  if (mcClasses.size < controls.memoryClasses.length) {
+    links = links.filter(l => {
+      if (l.kind !== "relates_to") return true;
+      const mc = (l.attributes && l.attributes.memory_class) || "objective";
+      return mcClasses.has(mc);
+    });
+  }
+
   if (egoFocus && egoFocus.nodeId && allowed.has(egoFocus.nodeId)) {
     const focusIds = egoNodeIds(egoFocus.nodeId, links, Number(egoFocus.depth || 1));
     nodes = nodes.filter(n => focusIds.has(n.id));
@@ -393,6 +411,10 @@ function nodeRadius(node) {
 function linkColorFor(link) {
   if (link.status === "needs_resolution") return "var(--bad)";
   if (link.invalid_at || link.expired_at) return "var(--bad)";
+  if (link.kind === "relates_to") {
+    const mc = (link.attributes && link.attributes.memory_class) || "objective";
+    if (mc !== "objective") return `var(--mc-${mc})`;
+  }
   return palette[link.kind] || palette.relates_to;
 }
 
@@ -403,6 +425,10 @@ function linkClassesFor(link) {
   if (link.status === "superseded") cls.push("superseded");
   if (link.status === "needs_resolution") cls.push("conflict");
   if (link.derived) cls.push("derived");
+  if (link.kind === "relates_to") {
+    const mc = (link.attributes && link.attributes.memory_class) || "objective";
+    cls.push(`mc-${mc}`);
+  }
   return cls.join(" ");
 }
 
@@ -679,9 +705,13 @@ function renderNodeDetails(node) {
   const factRow = (link, cls) => {
     const target = nodeById.get(idOf(link.target));
     const label = link.canonical_name || link.name;
+    const mc = (link.attributes && link.attributes.memory_class) || "objective";
+    const mcBadge = mc !== "objective"
+      ? `<span class="pill mc-${mc}" title="memory_class: ${mc}">${escapeHtml(mc)}</span> `
+      : "";
     return `<div class="fact-row ${cls}" data-edge-id="${escapeAttr(link.id)}">
       <span class="pill clickable">${escapeHtml(label)}</span>
-      <span class="obj">${escapeHtml((target && target.name) || idOf(link.target))}</span>
+      ${mcBadge}<span class="obj">${escapeHtml((target && target.name) || idOf(link.target))}</span>
     </div>`;
   };
 
@@ -763,6 +793,7 @@ function renderEdgeDetails(edge) {
   const source = nodeById.get(idOf(edge.source));
   const target = nodeById.get(idOf(edge.target));
   const frame = frameByName.get((edge.canonical_name || edge.name || "").toLowerCase());
+  const mc = (edge.attributes && edge.attributes.memory_class) || "objective";
 
   const block = (title, body) => body ? `<section class="detail-block"><h3>${escapeHtml(title)}</h3>${body}</section>` : "";
 
@@ -820,6 +851,7 @@ function renderEdgeDetails(edge) {
   detailsEl.innerHTML = `
     <section class="detail-block">
       <h2>${escapeHtml(edge.canonical_name || edge.name || edge.kind)}</h2>
+      ${edge.kind === "relates_to" ? `<div class="pill-row"><span class="pill mc-${mc}">${escapeHtml(mc)}</span></div>` : ""}
       ${edge.fact ? `<p>${escapeHtml(edge.fact)}</p>` : ""}
       <div class="pill-row">
         <span class="pill clickable" data-node-id="${escapeAttr(idOf(edge.source))}">${escapeHtml((source && source.name) || idOf(edge.source))}</span>
@@ -1533,6 +1565,7 @@ controls.group.addEventListener("change", () => {
   loadConflicts();
 });
 controls.kinds.forEach(input => input.addEventListener("change", () => { render(); persistState(); }));
+controls.memoryClasses.forEach(input => input.addEventListener("change", () => { render(); persistState(); }));
 controls.theme.addEventListener("click", toggleTheme);
 controls.export.addEventListener("click", e => {
   e.stopPropagation();

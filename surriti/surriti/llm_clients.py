@@ -69,6 +69,7 @@ Return STRICT JSON with two arrays:
      "temporal": false,
      "singleton": false,
      "domain": null,
+     "memory_class": "objective",
      "qualifiers": {},
      "argument_roles": {},
      "source_span": "<verbatim slice of CURRENT EPISODE>",
@@ -118,6 +119,36 @@ FACT METADATA -- general rubric, NOT a closed list of predicates:
   that share a slot. Examples of labels you might invent: "employment",
   "residence", "naming", "preference", "identity". Free text -- pick
   whatever fits.
+- `memory_class` = closed vocabulary tag for the *kind* of fact.
+  ONE of these six values, default `"objective"`:
+    * `"objective"`   - verifiable claim about the world or the user
+                        ("Jessica works at Target", "I am 32",
+                        "Acme is in Berlin"). Default. Use whenever
+                        the other classes don't fit.
+    * `"preference"`  - a soft user wish about how the assistant or
+                        the world should behave ("respond as a Russian
+                        gopnik", "I prefer concise answers", "I like
+                        to be addressed by my first name", "use
+                        metric units").
+    * `"style"`       - a communication-style directive constraining
+                        HOW the assistant writes ("be terse", "no
+                        emojis", "write in bullet points",
+                        "always use markdown").
+    * `"constraint"`  - a HARD rule / forbidden action ("never call
+                        me after 9pm", "do not store credit card
+                        numbers", "never mention politics").
+    * `"trait"`       - a persistent personal trait, value, or belief
+                        ("values privacy", "is risk-averse",
+                        "is a vegetarian").
+    * `"sentiment"`   - an emotional pattern or opinion ("dislikes
+                        small talk", "is frustrated with bug reports",
+                        "loves jazz"). When the user expresses a
+                        preference about the assistant's behaviour use
+                        `"preference"` / `"style"` / `"constraint"`
+                        instead.
+  Pick the most specific class. Subjective directives ("respond as",
+  "prefer", "always", "never", "I want you to", "stop doing") are
+  almost always preference / style / constraint, NOT objective.
 - `relation_phrase` = the verbatim verb phrase from the source ("is
   the wife of", "moved to", "no longer works at"). Lets the engine
   canonicalize alias predicates without losing the original wording.
@@ -144,7 +175,7 @@ only -- the real ones come from the input):
      "relation_phrase":"work at", "object":"Acme",
      "fact":"... works at Acme.",
      "operation":"assert", "temporal":true, "singleton":true,
-     "domain":"employment",
+     "domain":"employment", "memory_class":"objective",
      "argument_roles":{"subject":"employee","object":"employer"},
      "source_span":"I work at Acme"}
 
@@ -153,7 +184,7 @@ only -- the real ones come from the input):
      "relation_phrase":"quit my job at", "object":"Acme",
      "fact":"... quit working at Acme.",
      "operation":"terminate", "temporal":true, "singleton":true,
-     "domain":"employment",
+     "domain":"employment", "memory_class":"objective",
      "source_span":"I quit my job at Acme"}
 
   "I live in Florida during the winter" ->
@@ -161,7 +192,7 @@ only -- the real ones come from the input):
      "relation_phrase":"live in", "object":"Florida",
      "fact":"... lives in Florida during the winter.",
      "operation":"qualify", "temporal":true, "singleton":true,
-     "domain":"residence",
+     "domain":"residence", "memory_class":"objective",
      "qualifiers":{"season":"winter"},
      "source_span":"I live in Florida during the winter"}
 
@@ -170,8 +201,65 @@ only -- the real ones come from the input):
      "relation_phrase":"love", "object":"jazz",
      "fact":"... likes jazz.",
      "operation":"assert", "temporal":true, "singleton":false,
-     "domain":"preference",
+     "domain":"preference", "memory_class":"sentiment",
      "source_span":"I love jazz now"}
+
+  "Respond to me as a stereotypical Russian gopnik" ->
+    {"subject":"<speaker>", "predicate":"wants_assistant_persona",
+     "relation_phrase":"respond to me as", "object":"stereotypical Russian gopnik",
+     "fact":"... wants the assistant to respond as a stereotypical Russian gopnik.",
+     "operation":"assert", "temporal":true, "singleton":true,
+     "domain":"assistant_persona", "memory_class":"preference",
+     "source_span":"Respond to me as a stereotypical Russian gopnik"}
+
+  "Be terse and never use emojis" ->
+    [{"subject":"<speaker>", "predicate":"wants_assistant_style",
+      "relation_phrase":"be", "object":"terse",
+      "fact":"... wants the assistant to be terse.",
+      "operation":"assert", "temporal":true, "singleton":false,
+      "domain":"assistant_style", "memory_class":"style",
+      "source_span":"Be terse"},
+     {"subject":"<speaker>", "predicate":"forbids_assistant_action",
+      "relation_phrase":"never use", "object":"emojis",
+      "fact":"... forbids the assistant from using emojis.",
+      "operation":"assert", "temporal":true, "singleton":false,
+      "domain":"assistant_style", "memory_class":"constraint",
+      "source_span":"never use emojis"}]
+
+  "Never call me after 9pm" ->
+    {"subject":"<speaker>", "predicate":"forbids_assistant_action",
+     "relation_phrase":"never call me", "object":"calls after 9pm",
+     "fact":"... forbids the assistant from calling after 9pm.",
+     "operation":"assert", "temporal":true, "singleton":false,
+     "domain":"contact_rules", "memory_class":"constraint",
+     "source_span":"Never call me after 9pm"}
+
+  "I really value privacy" ->
+    {"subject":"<speaker>", "predicate":"values",
+     "relation_phrase":"really value", "object":"privacy",
+     "fact":"... values privacy.",
+     "operation":"assert", "temporal":true, "singleton":false,
+     "domain":"values", "memory_class":"trait",
+     "source_span":"I really value privacy"}
+
+SUBJECTIVE-DIRECTIVE PREDICATE VOCABULARY (use these exact predicates
+when the user is telling the assistant how to behave -- this keeps
+deduplication reliable):
+- `wants_assistant_persona`  - persona / role-play directives
+                               ("respond as X", "act like X")
+- `wants_assistant_style`    - positive style preferences
+                               ("be terse", "use markdown",
+                                "always include examples")
+- `forbids_assistant_action` - hard prohibitions
+                               ("never X", "don't X", "stop doing X")
+- `prefers_communication`    - preferences for how/when the assistant
+                               communicates ("text only", "no calls
+                               after 9pm" -> use forbids_*)
+- `values`                   - trait-class assertions
+                               ("I value X", "I care about X")
+- `feels_about`              - sentiment-class assertions
+                               ("I love jazz", "I dislike X")
+For all other facts use whatever snake_case predicate fits the verb.
 
 HARD RULES (violations make the output unusable):
 - Extract facts ONLY from CURRENT EPISODE. CONTEXT is read-only.
@@ -349,6 +437,16 @@ def _parse_extraction(raw: str) -> ExtractionResult:
         singleton = bool(f.get("singleton") or False)
         domain_raw = f.get("domain")
         domain = str(domain_raw).strip().lower() or None if isinstance(domain_raw, str) else None
+        memory_class_raw = f.get("memory_class")
+        _allowed_classes = {
+            "objective", "preference", "style",
+            "constraint", "trait", "sentiment",
+        }
+        if isinstance(memory_class_raw, str):
+            mc = memory_class_raw.strip().lower()
+            memory_class = mc if mc in _allowed_classes else "objective"
+        else:
+            memory_class = "objective"
         replaces_raw = f.get("replaces") or []
         replaces = [str(x).strip() for x in replaces_raw if x and str(x).strip()] if isinstance(replaces_raw, list) else []
         try:
@@ -398,6 +496,7 @@ def _parse_extraction(raw: str) -> ExtractionResult:
                         temporal=temporal,
                         singleton=singleton,
                         domain=domain,
+                        memory_class=memory_class,
                         replaces=list(replaces),
                         confidence=confidence,
                         relation_phrase=relation_phrase,

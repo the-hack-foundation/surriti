@@ -21,6 +21,13 @@
   --bad: #e56c60;
   --focus: #f4e8a4;
   --selected-stroke: #f4e8a4;
+  /* memory_class edge colours */
+  --mc-objective: var(--fact);
+  --mc-preference: #a78bfa;
+  --mc-style: #67e8f9;
+  --mc-constraint: #f97316;
+  --mc-trait: #86efac;
+  --mc-sentiment: #fde68a;
 }
 
 [data-theme="light"] {
@@ -45,6 +52,13 @@
   --bad: #c0392b;
   --focus: #b59617;
   --selected-stroke: #c0392b;
+  /* memory_class edge colours */
+  --mc-objective: var(--fact);
+  --mc-preference: #7c3aed;
+  --mc-style: #0891b2;
+  --mc-constraint: #c2410c;
+  --mc-trait: #15803d;
+  --mc-sentiment: #b45309;
 }
 
 * { box-sizing: border-box; }
@@ -250,6 +264,11 @@ button:hover { background: var(--hover); border-color: var(--focus); }
 .line.invalid { border-color: var(--bad); border-top-style: dashed; }
 .line.conflict { border-color: var(--bad); border-top-width: 4px; }
 .line.derived { border-top-style: dashed; opacity: 0.6; }
+.line.mc-preference { border-color: var(--mc-preference); }
+.line.mc-style      { border-color: var(--mc-style); }
+.line.mc-constraint { border-color: var(--mc-constraint); }
+.line.mc-trait      { border-color: var(--mc-trait); }
+.line.mc-sentiment  { border-color: var(--mc-sentiment); }
 
 /* ---------- Stage ---------- */
 .stage {
@@ -364,6 +383,12 @@ button:hover { background: var(--hover); border-color: var(--focus); }
 .pill.clickable:hover { border-color: var(--focus); background: var(--hover); }
 .pill.bad { border-color: var(--bad); color: var(--bad); }
 .pill.frame { border-color: var(--fact); color: var(--fact); }
+.pill.mc-objective  { border-color: var(--mc-objective);  color: var(--mc-objective); }
+.pill.mc-preference { border-color: var(--mc-preference); color: var(--mc-preference); }
+.pill.mc-style      { border-color: var(--mc-style);      color: var(--mc-style); }
+.pill.mc-constraint { border-color: var(--mc-constraint); color: var(--mc-constraint); font-weight: 700; }
+.pill.mc-trait      { border-color: var(--mc-trait);      color: var(--mc-trait); }
+.pill.mc-sentiment  { border-color: var(--mc-sentiment);  color: var(--mc-sentiment); }
 .action-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .focus-controls {
   display: grid;

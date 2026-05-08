@@ -1053,6 +1053,7 @@ class Surriti:
         as_of: datetime | None = None,
         limit: int = 20,
         include_invalid: bool = False,
+        memory_classes: list[str] | None = None,
     ) -> "MemoryContext":
         """Build a query-focused memory context.
 
@@ -1143,10 +1144,17 @@ class Surriti:
         # 3. Facts. Free-text + vector hybrid; ego_filter clamps to the
         #    resolved entities when present.
         embedding = await self.embedder.create(query) if query else None
+        from surriti.search_filters import SearchFilters as _SF
+        _filters = (
+            _SF(edge_memory_classes=list(memory_classes))
+            if memory_classes
+            else None
+        )
         cfg = SearchConfig(
             limit=limit,
             candidate_limit=max(limit * 4, 40),
             only_valid=not include_invalid,
+            filters=_filters,
         )
         edge_results = await hybrid_search(
             self.driver,
@@ -1157,6 +1165,32 @@ class Surriti:
             ego_filter=ego_uuids if ego_uuids else None,
         )
         facts = edge_results.edges
+
+        # Fallback: when caller asked for specific memory_classes but the
+        # hybrid search produced nothing (e.g. empty query string used for
+        # an always-pin sweep of subjective edges), do a direct SELECT
+        # scoped to those classes. This is the read-side guarantee that
+        # preference / style / constraint facts are always retrievable
+        # regardless of free-text overlap with the user's question.
+        if memory_classes and not facts:
+            classes_lc = [str(c).strip().lower() for c in memory_classes if c]
+            rows = _unwrap(
+                await self.driver.query(
+                    """
+                    SELECT * FROM relates_to
+                    WHERE group_id = $g
+                        AND status = "active"
+                        AND invalid_at IS NONE
+                        AND (attributes.memory_class IN $classes
+                             OR (attributes.memory_class IS NONE
+                                 AND "objective" IN $classes))
+                    ORDER BY created_at DESC
+                    LIMIT $lim;
+                    """,
+                    {"g": group_id, "classes": classes_lc, "lim": limit},
+                )
+            )
+            facts = [parse_edge(r) for r in rows]
 
         episodes: list[EpisodicNode] = []
         communities: list[CommunityNode] = []
@@ -1908,6 +1942,7 @@ class Surriti:
                 invalid_at=valid_at,
                 superseded_by=edge_uuid,
                 qualifier_hash_value=qhash,
+                memory_class=(fact.memory_class or "objective").strip().lower() or "objective",
             )
 
         edge_status = "active"
@@ -1980,6 +2015,11 @@ class Surriti:
             qualifiers=dict(fact.qualifiers or {}),
             roles=dict(fact.argument_roles or {}),
             conflict_group_id=conflict_group_id,
+            memory_class=(fact.memory_class or "objective").strip().lower() or "objective",
+            attributes={
+                "memory_class": (fact.memory_class or "objective").strip().lower()
+                or "objective"
+            },
         )
 
         await self.driver.query(
@@ -2010,7 +2050,7 @@ class Surriti:
                 conflict_group_id: $conflict_group_id,
                 derived: $derived,
                 derived_from: $derived_from,
-                attributes: {},
+                attributes: $attributes,
                 created_at: $created_at
             };
             """,
@@ -2041,6 +2081,7 @@ class Surriti:
                 "conflict_group_id": edge.conflict_group_id,
                 "derived": edge.derived,
                 "derived_from": edge.derived_from,
+                "attributes": dict(edge.attributes or {}),
                 "created_at": edge.created_at,
             },
         )
@@ -2056,6 +2097,7 @@ class Surriti:
         invalid_at: datetime,
         superseded_by: str,
         qualifier_hash_value: str = "",
+        memory_class: str = "objective",
     ) -> list[EntityEdge]:
         """Close active edges that share the singleton slot with the new fact.
 
@@ -2103,6 +2145,15 @@ class Surriti:
             parts = row_key.split("::")
             row_qhash = parts[4] if len(parts) >= 5 else ""
             if row_qhash != qualifier_hash_value:
+                continue
+            # Kind-aware closure: a "preference" assertion must NOT
+            # supersede a coexisting "objective" claim with the same
+            # predicate (and vice versa). Subjective + objective facts
+            # live in independent slots even when the predicate matches.
+            row_attrs = row.get("attributes") or {}
+            row_class = str(row_attrs.get("memory_class") or "objective").strip().lower() or "objective"
+            new_class = (memory_class or "objective").strip().lower() or "objective"
+            if row_class != new_class:
                 continue
             to_close.append(parse_edge(row))
         if to_close:
