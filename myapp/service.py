@@ -635,7 +635,7 @@ async def get_memory(user_id: str) -> dict:
         ))
     except Exception:
         log.exception("Memory dump failed")
-        return {"status": "error", "detail": "internal_error", "nodes": [], "edges": []}
+        return {"status": "error", "detail": "memory_retrieval_failed", "nodes": [], "edges": []}
 
     nodes = [parse_entity(r) for r in node_rows]
     edges = [parse_edge(r) for r in edge_rows]
@@ -681,7 +681,8 @@ def health() -> dict:
         "embed_model": EMBED_MODEL,
         "embed_dim":   EMBED_DIM,
         "vllm":   VLLM_BASE_URL,
-        "active_sessions": len(_sessions),
+        "active_sessions": [],
+        "active_session_count": len(_sessions),
     }
 
 
