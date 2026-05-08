@@ -233,6 +233,10 @@ async def lifespan(app: FastAPI):
         database = os.environ.get("SURRITI_SURREAL_DB", "myapp")
         username = os.environ.get("SURRITI_SURREAL_USER")
         password = os.environ.get("SURRITI_SURREAL_PASS")
+        if not username or not password:
+            raise RuntimeError(
+                "Missing SURRITI_SURREAL_USER/SURRITI_SURREAL_PASS for visualizer DB connection."
+            )
 
         db = AsyncSurreal(url)
         await db.connect()

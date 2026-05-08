@@ -207,6 +207,10 @@ async def lifespan(app: FastAPI):
         llm_client = OpenAILLMClient(
             model=VLLM_MODEL, client=_oa, extra_body=_CHAT_EXTRA_BODY,
         )
+        if not SURREAL_USER or not SURREAL_PASS:
+            raise RuntimeError(
+                "Missing SURRITI_SURREAL_USER/SURRITI_SURREAL_PASS for myapp memory connection."
+            )
         driver = SurrealDriver(
             url=SURREAL_URL, namespace=SURREAL_NS, database=SURREAL_DB,
             username=SURREAL_USER, password=SURREAL_PASS,
