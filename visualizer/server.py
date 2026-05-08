@@ -30,6 +30,11 @@ log = logging.getLogger("surriti.visualizer")
 load_dotenv()
 SURRITI_API_KEY = (os.environ.get("SURRITI_API_KEY") or "").strip()
 ALLOW_INSECURE_LOCAL = os.environ.get("SURRITI_ALLOW_INSECURE_LOCAL", "1") == "1"
+if not SURRITI_API_KEY and not ALLOW_INSECURE_LOCAL:
+    log.warning(
+        "SURRITI_API_KEY is empty while SURRITI_ALLOW_INSECURE_LOCAL=0; "
+        "all non-loopback API requests will be denied."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -81,6 +81,11 @@ SURREAL_USER = os.environ.get("SURRITI_SURREAL_USER")
 SURREAL_PASS = os.environ.get("SURRITI_SURREAL_PASS")
 SURRITI_API_KEY = (os.environ.get("SURRITI_API_KEY") or "").strip()
 ALLOW_INSECURE_LOCAL = os.environ.get("SURRITI_ALLOW_INSECURE_LOCAL", "1") == "1"
+if not SURRITI_API_KEY and not ALLOW_INSECURE_LOCAL:
+    log.warning(
+        "SURRITI_API_KEY is empty while SURRITI_ALLOW_INSECURE_LOCAL=0; "
+        "all non-loopback requests will be denied."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -628,8 +633,8 @@ async def get_memory(user_id: str) -> dict:
             "SELECT * FROM relates_to WHERE group_id = $g ORDER BY created_at;",
             {"g": user_id},
         ))
-    except Exception as exc:
-        log.warning("Memory dump failed: %s", exc)
+    except Exception:
+        log.exception("Memory dump failed")
         return {"status": "error", "detail": "internal_error", "nodes": [], "edges": []}
 
     nodes = [parse_entity(r) for r in node_rows]

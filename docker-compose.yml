@@ -10,7 +10,7 @@ services:
     # container (mapped to the named volume below) so `docker compose down`
     # no longer wipes the graph. To do a full reset (DB + container):
     # `docker compose down -v`.
-    command: start --user ${SURRITI_SURREAL_USER:?set SURRITI_SURREAL_USER} --pass ${SURRITI_SURREAL_PASS:?set SURRITI_SURREAL_PASS} --bind 0.0.0.0:8000 rocksdb:/data/surreal.db
+    command: start --user ${SURRITI_SURREAL_USER:?SURRITI_SURREAL_USER must be set (for example in .env)} --pass ${SURRITI_SURREAL_PASS:?SURRITI_SURREAL_PASS must be set (for example in .env)} --bind 0.0.0.0:8000 rocksdb:/data/surreal.db
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -96,8 +96,8 @@ services:
       SURRITI_SURREAL_URL:  "ws://surrealdb:8000/rpc"
       SURRITI_SURREAL_NS:   "myapp"
       SURRITI_SURREAL_DB:   "myapp"
-      SURRITI_SURREAL_USER: "${SURRITI_SURREAL_USER:?set SURRITI_SURREAL_USER}"
-      SURRITI_SURREAL_PASS: "${SURRITI_SURREAL_PASS:?set SURRITI_SURREAL_PASS}"
+      SURRITI_SURREAL_USER: "${SURRITI_SURREAL_USER:?SURRITI_SURREAL_USER must be set (for example in .env)}"
+      SURRITI_SURREAL_PASS: "${SURRITI_SURREAL_PASS:?SURRITI_SURREAL_PASS must be set (for example in .env)}"
     depends_on:
       surrealdb:
         condition: service_healthy
