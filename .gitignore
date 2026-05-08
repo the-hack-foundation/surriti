@@ -5,4 +5,7 @@ __pycache__
 *.pyo
 *.pyd
 legba
+surriti/dist/
+venv
+.venv
 

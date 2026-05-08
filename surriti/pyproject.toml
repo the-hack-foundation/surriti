@@ -37,7 +37,6 @@ dependencies = [
     "surrealdb>=2.0,<3",
     "pydantic>=2.6",
     "python-dotenv>=1.0",
-    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
@@ -54,11 +53,11 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/surriti/surriti"
-Repository = "https://github.com/surriti/surriti"
-Documentation = "https://github.com/surriti/surriti#readme"
-Issues = "https://github.com/surriti/surriti/issues"
-Changelog = "https://github.com/surriti/surriti/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/the-hack-foundation/surriti"
+Repository = "https://github.com/the-hack-foundation/surriti"
+Documentation = "https://github.com/the-hack-foundation/surriti#readme"
+Issues = "https://github.com/the-hack-foundation/surriti/issues"
+Changelog = "https://github.com/the-hack-foundation/surriti/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]

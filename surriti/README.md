@@ -177,18 +177,27 @@ Run any of them with `python examples/<name>.py` after installing.
 
 ## Development
 
+The repository contains the surriti library under `surriti/` alongside supporting
+tooling (visualizer, docker-compose, example app). The library itself — including
+`pyproject.toml`, tests, and examples — lives in the nested `surriti/` subdirectory.
+
 ```bash
-git clone https://github.com/surriti/surriti
-cd surriti
+git clone https://github.com/the-hack-foundation/surriti
+cd surriti/surriti        # enter the library root (where pyproject.toml lives)
 pip install -e ".[dev]"
+```
 
-# unit tests (no DB required)
-$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"
-python -m pytest tests -p asyncio -o asyncio_mode=auto
+No separate `requirements.txt` is needed — `pyproject.toml` declares all deps.
+The `[dev]` extra pulls in pytest, ruff, mypy, build, and twine.
 
-# integration tests (need SurrealDB on :8000)
-docker compose -f docker-compose.yml up -d
-python -m pytest tests/test_integration_surrealdb.py
+```bash
+# unit tests (no DB required — run from surriti/surriti/)
+pytest tests/
+
+# integration tests (need SurrealDB running on :8000)
+docker run --rm -d -p 8000:8000 surrealdb/surrealdb:latest \
+  start --user root --pass root memory
+pytest tests/test_integration_surrealdb.py
 ```
 
 Linting/type-checking:
