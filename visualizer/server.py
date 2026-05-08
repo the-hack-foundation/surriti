@@ -8,8 +8,10 @@ wire so the client can render without fabricating data.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,8 +19,8 @@ from typing import Any
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).resolve().parent
@@ -26,6 +28,8 @@ STATIC = ROOT / "static"
 log = logging.getLogger("surriti.visualizer")
 
 load_dotenv()
+SURRITI_API_KEY = (os.environ.get("SURRITI_API_KEY") or "").strip()
+ALLOW_INSECURE_LOCAL = os.environ.get("SURRITI_ALLOW_INSECURE_LOCAL", "1") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +39,38 @@ load_dotenv()
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    if host in ("localhost",):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _extract_bearer_token(authorization: str | None) -> str:
+    if not authorization:
+        return ""
+    prefix = "bearer "
+    if authorization.lower().startswith(prefix):
+        return authorization[len(prefix):].strip()
+    return ""
+
+
+def _is_authorized(request: Request) -> bool:
+    client_host = request.client.host if request.client else None
+    if ALLOW_INSECURE_LOCAL and _is_loopback_host(client_host):
+        return True
+    if not SURRITI_API_KEY:
+        return False
+    x_api_key = (request.headers.get("x-api-key") or request.query_params.get("api_key") or "").strip()
+    bearer = _extract_bearer_token(request.headers.get("authorization"))
+    presented = x_api_key or bearer
+    return bool(presented) and secrets.compare_digest(presented, SURRITI_API_KEY)
 
 
 def _jsonable(value: Any) -> Any:
@@ -195,8 +231,8 @@ async def lifespan(app: FastAPI):
         url = os.environ.get("SURRITI_SURREAL_URL", "ws://localhost:8000/rpc")
         namespace = os.environ.get("SURRITI_SURREAL_NS", "myapp")
         database = os.environ.get("SURRITI_SURREAL_DB", "myapp")
-        username = os.environ.get("SURRITI_SURREAL_USER", "root")
-        password = os.environ.get("SURRITI_SURREAL_PASS", "root")
+        username = os.environ.get("SURRITI_SURREAL_USER")
+        password = os.environ.get("SURRITI_SURREAL_PASS")
 
         db = AsyncSurreal(url)
         await db.connect()
@@ -215,6 +251,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Surriti Visualizer", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api") and not _is_authorized(request):
+        return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    return await call_next(request)
 
 
 @app.get("/")

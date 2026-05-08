@@ -8,4 +8,5 @@ legba
 surriti/dist/
 venv
 .venv
-
+.env
+.env.*
