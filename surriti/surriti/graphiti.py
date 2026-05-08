@@ -1052,6 +1052,7 @@ class Surriti:
         depth: str = "normal",
         as_of: datetime | None = None,
         limit: int = 20,
+        include_invalid: bool = False,
     ) -> "MemoryContext":
         """Build a query-focused memory context.
 
@@ -1071,6 +1072,12 @@ class Surriti:
 
         ``as_of`` is reserved for time-travel queries; current build
         ignores it and returns the latest valid state.
+
+        ``include_invalid``: when ``True``, invalidated / superseded edges
+        are included in the result alongside active ones.  Callers should
+        label them as historical so the LLM does not treat them as current
+        truth.  Useful for queries like "where did X previously work?"
+        where the *old* fact is exactly what is wanted.
         """
 
         from surriti.entity_resolution import resolve_entity_mentions
@@ -1136,7 +1143,11 @@ class Surriti:
         # 3. Facts. Free-text + vector hybrid; ego_filter clamps to the
         #    resolved entities when present.
         embedding = await self.embedder.create(query) if query else None
-        cfg = SearchConfig(limit=limit, candidate_limit=max(limit * 4, 40))
+        cfg = SearchConfig(
+            limit=limit,
+            candidate_limit=max(limit * 4, 40),
+            only_valid=not include_invalid,
+        )
         edge_results = await hybrid_search(
             self.driver,
             query=query,
