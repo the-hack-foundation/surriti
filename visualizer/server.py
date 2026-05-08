@@ -44,7 +44,7 @@ def _utcnow_iso() -> str:
 def _is_loopback_host(host: str | None) -> bool:
     if not host:
         return False
-    if host in ("localhost",):
+    if host == "localhost":
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
