@@ -100,6 +100,9 @@
             <label><input class="mcToggle" type="checkbox" value="constraint" checked> constraint</label>
             <label><input class="mcToggle" type="checkbox" value="trait" checked> trait</label>
             <label><input class="mcToggle" type="checkbox" value="sentiment" checked> sentiment</label>
+            <label><input class="mcToggle" type="checkbox" value="belief" checked> belief</label>
+            <label><input class="mcToggle" type="checkbox" value="goal" checked> goal</label>
+            <label><input class="mcToggle" type="checkbox" value="consolidated" checked> consolidated</label>
           </div>
         </details>
 
@@ -161,6 +164,10 @@
           <div><i class="line mc-constraint"></i>Constraint</div>
           <div><i class="line mc-trait"></i>Trait</div>
           <div><i class="line mc-sentiment"></i>Sentiment</div>
+          <div><i class="line mc-belief"></i>Belief</div>
+          <div><i class="line mc-goal"></i>Goal</div>
+          <div><i class="line mc-consolidated"></i>Consolidated</div>
+          <div><i class="dot affect-badge"></i>Affect-tagged</div>
         </section>
       </aside>
 
@@ -177,6 +184,7 @@
           <button class="tab" data-tab="aliases" role="tab" aria-selected="false">Aliases <span id="aliasBadge" class="tab-badge hidden">0</span></button>
           <button class="tab" data-tab="dossier" role="tab" aria-selected="false">Dossier</button>
           <button class="tab" data-tab="frames" role="tab" aria-selected="false">Frames</button>
+          <button class="tab" data-tab="cognition" role="tab" aria-selected="false">Cognition</button>
         </nav>
 
         <section class="tab-panel active" data-panel="inspector">
@@ -210,6 +218,15 @@
         <section class="tab-panel" data-panel="dossier">
           <div id="dossierView" class="details">
             <p class="empty">Select an entity to load its dossier.</p>
+          </div>
+        </section>
+
+        <section class="tab-panel" data-panel="cognition">
+          <div class="cognition-controls">
+            <button id="cognitionRefreshBtn" type="button">Refresh</button>
+          </div>
+          <div id="cognitionView" class="details">
+            <p class="empty">Select a group or click Refresh to load cognition data.</p>
           </div>
         </section>
 

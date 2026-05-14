@@ -28,6 +28,13 @@
   --mc-constraint: #f97316;
   --mc-trait: #86efac;
   --mc-sentiment: #fde68a;
+  /* cognition layer colours */
+  --mc-belief: #f472b6;
+  --mc-goal: #fb923c;
+  --mc-consolidated: #c084fc;
+  --affect-glow: rgba(251,191,36,0.45);
+  --trait-node: #4ade80;
+  --goal-node: #fb923c;
 }
 
 [data-theme="light"] {
@@ -59,6 +66,13 @@
   --mc-constraint: #c2410c;
   --mc-trait: #15803d;
   --mc-sentiment: #b45309;
+  /* cognition layer colours */
+  --mc-belief: #be185d;
+  --mc-goal: #c2410c;
+  --mc-consolidated: #7e22ce;
+  --affect-glow: rgba(217,119,6,0.35);
+  --trait-node: #15803d;
+  --goal-node: #c2410c;
 }
 
 * { box-sizing: border-box; }
@@ -596,6 +610,62 @@ pre {
 .timeline-head { display: flex; justify-content: space-between; align-items: center; }
 .timeline-head .muted { font-size: 11px; font-variant-numeric: tabular-nums; }
 .timeline input[type="range"] { width: 100%; accent-color: var(--focus); }
+
+/* ---------- Cognition panel ---------- */
+.cognition-controls { display: flex; gap: 8px; margin-bottom: 12px; }
+.cog-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.cog-stat {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cog-stat .cog-val {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.cog-stat .cog-label { font-size: 11px; color: var(--muted); }
+.cognition-section { margin-bottom: 16px; }
+.cognition-section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 6px; }
+.belief-card, .trait-card, .goal-card, .affect-card, .pred-card {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.belief-card { border-left: 3px solid var(--mc-belief); }
+.trait-card  { border-left: 3px solid var(--mc-trait); }
+.goal-card   { border-left: 3px solid var(--mc-goal); }
+.affect-card { border-left: 3px solid var(--mc-sentiment); }
+.pred-card   { border-left: 3px solid var(--mc-consolidated); }
+.cog-fact    { font-style: italic; color: var(--muted); margin-top: 3px; }
+.cog-holder  { font-size: 11px; color: var(--muted); margin-top: 2px; }
+/* Legend affect dot */
+.dot.affect-badge { background: radial-gradient(circle, var(--mc-sentiment) 40%, transparent 100%); border: 1.5px solid var(--mc-sentiment); }
+/* memory_class pills — cognition additions */
+.pill.mc-belief      { background: color-mix(in srgb, var(--mc-belief) 20%, transparent); color: var(--mc-belief); border-color: var(--mc-belief); }
+.pill.mc-goal        { background: color-mix(in srgb, var(--mc-goal) 20%, transparent); color: var(--mc-goal); border-color: var(--mc-goal); }
+.pill.mc-consolidated { background: color-mix(in srgb, var(--mc-consolidated) 20%, transparent); color: var(--mc-consolidated); border-color: var(--mc-consolidated); }
+/* Graph: belief edges */
+path.belief-edge { stroke-dasharray: 6 3; }
+/* Graph: affect-tagged episode node glow */
+circle.affect-glow { filter: drop-shadow(0 0 5px var(--affect-glow)); }
+/* Legend lines for new types */
+.line.mc-belief      { background: var(--mc-belief); }
+.line.mc-goal        { background: var(--mc-goal); }
+.line.mc-consolidated { background: var(--mc-consolidated); }
 
 /* ---------- Responsive ---------- */
 @media (max-width: 1100px) {

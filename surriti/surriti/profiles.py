@@ -149,9 +149,53 @@ async def refresh_entity_profiles(
                     facts.append(edge.fact)
 
             display_name = entity.canonical_name or entity.name
+
+            # Append cached trait + goal labels (synthesised by the
+            # cognitive layer) so the profile_summary is self-describing
+            # and can be rendered straight into a system prompt without
+            # an extra trait/goal lookup. We resolve the cached UUIDs
+            # to their entity ``name`` in one bulk SELECT.
+            trait_goal_uuids = list(
+                dict.fromkeys(
+                    list(getattr(entity, "traits", []) or [])
+                    + list(getattr(entity, "goals_active", []) or [])
+                )
+            )
+            trait_names: list[str] = []
+            goal_names: list[str] = []
+            if trait_goal_uuids:
+                try:
+                    sidecar_rows = _unwrap(
+                        await driver.query(
+                            "SELECT uuid, name, labels FROM entity "
+                            "WHERE group_id = $g AND uuid IN $u;",
+                            {"g": group_id, "u": trait_goal_uuids},
+                        )
+                    )
+                    for sr in sidecar_rows:
+                        labels = sr.get("labels") or []
+                        nm = str(sr.get("name") or "").strip()
+                        if not nm:
+                            continue
+                        if "trait" in labels:
+                            trait_names.append(nm)
+                        elif "goal" in labels:
+                            goal_names.append(nm)
+                except Exception:
+                    logger.debug("profile sidecar fetch failed for %s", uuid)
+
             summary = await _summarize_with_llm(
                 llm, display_name, facts, max_chars
             )
+            tail_parts: list[str] = []
+            if trait_names:
+                tail_parts.append("Traits: " + ", ".join(trait_names[:6]))
+            if goal_names:
+                tail_parts.append("Active goals: " + ", ".join(goal_names[:6]))
+            if tail_parts:
+                tail = " " + " ".join(p + "." for p in tail_parts)
+                if len(summary) + len(tail) <= max_chars + 240:
+                    summary = (summary or display_name + ".") + tail
             embedding: list[float] = []
             if summary:
                 try:

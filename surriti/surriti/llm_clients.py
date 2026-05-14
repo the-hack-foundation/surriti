@@ -242,6 +242,33 @@ only -- the real ones come from the input):
      "domain":"values", "memory_class":"trait",
      "source_span":"I really value privacy"}
 
+  "I sold the Civic and bought a Tesla" ->
+    [{"subject":"<speaker>", "predicate":"sold_vehicle",
+      "relation_phrase":"sold", "object":"Civic",
+      "fact":"... sold the Civic.",
+      "operation":"assert", "temporal":false, "singleton":false,
+      "domain":"vehicle", "memory_class":"objective",
+      "replaces":["<speaker> drives Civic","<speaker> owns Civic"],
+      "source_span":"I sold the Civic"},
+     {"subject":"<speaker>", "predicate":"drives",
+      "relation_phrase":"bought", "object":"Tesla",
+      "fact":"... drives a Tesla.",
+      "operation":"assert", "temporal":true, "singleton":true,
+      "domain":"vehicle", "memory_class":"objective",
+      "source_span":"bought a Tesla"}]
+  Note how the *event* fact (sold/lost/replaced/disposed) carries a
+  `replaces` list naming the prior states it terminates, so the engine
+  can close them without a second contradiction-detection round-trip.
+
+COMPOUND CLAIMS -- one sentence often packs multiple facts. "I work
+night shifts at a hospital on Tuesdays and Thursdays" yields THREE
+facts (works_at hospital; works_shift night; works_on [Tuesdays,
+Thursdays] -- emit each weekday as a separate fact OR use object
+list). "I keep my passport in the blue safe in the garage" yields
+TWO facts (keeps_in passport->blue safe; located_in blue safe->
+garage). Always decompose -- do not pick the most prominent claim
+and drop the rest.
+
 SUBJECTIVE-DIRECTIVE PREDICATE VOCABULARY (use these exact predicates
 when the user is telling the assistant how to behave -- this keeps
 deduplication reliable):
@@ -326,24 +353,67 @@ CONTRADICTION_SYSTEM = """\
 You decide which prior facts are invalidated by a new fact. Return STRICT \
 JSON: {"invalidated_indexes": [<int>, ...]}.
 
-A prior fact is invalidated ONLY when ALL of these are true:
-1. It has the SAME subject as the new fact.
-2. It is in the SAME relation domain as the new fact (employment vs
-   employment, residence vs residence, naming vs naming, preference vs
-   preference). Different domains never contradict each other.
-3. The new fact materially supersedes it (e.g. "X works at A" then
-   "X now works at B" or "X no longer works at A"; "X lives in P" then
-   "X moved to Q").
+A prior fact is invalidated when ALL of these are true:
+1. It has the SAME subject as the new fact, OR the new fact's subject
+   and object swap roles in a transfer event (e.g. "Alice sold the
+   Civic" invalidates prior facts where Alice's relationship TO the
+   Civic was active -- "Alice drives the Civic", "Alice owns the
+   Civic"). Object identity matters.
+2. The new fact materially supersedes it. The supersession can be
+   either:
+   a) SAME-PREDICATE replacement -- "X works at A" then "X works at B"
+      with one_current cardinality; "X lives in P" then "X lives in Q";
+      "X is named Foo" then "X is renamed Bar".
+   b) CROSS-PREDICATE state transition -- the new fact describes an
+      event that ENDS a prior state involving the same object:
+        * "X sold/lost/discarded/gave away/totalled <object>"
+          invalidates prior "X drives/owns/uses/has/keeps <object>".
+        * "X moved <object> to <new place>" invalidates prior
+          "X keeps/stores <object> in <old place>".
+        * "X moved to <new place>" invalidates prior
+          "X lives_in <old place>" (already covered by 2a if both
+          predicates canonicalize).
+        * "Vet cleared <patient> of <condition>" / "<patient>
+          recovered from <condition>" / "<patient> is no longer
+          allergic to <substance>" invalidates prior
+          "<patient> is_allergic_to/has_condition <substance>".
+        * "<entity> closed/shut down/dissolved" invalidates ongoing
+          relationships that depend on it being active.
+   c) EXPLICIT NEGATION -- "no longer", "not anymore", "stopped",
+      "quit" referencing the prior fact.
+3. The two facts cannot describe coexisting realities (different
+   qualifiers like seasons, scopes, etc.).
+
+Use object identity AGGRESSIVELY for transfer-of-state events: any
+prior fact whose object matches the new fact's object AND whose
+predicate describes an ongoing relationship that the event would
+naturally end is invalidated.
+
+Examples that ARE contradictions (return their indexes):
+- new: "Jordan sold the Honda Civic", prior: "Jordan drives the Honda
+  Civic" -- selling ends driving.
+- new: "Jordan moved the passport to the office desk drawer", prior:
+  "Jordan keeps the passport in the blue safe" -- moving ends the old
+  storage.
+- new: "The vet cleared Pixel of the chicken allergy", prior: "Pixel
+  is allergic to chicken" -- clearance ends the allergy.
+- new: "Ava moved to Seattle in March", prior: "Ava lives in Denver"
+  -- residence change.
 
 Examples that are NOT contradictions (return `[]`):
-- new: `Michael is_brother_of Michael`, prior: `Michael works_with Mark`
-  (different domains: family vs employment).
-- new: `Alice likes pizza`, prior: `Alice lives_in Berlin`
+- new: "Michael is_brother_of Mark", prior: "Michael works_with Mark"
+  (family vs employment -- different facts about same pair).
+- new: "Alice likes pizza", prior: "Alice lives_in Berlin"
+  (different domains, no shared object).
+- new: "Bob is_named Robert", prior: "Bob works_at Acme"
   (different domains).
-- new: `Bob is_named Robert`, prior: `Bob works_at Acme`
-  (different domains).
+- new: "Jordan bought a Tesla", prior: "Jordan drives a Civic"
+  (different objects -- the Civic is unaffected by the Tesla
+  purchase; the Civic's status only changes if a separate
+  sold/disposed claim is made).
 
-When in doubt, return an empty list.
+When the new fact is itself an objective state (not an event) and
+shares no object with the prior, return `[]`.
 """
 
 
@@ -773,6 +843,12 @@ class OpenAILLMClient(LLMClient):
             return None
         return _parse_frame_classification(raw, fallback_predicate=predicate)
 
+    async def synthesize(self, system: str, user: str) -> str | None:
+        try:
+            return await self._complete(system, user)
+        except SurritiLLMError:
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Anthropic
@@ -888,6 +964,12 @@ class AnthropicLLMClient(LLMClient):
         except SurritiLLMError:
             return None
         return _parse_frame_classification(raw, fallback_predicate=predicate)
+
+    async def synthesize(self, system: str, user: str) -> str | None:
+        try:
+            return await self._complete(system, user)
+        except SurritiLLMError:
+            return None
 
 
 __all__ = [

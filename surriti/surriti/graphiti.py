@@ -111,6 +111,15 @@ class MemoryContext:
     episodes: list[EpisodicNode] = field(default_factory=list)
     communities: list[CommunityNode] = field(default_factory=list)
     resolved_entities: list[dict] = field(default_factory=list)
+    traits: list[EntityNode] = field(default_factory=list)
+    """Synthesized trait entities tied to the resolved subjects.
+    Populated by the cognitive layer; empty when ``cognition=False``."""
+    goals: list[EntityNode] = field(default_factory=list)
+    """Active goal entities tied to the resolved subjects."""
+    prediction: dict | None = None
+    """Per-group prediction bundle (likely topics / preferences /
+    questions) emitted by the cognitive layer. Only populated at
+    ``depth='deep'``."""
 
 
 class Surriti:
@@ -142,11 +151,23 @@ class Surriti:
         alias_resolution_llm: bool = True,
         profile_refresh: str = "async",
         profile_summary_max_facts: int = 30,
+        cognition: "CognitionConfig | bool" = True,
     ) -> None:
+        from surriti.cognition import CognitionConfig
+
         self.driver = driver
         self.llm = llm_client or DummyLLMClient()
         self.embedder = embedder or DummyEmbedder(embedding_dim=driver.embedding_dim)
         self.cross_encoder = cross_encoder
+        # Cognitive abstraction layer. ``True`` enables the default
+        # config; ``False`` disables it entirely; pass a ``CognitionConfig``
+        # for fine-grained tuning. The scheduler itself is created lazily
+        # in ``connect()`` so a never-connected ``Surriti`` stays cheap.
+        if isinstance(cognition, bool):
+            self._cognition_config = CognitionConfig(enabled=cognition)
+        else:
+            self._cognition_config = cognition
+        self._cognition: "CognitionScheduler | None" = None
         # Alias resolution / dossier knobs. ``alias_resolution`` gates the
         # whole layered pipeline; ``profile_refresh`` controls when
         # ``profiles.refresh_entity_profiles`` runs after add_episode.
@@ -212,6 +233,7 @@ class Surriti:
         alias_resolution_llm: bool = True,
         profile_refresh: str = "async",
         profile_summary_max_facts: int = 30,
+        cognition: "CognitionConfig | bool" = True,
     ) -> "Surriti":
         """Build a Surriti instance from environment variables.
 
@@ -240,6 +262,7 @@ class Surriti:
             alias_resolution_llm=alias_resolution_llm,
             profile_refresh=profile_refresh,
             profile_summary_max_facts=profile_summary_max_facts,
+            cognition=cognition,
         )
 
     # ------------------------------------------------------------------ lifecycle
@@ -250,11 +273,27 @@ class Surriti:
             await self.driver.connect()
         if hasattr(self.driver, "init_schema"):
             await self.driver.init_schema()
+        if self._cognition is None:
+            from surriti.cognition import CognitionScheduler
+
+            self._cognition = CognitionScheduler(
+                driver=self.driver,
+                llm=self.llm,
+                embedder=self.embedder,
+                config=self._cognition_config,
+            )
+            self._cognition.start()
         return self
 
     async def close(self) -> None:
         """Close the underlying driver. Safe to call multiple times."""
 
+        if self._cognition is not None:
+            try:
+                await self._cognition.shutdown()
+            except Exception:  # noqa: BLE001
+                logger.exception("cognition shutdown failed")
+            self._cognition = None
         if hasattr(self.driver, "close"):
             await self.driver.close()
 
@@ -355,19 +394,46 @@ class Surriti:
             )
             if speaker_name:
                 speaker_hint = (
-                    f"(Speaker context: \"I\"/\"me\"/\"my\" refer to "
-                    f"\"{speaker_name}\" (stable id \"{speaker_id}\"). "
-                    f"Use \"{speaker_name}\" as the subject for facts "
-                    f"about the speaker. The OBJECT must be the actual "
-                    f"value mentioned in the text -- never the literal "
-                    f"word \"speaker\" or \"{speaker_name}\" again. "
-                    f"Examples: \"I work at Acme\" -> "
+                    f"(Speaker context: \"I\"/\"me\"/\"my\"/\"mine\" "
+                    f"refer to \"{speaker_name}\" (stable id "
+                    f"\"{speaker_id}\"). Use \"{speaker_name}\" as the "
+                    f"subject for facts about the speaker. The OBJECT "
+                    f"must be the actual value mentioned in the text -- "
+                    f"never the literal word \"speaker\" or "
+                    f"\"{speaker_name}\" again. Examples: "
+                    f"\"I work at Acme\" -> "
                     f"`{speaker_name} -[works_at]-> Acme`; "
                     f"\"my birthday is October 14\" -> "
                     f"`{speaker_name} -[has_birthday]-> October 14`; "
                     f"\"I am 33 years old\" -> "
                     f"`{speaker_name} -[is_age]-> 33`. Add the value "
-                    f"(Acme, October 14, 33) to the entities list too.)"
+                    f"(Acme, October 14, 33) to the entities list too. "
+                    f"\n\n"
+                    f"CRITICAL — third-party subjects: when the "
+                    f"sentence's grammatical subject is a NAMED entity "
+                    f"(a person, pet, place, object) rather than a "
+                    f"first-person pronoun, KEEP that named subject -- "
+                    f"DO NOT substitute \"{speaker_name}\". The speaker "
+                    f"swap applies ONLY to first-person pronouns "
+                    f"(I/me/my/mine). Likewise, resolve third-person "
+                    f"pronouns (he/she/they/him/her/them/his/hers) to "
+                    f"the most recently mentioned named entity from "
+                    f"CONTEXT, not to the speaker. Anti-examples: "
+                    f"\"Pixel is allergic to chicken\" -> "
+                    f"`Pixel -[allergic_to]-> chicken` (NOT "
+                    f"`{speaker_name} -[allergic_to]-> chicken`); "
+                    f"\"Mango hates thunderstorms\" -> "
+                    f"`Mango -[hates]-> thunderstorms` (NOT "
+                    f"`{speaker_name} -[hates]-> thunderstorms`); "
+                    f"\"My sister Ava lives in Denver\" -> "
+                    f"`Ava -[lives_in]-> Denver` AND "
+                    f"`{speaker_name} -[has_sister]-> Ava` (two facts; "
+                    f"Ava is the subject of the residence claim, NOT "
+                    f"{speaker_name}); \"The vet cleared him\" "
+                    f"following a sentence about Pixel -> "
+                    f"`Pixel -[was_cleared_by]-> vet` (the pronoun "
+                    f"\"him\" resolves to Pixel, NOT to "
+                    f"{speaker_name}).)"
                 )
             else:
                 speaker_hint = (
@@ -383,7 +449,27 @@ class Surriti:
                     f"`{speaker_id} -[is_age]-> 5 months`; "
                     f"\"I am a baby\" -> `{speaker_id} -[is_a]-> baby`. "
                     f"Add the value (Auley, 5 months, baby) to the "
-                    f"entities list too.)"
+                    f"entities list too."
+                    f"\n\nCRITICAL -- third-party subjects: when the "
+                    f"sentence's grammatical subject is a NAMED entity "
+                    f"(a person, pet, place, object) rather than a "
+                    f"first-person pronoun, KEEP that named subject -- "
+                    f"DO NOT substitute \"{speaker_id}\". Pronouns "
+                    f"he/she/they/him/her resolve to the most recently "
+                    f"mentioned named entity from CONTEXT, not to the "
+                    f"speaker. Anti-examples: \"Pixel is allergic to "
+                    f"chicken\" -> `Pixel -[is_allergic_to]-> chicken` "
+                    f"(NOT `{speaker_id} -[is_allergic_to]-> chicken`); "
+                    f"\"Mango hates thunderstorms\" -> "
+                    f"`Mango -[hates]-> thunderstorms`; \"My sister Ava "
+                    f"lives in Denver\" -> `Ava -[lives_in]-> Denver` "
+                    f"AND `{speaker_id} -[has_sister]-> Ava` (two facts; "
+                    f"Ava is the subject of the residence claim, NOT "
+                    f"{speaker_id}); \"The vet cleared him\" following "
+                    f"a sentence about Pixel -> "
+                    f"`Pixel -[was_cleared_by]-> vet` (the pronoun "
+                    f"\"him\" resolves to Pixel, NOT to "
+                    f"{speaker_id}).)"
                 )
             custom_extraction_instructions = (
                 f"{custom_extraction_instructions}\n\n{speaker_hint}"
@@ -605,6 +691,16 @@ class Surriti:
                     await coro
                 else:
                     asyncio.create_task(coro)
+
+        # Fire-and-forget cognitive abstraction pass. The scheduler
+        # debounces and batches; failures inside the pass are logged
+        # but never raised. Wrap defensively so an unexpected scheduler
+        # bug can never break ingest.
+        if self._cognition is not None and self._cognition.enabled:
+            try:
+                self._cognition.notify(group_id, episode.uuid)
+            except Exception:  # noqa: BLE001
+                logger.exception("cognition notify raised; ignoring")
 
         return AddEpisodeResults(
             episode=episode,
@@ -1155,6 +1251,7 @@ class Surriti:
             candidate_limit=max(limit * 4, 40),
             only_valid=not include_invalid,
             filters=_filters,
+            decay_aware=True,
         )
         edge_results = await hybrid_search(
             self.driver,
@@ -1194,6 +1291,7 @@ class Surriti:
 
         episodes: list[EpisodicNode] = []
         communities: list[CommunityNode] = []
+        prediction: dict | None = None
         if depth == "deep":
             episodes = await search_episodes(
                 self.driver, query=query, group_id=group_id, limit=limit
@@ -1205,6 +1303,48 @@ class Surriti:
                 group_id=group_id,
                 limit=limit,
             )
+            try:
+                pred_rows = _unwrap(
+                    await self.driver.query(
+                        "SELECT payload FROM community WHERE group_id = $g AND kind = 'prediction' LIMIT 1;",
+                        {"g": group_id},
+                    )
+                )
+                if pred_rows:
+                    payload = pred_rows[0].get("payload")
+                    if isinstance(payload, dict):
+                        prediction = payload
+            except Exception:
+                logger.exception("recall: prediction load failed")
+
+        # Trait + goal sidecar fetch. We read the cached ``traits`` /
+        # ``goals_active`` arrays denormalised onto each resolved
+        # subject, then resolve them to actual ``entity`` rows in one
+        # bulk SELECT. Both lists stay empty when the cognitive layer
+        # is disabled or has not yet ratified anything.
+        traits: list[EntityNode] = []
+        goals: list[EntityNode] = []
+        try:
+            wanted_trait_uuids: list[str] = []
+            wanted_goal_uuids: list[str] = []
+            for p in profiles:
+                wanted_trait_uuids.extend(getattr(p, "traits", []) or [])
+                wanted_goal_uuids.extend(getattr(p, "goals_active", []) or [])
+            wanted_trait_uuids = list(dict.fromkeys(wanted_trait_uuids))
+            wanted_goal_uuids = list(dict.fromkeys(wanted_goal_uuids))
+            sidecar_uuids = wanted_trait_uuids + wanted_goal_uuids
+            if sidecar_uuids:
+                rows = _unwrap(
+                    await self.driver.query(
+                        "SELECT * FROM entity WHERE group_id = $g AND uuid IN $u;",
+                        {"g": group_id, "u": sidecar_uuids},
+                    )
+                )
+                by_uuid = {str(r.get("uuid")): parse_entity(r) for r in rows}
+                traits = [by_uuid[u] for u in wanted_trait_uuids if u in by_uuid]
+                goals = [by_uuid[u] for u in wanted_goal_uuids if u in by_uuid]
+        except Exception:
+            logger.exception("recall: trait/goal sidecar load failed")
 
         return MemoryContext(
             query=query,
@@ -1212,6 +1352,9 @@ class Surriti:
             facts=facts,
             episodes=episodes,
             communities=communities,
+            traits=traits,
+            goals=goals,
+            prediction=prediction,
             resolved_entities=[
                 {
                     "mention": r.mention.name,
@@ -1892,7 +2035,6 @@ class Surriti:
             predicate=edge_name,
             fact_text=fact_text,
             qualifier_hash_value=qhash,
-            require_text_match=frame is None,
         )
         if existing is not None:
             if episode and episode.uuid not in existing.episodes:
@@ -1914,6 +2056,13 @@ class Surriti:
         # layer fires first decides the new edge's status and the set of
         # invalidated peers; later layers are skipped.
         #
+        #   Layer 0: extractor-declared ``replaces`` -- the LLM listed
+        #            prior facts this assertion supersedes (e.g. "sold
+        #            X" supersedes "drives X"). Each descriptor is
+        #            embedding-matched against active edges in the same
+        #            group whose source is this subject; matches are
+        #            terminated. Authoritative because it comes from
+        #            the model that read the source text.
         #   Layer 1: deterministic frame closure (cardinality=one_current
         #            or legacy singleton hint -- runs ``_close_singleton_slot``).
         #   Layer 2: explicit ``operation`` from the extractor -- ``terminate``
@@ -1930,6 +2079,19 @@ class Surriti:
         #            stamp every peer with the same ``conflict_group_id``
         #            so ``Surriti.get_conflicts()`` can surface the group.
         # ------------------------------------------------------------------
+
+        # Layer 0: extractor-declared replaces. Cheap, deterministic,
+        # and authoritative when the LLM populates the field.
+        replaces_closed: list[EntityEdge] = []
+        if fact.replaces:
+            replaces_closed = await self._apply_replaces(
+                group_id=group_id,
+                subject_uuid=subj_uuid,
+                replace_descriptors=fact.replaces,
+                exclude_edge_uuid=None,
+                invalid_at=valid_at,
+                superseded_by=edge_uuid,
+            )
 
         # Layer 1: deterministic singleton closure (cardinality-driven).
         singleton_closed: list[EntityEdge] = []
@@ -1952,7 +2114,7 @@ class Surriti:
         # * the deterministic closer already handled this slot, OR
         # * the frame's policy explicitly says peers coexist.
         if singleton_closed:
-            invalidated = singleton_closed
+            invalidated = list(singleton_closed)
         elif frame is not None and frame.contradiction_policy == "coexist":
             invalidated = []
         else:
@@ -1965,7 +2127,18 @@ class Surriti:
                 group_id=group_id,
                 new_fact_struct=fact,
                 new_edge_uuid=edge_uuid,
+                new_subject_uuid=subj_uuid,
+                new_object_uuid=obj_uuid,
             )
+
+        # Merge Layer 0 results, deduping by uuid so a peer terminated
+        # by both ``replaces`` and another layer is only listed once.
+        if replaces_closed:
+            seen_uuids = {e.uuid for e in invalidated}
+            for e in replaces_closed:
+                if e.uuid not in seen_uuids:
+                    invalidated.append(e)
+                    seen_uuids.add(e.uuid)
 
         # Layer 4: needs_resolution. When the frame says "uncertain" and
         # Layer 3 did not pick a winner, surface every same-slot peer in
@@ -2006,7 +2179,7 @@ class Surriti:
             temporal=fact.temporal or (frame is not None and frame.temporal_kind == "state"),
             singleton=is_singleton_slot,
             domain=fact.domain,
-            supersedes=[e.uuid for e in singleton_closed],
+            supersedes=list({e.uuid for e in (singleton_closed + replaces_closed)}),
             fact_key=make_fact_key(
                 group_id, subj_uuid, edge_name, obj_uuid, qualifier_hash=qhash
             ),
@@ -2156,6 +2329,80 @@ class Surriti:
             if row_class != new_class:
                 continue
             to_close.append(parse_edge(row))
+        if to_close:
+            await invalidate_edges(
+                self.driver,
+                [e.uuid for e in to_close],
+                invalid_at=invalid_at,
+                superseded_by=superseded_by,
+            )
+            for e in to_close:
+                e.invalid_at = invalid_at
+                e.status = "superseded"
+                e.superseded_by = superseded_by
+        return to_close
+
+    async def _apply_replaces(
+        self,
+        *,
+        group_id: str,
+        subject_uuid: str,
+        replace_descriptors: list[str],
+        exclude_edge_uuid: str | None,
+        invalid_at: datetime,
+        superseded_by: str,
+        similarity_limit: int = 5,
+    ) -> list[EntityEdge]:
+        """Terminate active edges that the extractor declared superseded.
+
+        ``replace_descriptors`` are free-text descriptions emitted by
+        the extractor in :attr:`ExtractedFact.replaces` (e.g.
+        ``"<speaker> drives Honda Civic"``). For each descriptor we do
+        a hybrid (vector + fulltext) search against active edges in
+        the same group whose source is the same subject, then
+        terminate every match. This honours the model's explicit
+        supersession signal -- the layer-3 LLM-as-judge pass only
+        triggers on undeclared contradictions, so transfer-of-state
+        events ("sold X" supersedes "drives X") that the model
+        already reasoned about don't depend on a second LLM hop to
+        be applied.
+        """
+        if not replace_descriptors:
+            return []
+        from surriti.temporal import find_similar_edges
+
+        seen: dict[str, EntityEdge] = {}
+        for descriptor in replace_descriptors:
+            text = (descriptor or "").strip()
+            if not text:
+                continue
+            try:
+                embedding = await self.embedder.create(text)
+            except Exception:  # noqa: BLE001
+                embedding = None
+            try:
+                candidates = await find_similar_edges(
+                    self.driver,
+                    fact=text,
+                    fact_embedding=embedding,
+                    group_id=group_id,
+                    limit=similarity_limit,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("replaces lookup failed for descriptor %r", text)
+                continue
+            for edge in candidates:
+                if edge.uuid == exclude_edge_uuid:
+                    continue
+                if edge.uuid in seen:
+                    continue
+                if edge.source_node_uuid != subject_uuid:
+                    continue
+                if edge.invalid_at is not None or edge.status != "active":
+                    continue
+                seen[edge.uuid] = edge
+
+        to_close = list(seen.values())
         if to_close:
             await invalidate_edges(
                 self.driver,
@@ -2546,19 +2793,29 @@ class Surriti:
         predicate: str,
         fact_text: str,
         qualifier_hash_value: str = "",
-        require_text_match: bool = True,
+        require_text_match: bool = False,
     ) -> EntityEdge | None:
-        """Find an existing exact edge that should receive another episode support.
+        """Find an existing active edge for the same canonical triple.
 
-        Primary lookup is the deterministic ``fact_key`` (group_id +
-        subject + predicate + object). For backward compatibility with
-        rows written before ``fact_key`` existed, falls back to a
-        triple-match query and exact ``fact`` text comparison. Near-
-        duplicate facts still go through contradiction handling so
-        temporal changes are not masked.
+        Equivalence is determined by the deterministic ``fact_key``
+        (group_id + subject + predicate + object [+ qualifier_hash]) --
+        not by the natural-language ``fact`` string. Two extractions
+        that produce the same triple from differently-worded source
+        text describe the same world fact and must collapse onto a
+        single edge so the new episode just appends to its supporting
+        list. Temporal changes ("X moved", "Y sold the car") are not
+        masked because the extractor surfaces them as
+        ``operation="terminate"`` or via cross-predicate contradiction
+        detection in :meth:`_add_fact_edge`, NOT via a fact-text
+        diff heuristic.
+
+        ``require_text_match`` and ``fact_text`` are kept for backward
+        compatibility with callers but are otherwise unused.
         """
 
         from surriti.search import _unwrap
+
+        del require_text_match, fact_text  # legacy parameters, see docstring
 
         key = make_fact_key(
             group_id, subject_uuid, predicate, object_uuid,
@@ -2576,22 +2833,10 @@ class Surriti:
                 {"group_id": group_id, "key": key},
             )
         )
-        # When a relation frame governs the predicate, the fact_key is
-        # already a frame-aware slot key, so any same-key/same-target
-        # row counts as equivalent and the new episode just appends to
-        # its supporting list. Without a frame we keep the legacy
-        # fact-text guard so negation-cue restatements ("no longer ...")
-        # still flow into contradiction handling.
-        if require_text_match:
-            exact = next(
-                (row for row in rows if row.get("fact") == fact_text), None
-            )
-        else:
-            exact = rows[0] if rows else None
-        if exact is not None:
-            return parse_edge(exact)
+        if rows:
+            return parse_edge(rows[0])
 
-        # Legacy fallback for rows that pre-date the fact_key field.
+        # Legacy fallback for rows written before ``fact_key`` existed.
         rows = _unwrap(
             await self.driver.query(
                 """
@@ -2611,8 +2856,7 @@ class Surriti:
                 },
             )
         )
-        exact = next((row for row in rows if row.get("fact") == fact_text), None)
-        return parse_edge(exact) if exact else None
+        return parse_edge(rows[0]) if rows else None
 
     async def _link_mentions(
         self,

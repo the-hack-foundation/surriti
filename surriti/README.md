@@ -164,6 +164,59 @@ Implement [`surriti.LLMClient`](surriti/llm.py) and pass it as
 
 ---
 
+## Cognitive layer
+
+Surriti runs a second-pass **cognitive abstraction layer** on top of the
+literal extractions emitted by `add_episode`. It debounces in the
+background per `group_id` and, every few episodes, synthesises:
+
+- **Traits & active goals** denormalised onto subject entities and
+  surfaced through `MemoryContext.traits` / `.goals`.
+- **Emotional valence** tagged onto episodes (`episode.affect`) and
+  propagated as `valence` / `intensity` on incident edges.
+- **Beliefs vs facts** — first-person opinions (“I think…”, “feels
+  like…”) are promoted to `memory_class='belief'` so they cannot be
+  invalidated by literal contradictions.
+- **Procedural patterns** (`optimization_request`, `iterative_refinement`,
+  …) inferred from recent episode shape and recorded as
+  `interaction_pattern`.
+- **Reinforcement & decay** — every recall is decay-aware: edges
+  reinforced by repeated mentions outrank stale ones; consolidated
+  abstractions never decay.
+- **Domain labels** on entity communities and on each member entity.
+- **Consolidated abstractions** — when a fact key is re-asserted across
+  many episodes spanning a meaningful time window, a single
+  `memory_class='consolidated'` summary edge is minted with provenance
+  back to the originals.
+- **Per-group prediction bundle** — likely next topics / preferences /
+  questions, exposed as `MemoryContext.prediction` at `depth='deep'`.
+
+The whole layer is **additive**: the public `Surriti` API
+(`add_episode`, `recall`, `search`, `upsert_user`, …) is unchanged.
+Tune or disable it via the `cognition=` constructor parameter:
+
+```python
+from surriti.cognition import CognitionConfig
+
+# Defaults (recommended): runs in the background, never blocks ingest.
+g = Surriti(driver, embedder=embedder)
+
+# Opt out entirely:
+g = Surriti(driver, embedder=embedder, cognition=False)
+
+# Fine-tune:
+g = Surriti(
+    driver,
+    embedder=embedder,
+    cognition=CognitionConfig(idle_seconds=15.0, batch_threshold=10),
+)
+```
+
+Cognition failures never propagate: every step is logged under the
+`surriti.cognition` logger and swallowed so ingest stays bullet-proof.
+
+---
+
 ## Examples
 
 - [`examples/quickstart.py`](examples/quickstart.py) — offline, dummy LLM

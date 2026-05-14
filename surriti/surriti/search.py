@@ -61,6 +61,12 @@ class SearchConfig:
     include_episodes: bool = False
     include_communities: bool = False
     filters: SearchFilters | None = None
+    decay_aware: bool = False
+    """Multiply post-fusion scores by ``effective_confidence(edge, now)``
+    so reinforced/persistent edges outrank stale ones. Off by default
+    to preserve current ``Surriti.search`` semantics; ``Surriti.recall``
+    opts in."""
+    decay_half_life_overrides: dict[str, float] | None = None
 
 
 @dataclass
@@ -230,6 +236,32 @@ async def hybrid_search(
         query=query,
         query_embedding=query_embedding,
     )
+
+    # Decay-aware multiplicative rescoring. We apply this *after* the
+    # configured reranker so it never displaces a focal/MMR/CE-driven
+    # ordering -- it only down-weights stale edges within the chosen
+    # candidate set. The fused score map is updated so callers reading
+    # ``SearchResults.scores`` see the same number we ranked by.
+    if cfg.decay_aware and candidates:
+        from surriti.cognition.decay import effective_confidence
+        from surriti.utils import parse_edge as _pe
+
+        now = datetime.now(timezone.utc)
+        for c in candidates:
+            try:
+                eff = effective_confidence(
+                    _pe(c),
+                    now=now,
+                    half_life_overrides=cfg.decay_half_life_overrides,
+                )
+            except Exception:
+                eff = 1.0
+            uid = c.get("uuid")
+            if uid is None:
+                continue
+            base = fused.get(uid, 0.0) or 0.0
+            fused[uid] = float(base) * float(eff)
+        candidates.sort(key=lambda e: fused.get(e["uuid"], 0.0), reverse=True)
 
     edges = [parse_edge(c) for c in candidates[: cfg.limit]]
     return SearchResults(edges=edges, scores=fused)

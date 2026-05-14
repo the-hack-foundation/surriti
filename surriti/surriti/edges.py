@@ -128,6 +128,43 @@ class EntityEdge(_Edge):
     ``attributes['memory_class']`` on the row so legacy rows (without
     the field set) default to ``"objective"`` on read."""
 
+    # Cognitive-layer fields (additive). ``surriti.cognition`` populates
+    # these in background passes; legacy rows simply read defaults. The
+    # public ``Surriti`` API surface is unchanged -- these are extra
+    # signals consumed by rerankers and ``recall()`` enrichment.
+    weight: float = 1.0
+    """Composite associative weight = ``confidence * decay * (1 + assoc_boost)``
+    snapshotted by the cognition pass. Used as an extra reranking
+    signal when ``decay_aware`` is enabled."""
+    reinforcement_count: int = 1
+    """Number of distinct episodes that have re-asserted this fact."""
+    last_reinforced_at: datetime | None = None
+    """Timestamp of the most recent reinforcement (newest supporting
+    episode)."""
+    decay_score: float = 1.0
+    """Snapshotted ``effective_confidence`` produced by the decay
+    function; refreshed on each cognition pass."""
+    stability: str = "episodic"
+    """Lifecycle bucket -- one of ``episodic``, ``reinforced``,
+    ``persistent``, ``consolidated``. Drives the per-bucket decay
+    half-life."""
+    valence: float | None = None
+    """Emotional polarity in [-1, 1] inherited from the supporting
+    episode's ``affect`` tag (Phase C affect pass)."""
+    intensity: float | None = None
+    """Emotional intensity in [0, 1] inherited from the supporting
+    episode's ``affect`` tag."""
+    consolidates: list[str] = Field(default_factory=list)
+    """When non-empty, this is a synthesized abstraction edge that
+    summarises the listed supporting edge UUIDs (Phase D consolidation)."""
+    is_belief: bool = False
+    """``True`` when the fact is a subjective belief rather than an
+    objective claim (Phase C perspective layer). Beliefs are excluded
+    from contradiction detection against ``objective`` facts."""
+    belief_holder: str | None = None
+    """UUID of the entity that holds the belief, when ``is_belief`` is
+    ``True``."""
+
     attributes: dict[str, Any] = Field(default_factory=dict)
 
 

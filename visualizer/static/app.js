@@ -73,6 +73,10 @@ const palette = {
   mc_constraint: "var(--mc-constraint)",
   mc_trait: "var(--mc-trait)",
   mc_sentiment: "var(--mc-sentiment)",
+  // cognition layer
+  mc_belief: "var(--mc-belief)",
+  mc_goal: "var(--mc-goal)",
+  mc_consolidated: "var(--mc-consolidated)",
 };
 
 // ---------- State ----------
@@ -83,6 +87,7 @@ let frameByName = new Map();              // lowercased canonical_name -> frame
 let selectedFrames = new Set();           // empty = all
 let simulation;
 let selected = null;                      // { item, type: 'node'|'edge' }
+let cognitionData = null;                 // last /api/cognition/summary result
 let frozen = false;
 let conflictsCache = [];
 let egoFocus = null;                      // { nodeId, depth, includeEpisodes, includeInvalidated }
@@ -412,7 +417,9 @@ function linkColorFor(link) {
   if (link.status === "needs_resolution") return "var(--bad)";
   if (link.invalid_at || link.expired_at) return "var(--bad)";
   if (link.kind === "relates_to") {
-    const mc = (link.attributes && link.attributes.memory_class) || "objective";
+    // Belief edges use the belief colour regardless of memory_class.
+    if (link.is_belief) return "var(--mc-belief)";
+    const mc = (link.attributes && link.attributes.memory_class) || link.memory_class || "objective";
     if (mc !== "objective") return `var(--mc-${mc})`;
   }
   return palette[link.kind] || palette.relates_to;
@@ -425,8 +432,9 @@ function linkClassesFor(link) {
   if (link.status === "superseded") cls.push("superseded");
   if (link.status === "needs_resolution") cls.push("conflict");
   if (link.derived) cls.push("derived");
+  if (link.is_belief) cls.push("belief-edge");
   if (link.kind === "relates_to") {
-    const mc = (link.attributes && link.attributes.memory_class) || "objective";
+    const mc = (link.attributes && link.attributes.memory_class) || link.memory_class || "objective";
     cls.push(`mc-${mc}`);
   }
   return cls.join(" ");
@@ -576,8 +584,20 @@ function render() {
 
   nodes.select("circle")
     .attr("r", nodeRadius)
-    .attr("fill", d => `var(--${d.kind})`)
-    .attr("fill-opacity", d => d.kind === "episode" ? 0.78 : 0.92);
+    .attr("fill", d => {
+      // Trait and goal entity nodes get distinct cognition colours.
+      if (d.kind === "entity" && (d.labels || []).includes("trait")) return "var(--trait-node)";
+      if (d.kind === "entity" && (d.labels || []).includes("goal")) return "var(--goal-node)";
+      return `var(--${d.kind})`;
+    })
+    .attr("fill-opacity", d => d.kind === "episode" ? 0.78 : 0.92)
+    .classed("affect-glow", d => {
+      // Affect-tagged episodes get a subtle glow.
+      if (d.kind !== "episode") return false;
+      const raw = d.raw || d;
+      const affect = raw.affect || (d.attributes && d.attributes.affect);
+      return !!(affect && (affect.emotion || affect.polarity != null));
+    });
 
   nodes.selectAll("text").filter(function () { return !this.classList.contains("quality-badge"); })
     .text(d => d.name || d.id);
@@ -825,6 +845,15 @@ function renderEdgeDetails(edge) {
     temporal: edge.temporal ? "true" : "",
     derived: edge.derived ? "true" : "",
     source_type: edge.source_type || "",
+    // Cognition layer
+    is_belief: edge.is_belief ? "true" : "",
+    belief_holder: edge.belief_holder || "",
+    weight: edge.weight != null ? Number(edge.weight).toFixed(3) : "",
+    decay_score: edge.decay_score != null ? Number(edge.decay_score).toFixed(3) : "",
+    reinforcement: edge.reinforcement_count != null ? edge.reinforcement_count : "",
+    stability: edge.stability || "",
+    valence: edge.valence != null ? Number(edge.valence).toFixed(2) : "",
+    intensity: edge.intensity != null ? Number(edge.intensity).toFixed(2) : "",
   });
 
   const temporal = kv({
@@ -838,11 +867,12 @@ function renderEdgeDetails(edge) {
     ? `<div class="chip-row">${edge.episodes.map(uid => `<span class="chip" data-episode="${escapeAttr(uid)}">${escapeHtml(shortUuid(uid))}</span>`).join("")}</div>`
     : "";
 
-  const lineage = ((edge.supersedes && edge.supersedes.length) || edge.superseded_by || edge.derived_from)
+  const lineage = ((edge.supersedes && edge.supersedes.length) || edge.superseded_by || edge.derived_from || (edge.consolidates && edge.consolidates.length))
     ? `<div class="chip-row">
         ${edge.supersedes.map(uid => `<span class="chip" data-edge="${escapeAttr(uid)}" title="supersedes">⊐ ${escapeHtml(shortUuid(uid))}</span>`).join("")}
         ${edge.superseded_by ? `<span class="chip" data-edge="${escapeAttr(edge.superseded_by)}" title="superseded by">⊏ ${escapeHtml(shortUuid(edge.superseded_by))}</span>` : ""}
         ${edge.derived_from ? `<span class="chip" data-edge="${escapeAttr(edge.derived_from)}" title="derived from">↩ ${escapeHtml(shortUuid(edge.derived_from))}</span>` : ""}
+        ${(edge.consolidates || []).map(uid => `<span class="chip" title="consolidates edge">⊕ ${escapeHtml(shortUuid(uid))}</span>`).join("")}
       </div>` : "";
 
   const conflict = edge.conflict_group_id
@@ -1291,6 +1321,7 @@ async function openTranscript(uuid) {
       })}
       <h3>Entities Mentioned</h3>
       ${mentioned.length ? `<div class="pill-row">${mentioned.map(n => `<span class="pill">${escapeHtml(n.name || n.id)}</span>`).join("")}</div>` : `<p class="empty">Not present in current graph slice.</p>`}
+      ${ep.raw && ep.raw.affect && ep.raw.affect.emotion ? `<h3>Affect</h3><div class="affect-card"><strong>${escapeHtml(ep.raw.affect.emotion)}</strong><span class="pill" style="margin-left:4px">${typeof ep.raw.affect.polarity === "number" ? ep.raw.affect.polarity.toFixed(2) : ""} / ${typeof ep.raw.affect.intensity === "number" ? ep.raw.affect.intensity.toFixed(2) : ""}</span></div>` : ""}
       <h3>Facts Extracted</h3>
       ${createdFacts.length ? `<div class="chip-row">${createdFacts.map(l => `<span class="chip" data-edge="${escapeAttr(l.id)}">${escapeHtml(l.canonical_name || l.name)} -> ${escapeHtml(shortUuid(idOf(l.target)))}</span>`).join("")}</div>` : `<p class="empty">Not present in current graph slice.</p>`}
       <h3>Invalidated / Superseded</h3>
@@ -1322,6 +1353,108 @@ function switchTab(name) {
   document.querySelectorAll(".tab-panel").forEach(p => {
     p.classList.toggle("active", p.dataset.panel === name);
   });
+  if (name === "cognition") loadCognitionPanel().catch(err => console.warn("cognition panel", err));
+}
+
+// ---------- Cognition panel ----------
+async function loadCognitionPanel() {
+  const cognitionEl = document.querySelector("#cognitionView");
+  if (!cognitionEl) return;
+  const params = new URLSearchParams();
+  const group = controls.group.value.trim();
+  if (group) params.set("group_id", group);
+  cognitionEl.innerHTML = `<p class="empty">Loading cognition data…</p>`;
+  try {
+    const [sumRes, belRes, traitRes, goalRes, affRes, predRes, consRes] = await Promise.all([
+      fetch(`/api/cognition/summary?${params}`),
+      fetch(`/api/cognition/beliefs?${params}`),
+      fetch(`/api/cognition/traits?${params}`),
+      fetch(`/api/cognition/goals?${params}`),
+      fetch(`/api/cognition/affect?${params}`),
+      fetch(`/api/cognition/predictions?${params}`),
+      fetch(`/api/cognition/consolidated?${params}`),
+    ]);
+    const [sum, bel, traits, goals, aff, pred, cons] = await Promise.all([
+      sumRes.json(), belRes.json(), traitRes.json(), goalRes.json(),
+      affRes.json(), predRes.json(), consRes.json(),
+    ]);
+    cognitionData = sum;
+    renderCognitionPanel(cognitionEl, { sum, bel, traits, goals, aff, pred, cons });
+  } catch (err) {
+    cognitionEl.innerHTML = `<p class="empty">Failed to load: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function renderCognitionPanel(el, { sum, bel, traits, goals, aff, pred, cons }) {
+  const stat = (val, label) =>
+    `<div class="cog-stat"><span class="cog-val">${escapeHtml(String(val))}</span><span class="cog-label">${escapeHtml(label)}</span></div>`;
+
+  const belCards = (bel.edges || []).slice(0, 40).map(e =>
+    `<div class="belief-card">
+      <strong>${escapeHtml(e.canonical_name || e.name || "belief")}</strong>
+      ${e.fact ? `<div class="cog-fact">${escapeHtml(e.fact)}</div>` : ""}
+      <div class="cog-holder">holder: ${escapeHtml(e.holder_name || e.belief_holder || "?")}</div>
+    </div>`).join("");
+
+  const traitCards = (traits.nodes || []).slice(0, 40).map(n =>
+    `<div class="trait-card">
+      <strong>${escapeHtml(n.name)}</strong>
+      ${n.summary ? `<div class="cog-fact">${escapeHtml(n.summary)}</div>` : ""}
+    </div>`).join("");
+
+  const goalCards = (goals.nodes || []).slice(0, 40).map(n =>
+    `<div class="goal-card">
+      <strong>${escapeHtml(n.name)}</strong>
+      ${n.summary ? `<div class="cog-fact">${escapeHtml(n.summary)}</div>` : ""}
+    </div>`).join("");
+
+  const affCards = (aff.episodes || []).slice(0, 40).map(ep => {
+    const pol = typeof ep.polarity === "number" ? ep.polarity.toFixed(2) : ep.polarity;
+    const int_ = typeof ep.intensity === "number" ? ep.intensity.toFixed(2) : ep.intensity;
+    return `<div class="affect-card">
+      <strong>${escapeHtml(ep.emotion || "neutral")}</strong>
+      <span class="pill" style="margin-left:4px">${pol ?? ""} / ${int_ ?? ""}</span>
+      <div class="cog-fact">${escapeHtml(ep.name || ep.uuid || "")}</div>
+    </div>`;
+  }).join("");
+
+  const predCards = (pred.predictions || []).slice(0, 20).map(p => {
+    const pl = p.payload || {};
+    const topics = Array.isArray(pl.likely_topics) ? pl.likely_topics.slice(0, 3).join(", ") : "";
+    return `<div class="pred-card">
+      <strong>${escapeHtml(p.name || "prediction")}</strong>
+      ${topics ? `<div class="cog-fact">likely: ${escapeHtml(topics)}</div>` : ""}
+    </div>`;
+  }).join("");
+
+  const consCards = (cons.edges || []).slice(0, 20).map(e =>
+    `<div class="pred-card">
+      <strong>${escapeHtml(e.canonical_name || e.name || "consolidated")}</strong>
+      ${e.fact ? `<div class="cog-fact">${escapeHtml(e.fact)}</div>` : ""}
+      ${e.consolidates && e.consolidates.length ? `<div class="cog-holder">consolidates ${e.consolidates.length} edge(s)</div>` : ""}
+    </div>`).join("");
+
+  el.innerHTML = `
+    <section class="cognition-section">
+      <h3>Summary</h3>
+      <div class="cog-summary-grid">
+        ${stat(sum.beliefs || 0, "beliefs")}
+        ${stat(sum.trait_nodes || 0, "traits")}
+        ${stat(sum.goal_nodes || 0, "goals")}
+        ${stat(sum.affect_tagged_episodes || 0, "affect-tagged")}
+        ${stat(sum.consolidated_edges || 0, "consolidated")}
+        ${stat(sum.prediction_sidecars || 0, "predictions")}
+        ${stat(sum.procedural_episodes || 0, "procedural")}
+      </div>
+    </section>
+    ${bel.count ? `<section class="cognition-section"><h3>Beliefs (${bel.count})</h3>${belCards}</section>` : ""}
+    ${traits.count ? `<section class="cognition-section"><h3>Traits (${traits.count})</h3>${traitCards}</section>` : ""}
+    ${goals.count ? `<section class="cognition-section"><h3>Goals (${goals.count})</h3>${goalCards}</section>` : ""}
+    ${aff.count ? `<section class="cognition-section"><h3>Affect (${aff.count} episodes)</h3>${affCards}</section>` : ""}
+    ${pred.count ? `<section class="cognition-section"><h3>Predictions (${pred.count})</h3>${predCards}</section>` : ""}
+    ${cons.count ? `<section class="cognition-section"><h3>Consolidated (${cons.count})</h3>${consCards}</section>` : ""}
+    <p class="muted" style="font-size:11px;margin-top:8px">Generated ${escapeHtml(sum.generated_at || "")}</p>
+  `;
 }
 
 // ---------- Frames ----------
@@ -1615,6 +1748,14 @@ loadGroups();
 loadTimelineBounds();
 loadFrames();
 loadConflicts();
+
+const cognitionRefreshBtn = document.querySelector("#cognitionRefreshBtn");
+if (cognitionRefreshBtn) {
+  cognitionRefreshBtn.addEventListener("click", () =>
+    loadCognitionPanel().catch(err => console.warn("cognition panel", err))
+  );
+}
+
 loadGraph()
   .then(() => setTimeout(fitToView, 650))
   .catch(err => setStatus(err.message, true));

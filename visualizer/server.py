@@ -170,6 +170,18 @@ def _edge(
         "derived": bool(row.get("derived") or False),
         "derived_from": row.get("derived_from") or "",
         "attributes": _jsonable(row.get("attributes") or {}),
+        # Cognitive layer — decay, reinforcement, belief, affect
+        "is_belief": bool(row.get("is_belief") or False),
+        "belief_holder": row.get("belief_holder") or "",
+        "weight": row.get("weight"),
+        "decay_score": row.get("decay_score"),
+        "reinforcement_count": row.get("reinforcement_count"),
+        "stability": row.get("stability") or "episodic",
+        "valence": row.get("valence"),
+        "intensity": row.get("intensity"),
+        "consolidates": list(row.get("consolidates") or []),
+        # Flattened memory_class from attributes (most callers read it here)
+        "memory_class": (row.get("attributes") or {}).get("memory_class") or "objective",
         "raw": _compact_raw(row),
     }
 
@@ -896,6 +908,331 @@ async def frames(
     return {
         "frames": sorted(out.values(), key=lambda f: f["canonical_name"]),
         "count": len(out),
+        "generated_at": _utcnow_iso(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cognition debug endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/cognition/summary")
+async def cognition_summary(
+    group_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """High-level cognition stats: count of beliefs, traits, goals,
+    affect-tagged episodes, consolidated edges, and prediction sidecars."""
+
+    where = "WHERE group_id = $g" if group_id else ""
+    params: dict[str, Any] = {"g": group_id} if group_id else {}
+
+    async def _count(q: str, p: dict[str, Any] | None = None) -> int:
+        rows = await _query(q, p or params)
+        if not rows:
+            return 0
+        r = rows[0]
+        return int(r.get("count") or r.get("c") or 0)
+
+    beliefs = await _count(
+        f"SELECT count() AS count FROM relates_to {where} AND is_belief = true GROUP ALL;",
+        params,
+    )
+    traits_nodes = await _count(
+        f"SELECT count() AS count FROM entity {where} AND labels CONTAINS 'trait' GROUP ALL;",
+        params,
+    )
+    goals_nodes = await _count(
+        f"SELECT count() AS count FROM entity {where} AND labels CONTAINS 'goal' GROUP ALL;",
+        params,
+    )
+    affect_eps = await _count(
+        f"""
+        SELECT count() AS count FROM episode {where}
+        AND (affect IS NOT NONE AND affect != {{}}) GROUP ALL;
+        """,
+        params,
+    )
+    consolidated = await _count(
+        f"""
+        SELECT count() AS count FROM relates_to {where}
+        AND attributes.memory_class = 'consolidated' GROUP ALL;
+        """,
+        params,
+    )
+    predictions = await _count(
+        f"SELECT count() AS count FROM community {where} AND kind = 'prediction' GROUP ALL;",
+        params,
+    )
+    procedural_eps = await _count(
+        f"""
+        SELECT count() AS count FROM episode {where}
+        AND interaction_pattern IS NOT NONE GROUP ALL;
+        """,
+        params,
+    )
+
+    return {
+        "group_id": group_id,
+        "beliefs": beliefs,
+        "trait_nodes": traits_nodes,
+        "goal_nodes": goals_nodes,
+        "affect_tagged_episodes": affect_eps,
+        "consolidated_edges": consolidated,
+        "prediction_sidecars": predictions,
+        "procedural_episodes": procedural_eps,
+        "generated_at": _utcnow_iso(),
+    }
+
+
+@app.get("/api/cognition/beliefs")
+async def cognition_beliefs(
+    group_id: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> dict[str, Any]:
+    """All ``relates_to`` edges promoted to beliefs (``is_belief = true``)."""
+
+    clauses = ["is_belief = true"]
+    params: dict[str, Any] = {"limit": limit}
+    if group_id:
+        clauses.append("group_id = $g")
+        params["g"] = group_id
+    where = "WHERE " + " AND ".join(clauses)
+    rows = await _query(
+        f"""
+        SELECT *,
+            record::id(in) AS source_uuid,
+            record::id(out) AS target_uuid
+        FROM relates_to {where}
+        LIMIT $limit;
+        """,
+        params,
+    )
+    # Fetch entity names for holder UUIDs + subject/object.
+    holder_uuids = {str(r.get("belief_holder")) for r in rows if r.get("belief_holder")}
+    subject_uuids = {
+        str(r.get("source_uuid") or _record_id(r.get("in"))) for r in rows
+    } | holder_uuids
+    entity_map: dict[str, str] = {}
+    if subject_uuids:
+        e_rows = await _query(
+            "SELECT uuid, name FROM entity WHERE uuid IN $uuids;",
+            {"uuids": list(subject_uuids)},
+        )
+        entity_map = {str(r.get("uuid")): str(r.get("name") or r.get("uuid")) for r in e_rows}
+
+    edges = []
+    for row in rows:
+        source = str(row.get("source_uuid") or _record_id(row.get("in")))
+        target = str(row.get("target_uuid") or _record_id(row.get("out")))
+        edge = _edge("relates_to", row, source=source, target=target,
+                     name=row.get("name") or "relates_to")
+        edge["holder_name"] = entity_map.get(edge["belief_holder"], edge["belief_holder"])
+        edges.append(edge)
+
+    return {
+        "edges": edges,
+        "count": len(edges),
+        "entity_names": entity_map,
+        "generated_at": _utcnow_iso(),
+    }
+
+
+@app.get("/api/cognition/traits")
+async def cognition_traits(
+    group_id: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> dict[str, Any]:
+    """Trait entity nodes plus their ``has_trait`` edges."""
+
+    where_g = "WHERE group_id = $g" if group_id else ""
+    params: dict[str, Any] = {"limit": limit}
+    if group_id:
+        params["g"] = group_id
+
+    trait_nodes = await _query(
+        f"SELECT * FROM entity {where_g} AND labels CONTAINS 'trait' LIMIT $limit;",
+        params,
+    )
+    trait_uuids = [str(r.get("uuid")) for r in trait_nodes if r.get("uuid")]
+
+    edges: list[dict[str, Any]] = []
+    if trait_uuids:
+        edge_clauses = ["record::id(out) IN $tuuids"]
+        ep: dict[str, Any] = {"tuuids": trait_uuids, "limit": limit}
+        if group_id:
+            edge_clauses.append("group_id = $g")
+            ep["g"] = group_id
+        ew = "WHERE " + " AND ".join(edge_clauses)
+        edge_rows = await _query(
+            f"""
+            SELECT *,
+                record::id(in) AS source_uuid,
+                record::id(out) AS target_uuid
+            FROM relates_to {ew} LIMIT $limit;
+            """,
+            ep,
+        )
+        for row in edge_rows:
+            source = str(row.get("source_uuid") or _record_id(row.get("in")))
+            target = str(row.get("target_uuid") or _record_id(row.get("out")))
+            edges.append(_edge("relates_to", row, source=source, target=target,
+                               name=row.get("name") or "has_trait"))
+
+    return {
+        "nodes": [_node("entity", r, fallback_name="Trait") for r in trait_nodes],
+        "edges": edges,
+        "count": len(trait_nodes),
+        "generated_at": _utcnow_iso(),
+    }
+
+
+@app.get("/api/cognition/goals")
+async def cognition_goals(
+    group_id: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> dict[str, Any]:
+    """Goal entity nodes plus their ``pursues_goal`` edges."""
+
+    where_g = "WHERE group_id = $g" if group_id else ""
+    params: dict[str, Any] = {"limit": limit}
+    if group_id:
+        params["g"] = group_id
+
+    goal_nodes = await _query(
+        f"SELECT * FROM entity {where_g} AND labels CONTAINS 'goal' LIMIT $limit;",
+        params,
+    )
+    goal_uuids = [str(r.get("uuid")) for r in goal_nodes if r.get("uuid")]
+
+    edges: list[dict[str, Any]] = []
+    if goal_uuids:
+        edge_clauses = ["record::id(out) IN $guuids"]
+        ep: dict[str, Any] = {"guuids": goal_uuids, "limit": limit}
+        if group_id:
+            edge_clauses.append("group_id = $g")
+            ep["g"] = group_id
+        ew = "WHERE " + " AND ".join(edge_clauses)
+        edge_rows = await _query(
+            f"""
+            SELECT *,
+                record::id(in) AS source_uuid,
+                record::id(out) AS target_uuid
+            FROM relates_to {ew} LIMIT $limit;
+            """,
+            ep,
+        )
+        for row in edge_rows:
+            source = str(row.get("source_uuid") or _record_id(row.get("in")))
+            target = str(row.get("target_uuid") or _record_id(row.get("out")))
+            edges.append(_edge("relates_to", row, source=source, target=target,
+                               name=row.get("name") or "pursues_goal"))
+
+    return {
+        "nodes": [_node("entity", r, fallback_name="Goal") for r in goal_nodes],
+        "edges": edges,
+        "count": len(goal_nodes),
+        "generated_at": _utcnow_iso(),
+    }
+
+
+@app.get("/api/cognition/affect")
+async def cognition_affect(
+    group_id: str | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+) -> dict[str, Any]:
+    """Episodes with a non-empty ``affect`` field, sorted most recent first."""
+
+    clauses = ["affect IS NOT NONE", "affect != {}"]
+    params: dict[str, Any] = {"limit": limit}
+    if group_id:
+        clauses.append("group_id = $g")
+        params["g"] = group_id
+    where = "WHERE " + " AND ".join(clauses)
+    rows = await _query(
+        f"""
+        SELECT uuid, group_id, name, content, reference_time, created_at, affect
+        FROM episode {where}
+        ORDER BY reference_time DESC
+        LIMIT $limit;
+        """,
+        params,
+    )
+    items = []
+    for r in rows:
+        affect = r.get("affect") or {}
+        items.append({
+            "uuid": str(r.get("uuid") or ""),
+            "name": str(r.get("name") or ""),
+            "group_id": str(r.get("group_id") or ""),
+            "reference_time": _jsonable(r.get("reference_time")),
+            "emotion": str(affect.get("emotion") or ""),
+            "polarity": _jsonable(affect.get("polarity")),
+            "intensity": _jsonable(affect.get("intensity")),
+            "affect": _jsonable(affect),
+        })
+    return {
+        "episodes": items,
+        "count": len(items),
+        "generated_at": _utcnow_iso(),
+    }
+
+
+@app.get("/api/cognition/predictions")
+async def cognition_predictions(
+    group_id: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> dict[str, Any]:
+    """Prediction sidecar community rows (``kind = 'prediction'``)."""
+
+    clauses = ["kind = 'prediction'"]
+    params: dict[str, Any] = {"limit": limit}
+    if group_id:
+        clauses.append("group_id = $g")
+        params["g"] = group_id
+    where = "WHERE " + " AND ".join(clauses)
+    rows = await _query(
+        f"SELECT * FROM community {where} ORDER BY created_at DESC LIMIT $limit;",
+        params,
+    )
+    return {
+        "predictions": [_jsonable(r) for r in rows],
+        "count": len(rows),
+        "generated_at": _utcnow_iso(),
+    }
+
+
+@app.get("/api/cognition/consolidated")
+async def cognition_consolidated(
+    group_id: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> dict[str, Any]:
+    """Consolidated memory edges (``memory_class = 'consolidated'``)."""
+
+    clauses = ["attributes.memory_class = 'consolidated'"]
+    params: dict[str, Any] = {"limit": limit}
+    if group_id:
+        clauses.append("group_id = $g")
+        params["g"] = group_id
+    where = "WHERE " + " AND ".join(clauses)
+    rows = await _query(
+        f"""
+        SELECT *,
+            record::id(in) AS source_uuid,
+            record::id(out) AS target_uuid
+        FROM relates_to {where} LIMIT $limit;
+        """,
+        params,
+    )
+    edges = []
+    for row in rows:
+        source = str(row.get("source_uuid") or _record_id(row.get("in")))
+        target = str(row.get("target_uuid") or _record_id(row.get("out")))
+        edges.append(_edge("relates_to", row, source=source, target=target,
+                           name=row.get("name") or "relates_to"))
+    return {
+        "edges": edges,
+        "count": len(edges),
         "generated_at": _utcnow_iso(),
     }
 

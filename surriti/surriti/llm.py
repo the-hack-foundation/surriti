@@ -186,6 +186,17 @@ class LLMClient(ABC):
         del predicate, source_span, sample_subject, sample_object
         return None
 
+    async def synthesize(self, system: str, user: str) -> str | None:
+        """Optional generic JSON-completion hook used by ``surriti.cognition``.
+
+        Default returns ``None`` -- callers (cognition modules) treat
+        that as "skip the LLM step, fall back to heuristics". Real
+        adapters override this to delegate to their underlying
+        ``_complete(system, user)``.
+        """
+        del system, user
+        return None
+
 
 class DummyLLMClient(LLMClient):
     """Heuristic, offline LLM stub.

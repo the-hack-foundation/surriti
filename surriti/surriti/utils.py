@@ -56,6 +56,8 @@ def parse_episode(row: dict[str, Any]) -> EpisodicNode:
         reference_time=_coerce_dt(row.get("reference_time")) or _utcnow(),
         created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
         entity_edges=list(row.get("entity_edges") or []),
+        affect=dict(row.get("affect") or {}),
+        interaction_pattern=row.get("interaction_pattern"),
     )
 
 
@@ -77,6 +79,9 @@ def parse_entity(row: dict[str, Any]) -> EntityNode:
         mention_count=int(row.get("mention_count") or 0),
         last_seen_at=_coerce_dt(row.get("last_seen_at")),
         merged_into=row.get("merged_into"),
+        traits=list(row.get("traits") or []),
+        goals_active=list(row.get("goals_active") or []),
+        domain=row.get("domain"),
     )
 
 
@@ -126,6 +131,16 @@ def parse_edge(row: dict[str, Any]) -> EntityEdge:
         derived=bool(row.get("derived") or False),
         derived_from=row.get("derived_from"),
         attributes=dict(row.get("attributes") or {}),
+        weight=float(row.get("weight")) if row.get("weight") is not None else 1.0,
+        reinforcement_count=int(row.get("reinforcement_count") or 1),
+        last_reinforced_at=_coerce_dt(row.get("last_reinforced_at")),
+        decay_score=float(row.get("decay_score")) if row.get("decay_score") is not None else 1.0,
+        stability=str(row.get("stability") or "episodic"),
+        valence=float(row.get("valence")) if row.get("valence") is not None else None,
+        intensity=float(row.get("intensity")) if row.get("intensity") is not None else None,
+        consolidates=list(row.get("consolidates") or []),
+        is_belief=bool(row.get("is_belief") or False),
+        belief_holder=row.get("belief_holder"),
         memory_class=str(
             (row.get("attributes") or {}).get("memory_class") or "objective"
         ).strip().lower() or "objective",
@@ -161,4 +176,7 @@ def parse_community(row: dict[str, Any]) -> CommunityNode:
         summary=row.get("summary", "") or "",
         name_embedding=row.get("name_embedding"),
         created_at=_coerce_dt(row.get("created_at")) or _utcnow(),
+        kind=str(row.get("kind") or "cluster"),
+        domain=row.get("domain"),
+        payload=dict(row.get("payload") or {}),
     )

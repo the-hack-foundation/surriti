@@ -35,6 +35,11 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     DEFINE FIELD IF NOT EXISTS reference_time    ON episode TYPE datetime;
     DEFINE FIELD IF NOT EXISTS created_at        ON episode TYPE datetime;
     DEFINE FIELD IF NOT EXISTS entity_edges      ON episode TYPE array<string> DEFAULT [];
+    -- Cognitive layer (additive): per-episode affect tag and procedural
+    -- interaction-pattern label. Both populated by ``surriti.cognition``;
+    -- legacy rows simply read empty defaults.
+    DEFINE FIELD IF NOT EXISTS affect            ON episode TYPE object FLEXIBLE DEFAULT {{}};
+    DEFINE FIELD IF NOT EXISTS interaction_pattern ON episode TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS episode_uuid_idx     ON episode FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS episode_group_idx    ON episode FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS episode_content_fts  ON episode FIELDS content
@@ -61,6 +66,13 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     DEFINE FIELD IF NOT EXISTS mention_count     ON entity TYPE int DEFAULT 0;
     DEFINE FIELD IF NOT EXISTS last_seen_at      ON entity TYPE option<datetime>;
     DEFINE FIELD IF NOT EXISTS merged_into       ON entity TYPE option<string>;
+    -- Cognitive layer (additive). All optional / cached / safe defaults.
+    -- ``traits`` and ``goals_active`` are denormalised UUID lists kept in
+    -- sync by ``surriti.cognition``; ``domain`` is the labelled cluster
+    -- this entity belongs to (set by domain-aware community labelling).
+    DEFINE FIELD IF NOT EXISTS traits            ON entity TYPE array<string> DEFAULT [];
+    DEFINE FIELD IF NOT EXISTS goals_active      ON entity TYPE array<string> DEFAULT [];
+    DEFINE FIELD IF NOT EXISTS domain            ON entity TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS entity_uuid_idx     ON entity FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS entity_group_idx    ON entity FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS entity_name_uniq    ON entity FIELDS group_id, name UNIQUE;
@@ -101,7 +113,16 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     DEFINE FIELD IF NOT EXISTS summary        ON community TYPE string DEFAULT "";
     DEFINE FIELD IF NOT EXISTS name_embedding ON community TYPE option<array<float>>;
     DEFINE FIELD IF NOT EXISTS created_at     ON community TYPE datetime;
+    -- Cognitive layer (additive). ``kind`` discriminates a normal
+    -- entity-cluster ("cluster") from cognitive sidecars stored as
+    -- community rows ("prediction"). ``domain`` carries the labelled
+    -- semantic domain assigned by domain-aware clustering.
+    -- ``payload`` is a free-form bag (e.g. prediction bundle).
+    DEFINE FIELD IF NOT EXISTS kind           ON community TYPE string DEFAULT "cluster";
+    DEFINE FIELD IF NOT EXISTS domain         ON community TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS payload        ON community TYPE object FLEXIBLE DEFAULT {{}};
     DEFINE INDEX IF NOT EXISTS community_uuid_idx ON community FIELDS uuid UNIQUE;
+    DEFINE INDEX IF NOT EXISTS community_kind_idx ON community FIELDS group_id, kind;
 
     -- Edges -------------------------------------------------------------
     DEFINE TABLE IF NOT EXISTS mentions SCHEMAFULL TYPE RELATION FROM episode TO entity;
@@ -148,6 +169,20 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     DEFINE FIELD IF NOT EXISTS conflict_group_id ON relates_to TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS derived           ON relates_to TYPE bool DEFAULT false;
     DEFINE FIELD IF NOT EXISTS derived_from      ON relates_to TYPE option<string>;
+    -- Cognitive layer (additive). All optional / safe defaults so legacy
+    -- rows load forward without backfill. Populated lazily by
+    -- ``surriti.cognition`` (reinforcement / decay / consolidation /
+    -- belief / affect passes) and read by recall + rerankers.
+    DEFINE FIELD IF NOT EXISTS weight             ON relates_to TYPE float DEFAULT 1.0;
+    DEFINE FIELD IF NOT EXISTS reinforcement_count ON relates_to TYPE int DEFAULT 1;
+    DEFINE FIELD IF NOT EXISTS last_reinforced_at  ON relates_to TYPE option<datetime>;
+    DEFINE FIELD IF NOT EXISTS decay_score          ON relates_to TYPE float DEFAULT 1.0;
+    DEFINE FIELD IF NOT EXISTS stability            ON relates_to TYPE string DEFAULT "episodic";
+    DEFINE FIELD IF NOT EXISTS valence              ON relates_to TYPE option<float>;
+    DEFINE FIELD IF NOT EXISTS intensity            ON relates_to TYPE option<float>;
+    DEFINE FIELD IF NOT EXISTS consolidates         ON relates_to TYPE array<string> DEFAULT [];
+    DEFINE FIELD IF NOT EXISTS is_belief            ON relates_to TYPE bool DEFAULT false;
+    DEFINE FIELD IF NOT EXISTS belief_holder        ON relates_to TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS relates_to_uuid_idx  ON relates_to FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS relates_to_group_idx ON relates_to FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS relates_to_active_idx ON relates_to FIELDS group_id, in, name, status;

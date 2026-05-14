@@ -39,6 +39,14 @@ class EpisodicNode(_Base):
     reference_time: datetime = Field(default_factory=utc_now)
     entity_edges: list[str] = Field(default_factory=list)
     """UUIDs of EntityEdges derived from this episode."""
+    affect: dict[str, Any] = Field(default_factory=dict)
+    """Cognitive-layer affect tag: ``{"emotion": str, "intensity": float,
+    "polarity": float}`` populated by ``surriti.cognition.affect``.
+    Empty dict on legacy rows."""
+    interaction_pattern: str | None = None
+    """Cognitive-layer procedural label assigned by
+    ``surriti.cognition.procedural`` (e.g. ``iterative_refinement``,
+    ``optimization_request``). ``None`` until classified."""
 
 
 class EntityNode(_Base):
@@ -60,6 +68,13 @@ class EntityNode(_Base):
     mention_count: int = 0
     last_seen_at: datetime | None = None
     merged_into: str | None = None
+    # Cognitive-layer caches. ``traits`` / ``goals_active`` denormalise
+    # the UUIDs of attached trait / goal entities so ``recall()`` can
+    # render them without an extra graph hop. ``domain`` is the
+    # labelled semantic domain assigned by domain-aware clustering.
+    traits: list[str] = Field(default_factory=list)
+    goals_active: list[str] = Field(default_factory=list)
+    domain: str | None = None
 
 
 class EntityAlias(_Base):
@@ -76,6 +91,14 @@ class EntityAlias(_Base):
     confidence: float = 1.0
     source_episode_uuid: str | None = None
 
+    # Cognitive-layer extensions. ``kind`` discriminates a normal
+    # entity cluster (``"cluster"``) from cognitive sidecars stored as
+    # community rows (e.g. ``"prediction"`` for the per-group
+    # predictive bundle). ``domain`` is the labelled semantic domain
+    # for entity clusters; ``payload`` carries free-form sidecar data.
+    kind: str = "cluster"
+    domain: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 class CommunityNode(_Base):
     """A cluster of related entities."""

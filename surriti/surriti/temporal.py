@@ -31,17 +31,78 @@ async def find_similar_edges(
     fact_embedding: list[float] | None,
     group_id: str,
     limit: int = 10,
+    co_subject_uuid: str | None = None,
+    co_object_uuid: str | None = None,
+    only_active: bool = True,
 ) -> list[EntityEdge]:
+    """Return edges similar to the new fact for contradiction reasoning.
+
+    The candidate pool is the union of:
+
+    * vector-search hits on ``fact_embedding`` (when supplied),
+    * fulltext-search hits on ``fact``,
+    * **co-object active peers** -- every active edge in ``group_id``
+      whose target is ``co_object_uuid``. This guarantees that
+      transfer-of-state events ("X sold Y", "X moved Y to ...") see
+      every prior fact attached to ``Y`` regardless of how
+      semantically distant their predicates are from the new event,
+      so the contradiction LLM has the full set of dependencies on
+      the affected object to reason over,
+    * **co-subject active peers** when ``co_subject_uuid`` is given
+      and no ``co_object_uuid`` is supplied (rare; reserved for
+      future per-subject sweeps).
+
+    When ``only_active`` is true (default), superseded / invalidated
+    rows are filtered out so the LLM only sees current truth.
+    """
     rows: list[dict] = []
     if fact_embedding is not None:
         rows.extend(await _vector_search_edges(driver, fact_embedding, group_id, limit))
     if fact:
         rows.extend(await _fulltext_search_edges(driver, fact, group_id, limit))
 
+    if co_object_uuid:
+        co_rows = _unwrap(
+            await driver.query(
+                """
+                SELECT * FROM relates_to
+                WHERE group_id = $group_id
+                    AND out = type::record("entity", $obj)
+                    AND status = "active"
+                    AND invalid_at IS NONE
+                LIMIT $limit;
+                """,
+                {"group_id": group_id, "obj": co_object_uuid, "limit": limit * 2},
+            )
+        )
+        rows.extend(co_rows)
+    elif co_subject_uuid:
+        co_rows = _unwrap(
+            await driver.query(
+                """
+                SELECT * FROM relates_to
+                WHERE group_id = $group_id
+                    AND in = type::record("entity", $sub)
+                    AND status = "active"
+                    AND invalid_at IS NONE
+                LIMIT $limit;
+                """,
+                {"group_id": group_id, "sub": co_subject_uuid, "limit": limit * 2},
+            )
+        )
+        rows.extend(co_rows)
+
     seen: dict[str, dict] = {}
     for row in rows:
         seen.setdefault(row["uuid"], row)
-    return [parse_edge(r) for r in seen.values()]
+
+    edges = [parse_edge(r) for r in seen.values()]
+    if only_active:
+        edges = [
+            e for e in edges
+            if e.status == "active" and e.invalid_at is None
+        ]
+    return edges
 
 
 async def invalidate_edges(
@@ -82,6 +143,8 @@ async def resolve_contradictions(
     similarity_limit: int = 10,
     new_fact_struct: ExtractedFact | None = None,
     new_edge_uuid: str | None = None,
+    new_subject_uuid: str | None = None,
+    new_object_uuid: str | None = None,
 ) -> list[EntityEdge]:
     """Run the full contradiction pipeline. Returns the invalidated edges.
 
@@ -90,7 +153,10 @@ async def resolve_contradictions(
     the similar edges and forwarded to the LLM client so the prompt can
     reason about subject/predicate/object/domain explicitly. When
     ``new_edge_uuid`` is supplied, invalidated edges are stamped with
-    ``superseded_by`` pointing at it.
+    ``superseded_by`` pointing at it. When ``new_object_uuid`` is
+    supplied, the candidate set is enriched with every active edge
+    sharing that object so transfer-of-state events surface their
+    dependencies.
     """
 
     candidates_edges = await find_similar_edges(
@@ -99,7 +165,25 @@ async def resolve_contradictions(
         fact_embedding=new_fact_embedding,
         group_id=group_id,
         limit=similarity_limit,
+        co_object_uuid=new_object_uuid,
     )
+    # Never let a candidate include the new edge itself, or any edge
+    # already invalidated.
+    if new_edge_uuid:
+        candidates_edges = [c for c in candidates_edges if c.uuid != new_edge_uuid]
+    if not candidates_edges:
+        return []
+
+    # Belief vs objective filter. A subjective belief ("I think X") and
+    # a literal objective fact ("X is Y") are not in the same epistemic
+    # class -- one cannot invalidate the other. Belief-vs-belief and
+    # objective-vs-objective contradictions are still candidates.
+    new_is_belief = bool(getattr(new_fact_struct, "is_belief", False))
+    candidates_edges = [
+        c for c in candidates_edges
+        if bool(getattr(c, "is_belief", False)) == new_is_belief
+        or (getattr(c, "memory_class", None) == "belief") == new_is_belief
+    ]
     if not candidates_edges:
         return []
 
