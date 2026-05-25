@@ -1944,10 +1944,10 @@ class Surriti:
         await self.driver.query(
             """
             UPDATE relates_to
-            SET in = type::record("entity", $canonical), source_node_uuid = $canonical
+            SET in = type::record("entity", $canonical)
             WHERE group_id = $group_id AND record::id(in) IN $aliases;
             UPDATE relates_to
-            SET out = type::record("entity", $canonical), target_node_uuid = $canonical
+            SET out = type::record("entity", $canonical)
             WHERE group_id = $group_id AND record::id(out) IN $aliases;
             UPDATE mentions
             SET out = type::record("entity", $canonical)

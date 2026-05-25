@@ -49,7 +49,7 @@ def _scan_goal_sentences(text: str) -> list[str]:
     out: list[str] = []
     for pat in _GOAL_PATTERNS:
         for m in pat.finditer(text):
-            phrase = (m.group(0) if m.lastindex is None else m.group(0)).strip()
+            phrase = (m.group(m.lastindex) if m.lastindex is not None else m.group(0)).strip()
             phrase = re.sub(r"\s+", " ", phrase).strip(" ,.;:")
             if 8 <= len(phrase) <= 200:
                 out.append(phrase)
@@ -99,14 +99,41 @@ async def _resolve_speaker_uuid(
         )
     )
     candidates = [str(r.get("entity_uuid")) for r in rows if r.get("entity_uuid")]
-    if not candidates:
-        return None
-    # Heaviest-mentioned entity.
-    counts: dict[str, int] = {}
-    for c in candidates:
-        counts[c] = counts.get(c, 0) + 1
-    best = max(counts.items(), key=lambda kv: kv[1])[0]
-    return best
+    if candidates:
+        # Heaviest-mentioned entity.
+        counts: dict[str, int] = {}
+        for c in candidates:
+            counts[c] = counts.get(c, 0) + 1
+        return max(counts.items(), key=lambda kv: kv[1])[0]
+    # Fallback: look for the canonical user entity for this group.
+    user_rows = _unwrap(
+        await driver.query(
+            """
+            SELECT uuid FROM entity
+            WHERE group_id = $g AND 'user' IN labels
+            ORDER BY created_at DESC
+            LIMIT 1;
+            """,
+            {"g": group_id},
+        )
+    )
+    if user_rows:
+        return str(user_rows[0].get("uuid"))
+    # Last resort: any entity in the group.
+    any_rows = _unwrap(
+        await driver.query(
+            """
+            SELECT uuid FROM entity
+            WHERE group_id = $g
+            ORDER BY created_at DESC
+            LIMIT 1;
+            """,
+            {"g": group_id},
+        )
+    )
+    if any_rows:
+        return str(any_rows[0].get("uuid"))
+    return None
 
 
 async def synthesize_goals(

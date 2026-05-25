@@ -260,9 +260,48 @@ class DummyLLMClient(LLMClient):
         candidates: list[ContradictionCandidate] | None = None,
         new_fact_struct: ExtractedFact | None = None,
     ) -> list[int]:
-        # The dummy client ignores structured info -- it is heuristic-only.
-        del candidates, new_fact_struct
         cues = ("not ", "no longer", "moved", "changed", "stopped", "former")
+        has_transition_cue = any(c in new_fact.lower() for c in cues)
+
+        # --- Layer A: structured candidate overlap (preferred when available) ---
+        if candidates:
+            # Extract subject/predicate/object from the new fact struct or
+            # from the raw fact text as a fallback.
+            new_subject = (new_fact_struct.subject if new_fact_struct else "").lower()
+            new_predicate = (new_fact_struct.predicate if new_fact_struct else "").lower()
+            new_object = (new_fact_struct.object if new_fact_struct else "").lower()
+
+            new_tokens = {t.lower() for t in re.findall(r"\w+", new_fact) if len(t) > 2}
+
+            contradicted: list[int] = []
+            for idx, cand in enumerate(candidates):
+                if idx >= len(existing_facts):
+                    break
+                # Subject overlap is a strong contradiction signal when
+                # combined with a transition cue.
+                subj_overlap = (
+                    new_subject and cand.subject.lower() == new_subject
+                )
+                # Object overlap (same entity, different relationship).
+                obj_overlap = (
+                    new_object and cand.object.lower() == new_object
+                )
+                # Token overlap (fallback when structured fields are empty).
+                existing_tokens = {
+                    t.lower() for t in re.findall(r"\w+", cand.fact) if len(t) > 2
+                }
+                token_shared = len(new_tokens & existing_tokens)
+
+                if has_transition_cue and (
+                    subj_overlap
+                    or obj_overlap
+                    or token_shared >= 1  # lowered from 2
+                ):
+                    contradicted.append(idx)
+            if contradicted:
+                return contradicted
+
+        # --- Layer B: pure text heuristic (legacy path) ---
         new_tokens = {t.lower() for t in re.findall(r"\w+", new_fact) if len(t) > 2}
         contradicted: list[int] = []
         for idx, existing in enumerate(existing_facts):
@@ -270,7 +309,7 @@ class DummyLLMClient(LLMClient):
                 t.lower() for t in re.findall(r"\w+", existing) if len(t) > 2
             }
             shared = new_tokens & existing_tokens
-            if len(shared) >= 2 and any(c in new_fact.lower() for c in cues):
+            if len(shared) >= 1 and has_transition_cue:  # lowered from 2
                 contradicted.append(idx)
         return contradicted
 

@@ -61,6 +61,24 @@ async def find_similar_edges(
     if fact:
         rows.extend(await _fulltext_search_edges(driver, fact, group_id, limit))
 
+    # Fallback: when vector and fulltext searches return nothing (common with
+    # DummyEmbedder or very short facts), sweep all active edges in the group
+    # so the contradiction LLM still gets a candidate pool.  This is a
+    # deterministic safety net -- not a replacement for semantic search.
+    if not rows:
+        rows = _unwrap(
+            await driver.query(
+                """
+                SELECT * FROM relates_to
+                WHERE group_id = $group_id
+                    AND status = "active"
+                    AND invalid_at IS NONE
+                LIMIT $limit;
+                """,
+                {"group_id": group_id, "limit": limit * 2},
+            )
+        )
+
     if co_object_uuid:
         co_rows = _unwrap(
             await driver.query(

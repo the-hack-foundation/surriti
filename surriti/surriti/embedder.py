@@ -34,7 +34,7 @@ class DummyEmbedder(EmbedderClient):
     but lets every other layer of Surriti be exercised without API keys.
     """
 
-    def __init__(self, embedding_dim: int = 1024) -> None:
+    def __init__(self, embedding_dim: int = 768) -> None:
         self.embedding_dim = embedding_dim
 
     async def create(self, input_data: str) -> list[float]:
