@@ -1702,6 +1702,10 @@ controls.memoryClasses.forEach(input => input.addEventListener("change", () => {
 controls.theme.addEventListener("click", toggleTheme);
 controls.export.addEventListener("click", e => {
   e.stopPropagation();
+  const rect = controls.export.getBoundingClientRect();
+  exportMenu.style.top = (rect.bottom + 6) + "px";
+  exportMenu.style.left = rect.left + "px";
+  exportMenu.style.right = "auto";
   exportMenu.classList.toggle("hidden");
 });
 exportMenu.addEventListener("click", e => {

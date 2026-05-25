@@ -21,6 +21,12 @@
           </div>
         </header>
 
+        <div class="toolbar">
+          <button id="refreshBtn" type="button" title="Refresh (R)">Refresh</button>
+          <button id="fitBtn" type="button" title="Fit to view (F)">Fit</button>
+          <button id="freezeBtn" type="button" title="Freeze layout (Space)">Freeze</button>
+        </div>
+
         <fieldset class="view-toggle lens-toggle" aria-label="Graph lens">
           <label><input type="radio" name="view" value="truth" checked> Truth</label>
           <label><input type="radio" name="view" value="raw"> Raw</label>
@@ -137,12 +143,6 @@
           </div>
           <input id="asOfSlider" type="range" min="0" max="100" value="100" disabled>
         </section>
-
-        <div class="toolbar">
-          <button id="refreshBtn" type="button" title="Refresh (R)">Refresh</button>
-          <button id="fitBtn" type="button" title="Fit to view (F)">Fit</button>
-          <button id="freezeBtn" type="button" title="Freeze layout (Space)">Freeze</button>
-        </div>
 
         <section class="metrics" aria-label="Graph metrics">
           <div><span id="nodeCount">0</span><small>nodes</small></div>
