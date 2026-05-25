@@ -106,6 +106,24 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  visualizer:
+    build:
+      context: .
+      dockerfile: visualizer/Dockerfile
+    container_name: visualizer
+    ports:
+      - "7200:8000"
+    environment:
+      - SURRITI_SURREAL_URL=ws://surrealdb:8000/rpc
+      - SURRITI_SURREAL_NS=${SURRITI_SURREAL_NS:-surriti}
+      - SURRITI_SURREAL_DB=${SURRITI_SURREAL_DB:-legba}
+      - SURRITI_SURREAL_USER=${SURRITI_SURREAL_USER:-root}
+      - SURRITI_SURREAL_PASS=${SURRITI_SURREAL_PASS:-root}
+    depends_on:
+      surrealdb:
+        condition: service_started
+    restart: unless-stopped
+
 
 volumes:
   # Holds the SurrealDB on-disk store. Survives `docker compose down`;

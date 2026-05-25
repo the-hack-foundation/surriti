@@ -924,7 +924,7 @@ async def cognition_summary(
     """High-level cognition stats: count of beliefs, traits, goals,
     affect-tagged episodes, consolidated edges, and prediction sidecars."""
 
-    where = "WHERE group_id = $g" if group_id else ""
+    g_filter = "group_id = $g AND " if group_id else ""
     params: dict[str, Any] = {"g": group_id} if group_id else {}
 
     async def _count(q: str, p: dict[str, Any] | None = None) -> int:
@@ -935,39 +935,47 @@ async def cognition_summary(
         return int(r.get("count") or r.get("c") or 0)
 
     beliefs = await _count(
-        f"SELECT count() AS count FROM relates_to {where} AND is_belief = true GROUP ALL;",
+        f"SELECT count() AS count FROM relates_to WHERE {g_filter}is_belief = true GROUP ALL;",
         params,
     )
     traits_nodes = await _count(
-        f"SELECT count() AS count FROM entity {where} AND labels CONTAINS 'trait' GROUP ALL;",
+        f"SELECT count() AS count FROM entity WHERE {g_filter}labels CONTAINS 'trait' GROUP ALL;",
         params,
     )
     goals_nodes = await _count(
-        f"SELECT count() AS count FROM entity {where} AND labels CONTAINS 'goal' GROUP ALL;",
+        f"SELECT count() AS count FROM entity WHERE {g_filter}labels CONTAINS 'goal' GROUP ALL;",
         params,
     )
     affect_eps = await _count(
         f"""
-        SELECT count() AS count FROM episode {where}
-        AND (affect IS NOT NONE AND affect != {{}}) GROUP ALL;
+        SELECT count() AS count FROM episode
+        WHERE {g_filter}(affect IS NOT NONE AND affect != {{}}) GROUP ALL;
         """,
         params,
     )
     consolidated = await _count(
         f"""
-        SELECT count() AS count FROM relates_to {where}
-        AND attributes.memory_class = 'consolidated' GROUP ALL;
+        SELECT count() AS count FROM relates_to
+        WHERE {g_filter}attributes.memory_class = 'consolidated' GROUP ALL;
         """,
         params,
     )
     predictions = await _count(
-        f"SELECT count() AS count FROM community {where} AND kind = 'prediction' GROUP ALL;",
+        f"SELECT count() AS count FROM community WHERE {g_filter}kind = 'prediction' GROUP ALL;",
         params,
     )
     procedural_eps = await _count(
         f"""
-        SELECT count() AS count FROM episode {where}
-        AND interaction_pattern IS NOT NONE GROUP ALL;
+        SELECT count() AS count FROM episode
+        WHERE {g_filter}interaction_pattern IS NOT NONE GROUP ALL;
+        """,
+        params,
+    )
+    reinforced = await _count(
+        f"""
+        SELECT count() AS count FROM relates_to
+        WHERE {g_filter}reinforcement_count IS NOT NONE
+          AND reinforcement_count > 0 GROUP ALL;
         """,
         params,
     )
@@ -979,6 +987,7 @@ async def cognition_summary(
         "goal_nodes": goals_nodes,
         "affect_tagged_episodes": affect_eps,
         "consolidated_edges": consolidated,
+        "reinforced_edges": reinforced,
         "prediction_sidecars": predictions,
         "procedural_episodes": procedural_eps,
         "generated_at": _utcnow_iso(),
@@ -1045,13 +1054,13 @@ async def cognition_traits(
 ) -> dict[str, Any]:
     """Trait entity nodes plus their ``has_trait`` edges."""
 
-    where_g = "WHERE group_id = $g" if group_id else ""
+    g_filter = "group_id = $g AND " if group_id else ""
     params: dict[str, Any] = {"limit": limit}
     if group_id:
         params["g"] = group_id
 
     trait_nodes = await _query(
-        f"SELECT * FROM entity {where_g} AND labels CONTAINS 'trait' LIMIT $limit;",
+        f"SELECT * FROM entity WHERE {g_filter}labels CONTAINS 'trait' LIMIT $limit;",
         params,
     )
     trait_uuids = [str(r.get("uuid")) for r in trait_nodes if r.get("uuid")]
@@ -1094,13 +1103,13 @@ async def cognition_goals(
 ) -> dict[str, Any]:
     """Goal entity nodes plus their ``pursues_goal`` edges."""
 
-    where_g = "WHERE group_id = $g" if group_id else ""
+    g_filter = "group_id = $g AND " if group_id else ""
     params: dict[str, Any] = {"limit": limit}
     if group_id:
         params["g"] = group_id
 
     goal_nodes = await _query(
-        f"SELECT * FROM entity {where_g} AND labels CONTAINS 'goal' LIMIT $limit;",
+        f"SELECT * FROM entity WHERE {g_filter}labels CONTAINS 'goal' LIMIT $limit;",
         params,
     )
     goal_uuids = [str(r.get("uuid")) for r in goal_nodes if r.get("uuid")]
@@ -1221,6 +1230,52 @@ async def cognition_consolidated(
             record::id(in) AS source_uuid,
             record::id(out) AS target_uuid
         FROM relates_to {where} LIMIT $limit;
+        """,
+        params,
+    )
+    edges = []
+    for row in rows:
+        source = str(row.get("source_uuid") or _record_id(row.get("in")))
+        target = str(row.get("target_uuid") or _record_id(row.get("out")))
+        edges.append(_edge("relates_to", row, source=source, target=target,
+                           name=row.get("name") or "relates_to"))
+    return {
+        "edges": edges,
+        "count": len(edges),
+        "generated_at": _utcnow_iso(),
+    }
+
+
+@app.get("/api/cognition/reinforced")
+async def cognition_reinforced(
+    group_id: str | None = Query(default=None),
+    min_count: int = Query(default=1, ge=1, le=1000),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> dict[str, Any]:
+    """Edges ranked by ``reinforcement_count``, highest first.
+
+    Only returns rows where ``reinforcement_count >= min_count``.
+    Useful for spotting which facts are being continuously reinforced
+    by the cognition scheduler's reinforcement phase.
+    """
+
+    clauses = [
+        "reinforcement_count IS NOT NONE",
+        "reinforcement_count >= $min_count",
+    ]
+    params: dict[str, Any] = {"limit": limit, "min_count": min_count}
+    if group_id:
+        clauses.append("group_id = $g")
+        params["g"] = group_id
+    where = "WHERE " + " AND ".join(clauses)
+    rows = await _query(
+        f"""
+        SELECT *,
+            record::id(in) AS source_uuid,
+            record::id(out) AS target_uuid
+        FROM relates_to {where}
+        ORDER BY reinforcement_count DESC
+        LIMIT $limit;
         """,
         params,
     )
