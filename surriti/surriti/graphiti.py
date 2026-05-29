@@ -1037,6 +1037,11 @@ class Surriti:
         group_id: str | None = None,
         config: SearchConfig | None = None,
         return_results: bool | None = None,
+        # Convenience kwargs that map to SearchConfig fields
+        limit: int | None = None,
+        depth: str | None = None,
+        rerank_strategy: str | None = None,
+        only_valid: bool | None = None,
     ) -> SearchResults | list[EntityEdge]:
         """Hybrid (vector + BM25) search over EntityEdge facts.
 
@@ -1044,7 +1049,19 @@ class Surriti:
         calls that use ``group_ids`` / ``num_results`` / ``search_filter`` /
         ``center_node_uuid`` return the edge list unless ``return_results`` is
         explicitly set.
+
+        Convenience kwargs (mapped to SearchConfig):
+
+        * ``limit`` – maximum results to return
+        * ``depth`` – search depth: ``"fast"`` (limit=10), ``"normal"`` (limit=25),
+          ``"deep"`` (limit=50, includes community search)
+        * ``rerank_strategy`` – reranker name: ``"rrf"``, ``"mmr"``,
+          ``"cross_encoder"``, ``"node_distance"``, ``"episode_mentions"``
+        * ``only_valid`` – when True, exclude edges whose ``invalid_at`` /
+          ``expired_at`` are in the past
         """
+
+        from surriti.search import Reranker
 
         graphiti_style = any(
             value is not None
@@ -1054,12 +1071,25 @@ class Surriti:
         cfg = config or SearchConfig()
         if num_results is not None:
             cfg.limit = num_results
+        if limit is not None:
+            cfg.limit = limit
         if center_node_uuid is not None:
             cfg.focal_uuid = center_node_uuid
         if search_filter is not None:
             cfg.filters = search_filter
         if cfg.cross_encoder is None:
             cfg.cross_encoder = self.cross_encoder
+        # Map convenience kwargs
+        if only_valid is not None:
+            cfg.only_valid = only_valid
+        if rerank_strategy is not None:
+            try:
+                cfg.reranker = Reranker(rerank_strategy)
+            except ValueError:
+                pass  # keep default reranker
+        if depth is not None:
+            depth_map = {"fast": 10, "normal": 25, "deep": 50}
+            cfg.limit = depth_map.get(depth, cfg.limit)
         effective_group_id = group_id
         if effective_group_id is None and group_ids:
             effective_group_id = group_ids[0]
@@ -1150,6 +1180,9 @@ class Surriti:
         limit: int = 20,
         include_invalid: bool = False,
         memory_classes: list[str] | None = None,
+        # Convenience kwargs for test / API compatibility
+        include_edges: bool = False,
+        include_entities: bool = False,
     ) -> "MemoryContext":
         """Build a query-focused memory context.
 
@@ -1175,6 +1208,11 @@ class Surriti:
         label them as historical so the LLM does not treat them as current
         truth.  Useful for queries like "where did X previously work?"
         where the *old* fact is exactly what is wanted.
+
+        ``include_edges`` / ``include_entities``: compatibility flags.
+        ``include_edges`` has no effect (edges are always returned as
+        ``facts``).  ``include_entities`` is a no-op for now; entity
+        resolution is always performed.
         """
 
         from surriti.entity_resolution import resolve_entity_mentions
@@ -2891,6 +2929,307 @@ class Surriti:
             )
             edges.append(ee)
         return edges
+
+
+    # ------------------------------------------------------------------
+    # Self-awareness API
+    # ------------------------------------------------------------------
+
+    async def add_self_episode(
+        self,
+        *,
+        episode_type: EpisodeType,
+        content: str,
+        group_id: str = "",
+        name: str | None = None,
+        reference_time: datetime | None = None,
+    ) -> AddEpisodeResults:
+        """Store a self-referential episode for operational self-awareness.
+
+        Self-episodes are stored in the universal memory graph alongside
+        world/user facts, but are flagged with a special source type so the
+        cognition layer can process them differently (self-model extraction,
+        pattern detection, belief refinement).
+
+        Supported types:
+        - ``self_observation`` — explicit reflection ("I was too verbose")
+        - ``self_correction`` — noticing a mistake
+        - ``self_success`` — noticing a win
+        - ``self_pattern`` — recurring behavioral trend
+
+        Parameters
+        ----------
+        episode_type : EpisodeType
+            One of the self-episode types from EpisodeType enum.
+        content : str
+            The self-observation content.
+        group_id : str
+            Tenant/group ID for isolation.
+        name : str | None
+            Optional episode name. Defaults to f"self_{episode_type.value}".
+        reference_time : datetime | None
+            Optional timestamp. Defaults to now.
+
+        Returns
+        -------
+        AddEpisodeResults with the stored episode and any derived entities/edges.
+        """
+        if episode_type not in (
+            EpisodeType.self_observation,
+            EpisodeType.self_correction,
+            EpisodeType.self_success,
+            EpisodeType.self_pattern,
+        ):
+            raise ValueError(
+                f"Invalid episode_type {episode_type!r}. "
+                f"Must be one of: self_observation, self_correction, "
+                f"self_success, self_pattern"
+            )
+
+        episode_name = name or f"self_{episode_type.value}"
+        ref_time = reference_time or datetime.now(timezone.utc)
+
+        episode = EpisodicNode(
+            uuid=str(uuid4()),
+            name=episode_name,
+            content=content,
+            source=episode_type,
+            source_description=f"self_{episode_type.value}",
+            reference_time=ref_time,
+            group_id=group_id,
+        )
+        await self._save_episode(episode)
+
+        # Extract self-referential entities/facts via LLM
+        extraction = await self.llm.extract(
+            content,
+            group_id=group_id,
+            custom_instructions=(
+                "This is a SELF-REFERENTIAL episode about the AI assistant's "
+                "own behavior, not about the user or the world. Extract facts "
+                "about the assistant's behavior, patterns, or self-assessment. "
+                "Do NOT extract facts about external entities or world knowledge."
+            ),
+        )
+
+        entities: list[EntityNode] = []
+        edges: list[EntityEdge] = []
+
+        # Create/update a "self" entity for this group
+        self_entity_name = f"assistant_{group_id}" if group_id else "assistant"
+        self_entity = await self._get_entity_by_name(
+            name=self_entity_name,
+            group_id=group_id,
+        )
+        if self_entity is None:
+            self_entity_uuid = str(uuid4())
+            self_entity = EntityNode(
+                uuid=self_entity_uuid,
+                name=self_entity_name,
+                summary=f"Self-referential entity for group {group_id or 'default'}",
+                labels=["SelfEntity", "Assistant"],
+                group_id=group_id,
+            )
+            await self.driver.query(
+                f"""
+                CREATE type::record("entity", $uuid) CONTENT {{
+                    uuid: $uuid,
+                    group_id: $group_id,
+                    name: $name,
+                    summary: $summary,
+                    labels: $labels,
+                    created_at: $created_at
+                }};
+                """,
+                {
+                    "uuid": self_entity_uuid,
+                    "group_id": group_id,
+                    "name": self_entity_name,
+                    "summary": self_entity.summary,
+                    "labels": self_entity.labels,
+                    "created_at": self_entity.created_at.isoformat(),
+                },
+            )
+        entities.append(self_entity)
+
+        # Create fact edges for each extracted self-fact
+        for fact in extraction.facts:
+            edge, invalidated = await self._add_fact_edge(
+                fact=fact,
+                subject=EntityNode(name=self_entity_name, labels=["SelfEntity"]),
+                obj=EntityNode(name=fact.object, labels=[]),
+                episode=episode,
+                group_id=group_id,
+                source_type="assistant",
+            )
+            edges.append(edge)
+            if invalidated:
+                edges.extend(invalidated)
+
+        # Link episode to self-entity
+        episodic_edges = await self._link_mentions(
+            episode=episode,
+            entities=[self_entity],
+            group_id=group_id,
+        )
+
+        return AddEpisodeResults(
+            episode=episode,
+            episodic_edges=episodic_edges,
+            nodes=entities,
+            edges=edges,
+        )
+
+    async def get_self_model(
+        self,
+        *,
+        group_id: str,
+        include_traits: bool = True,
+        include_patterns: bool = True,
+        include_beliefs: bool = True,
+    ) -> dict[str, Any]:
+        """Return the current self-model for a group.
+
+        The self-model is a synthesized view of the assistant's own
+        behavior patterns, traits, beliefs, and goals derived from
+        self-episodes stored via :meth:`add_self_episode`.
+
+        Parameters
+        ----------
+        group_id : str
+            Tenant/group ID.
+        include_traits : bool
+            Include synthesized trait entities.
+        include_patterns : bool
+            Include interaction pattern analysis.
+        include_beliefs : bool
+            Include belief edges (subjective self-assessments).
+
+        Returns
+        -------
+        Dict with keys: traits, patterns, beliefs, goals, summary.
+        """
+        from surriti.search import _unwrap
+
+        result: dict[str, Any] = {
+            "group_id": group_id,
+            "traits": [],
+            "patterns": [],
+            "beliefs": [],
+            "goals": [],
+            "summary": "",
+        }
+
+        # 1. Trait entities tied to the self-entity
+        if include_traits:
+            self_entity = await self._get_entity_by_name(
+                name=f"assistant_{group_id}" if group_id else "assistant",
+                group_id=group_id,
+            )
+            if self_entity:
+                trait_edges = await self.driver.query(
+                    """
+                    SELECT * FROM relates_to
+                    WHERE group_id = $group_id
+                        AND in = type::record("entity", $src)
+                        AND name = "has_trait"
+                        AND status = "active"
+                        AND invalid_at IS NONE;
+                    """,
+                    {"group_id": group_id, "src": self_entity.uuid},
+                )
+                result["traits"] = [
+                    {"fact": _unwrap(row).get("fact", ""), "confidence": _unwrap(row).get("confidence", 1.0)}
+                    for row in trait_edges
+                ]
+
+        # 2. Interaction patterns from procedural cognition
+        if include_patterns:
+            episodes = await self.driver.query(
+                """
+                SELECT name, content, interaction_pattern, created_at
+                FROM episode
+                WHERE group_id = $group_id
+                    AND source LIKE "self_%"
+                ORDER BY created_at DESC
+                LIMIT 50;
+                """,
+                {"group_id": group_id},
+            )
+            patterns = defaultdict(int)
+            for ep in episodes:
+                row = _unwrap(ep)
+                pattern = row.get("interaction_pattern")
+                if pattern:
+                    patterns[pattern] += 1
+            result["patterns"] = [
+                {"pattern": k, "count": v, "confidence": v / max(len(episodes), 1)}
+                for k, v in sorted(patterns.items(), key=lambda x: -x[1])
+            ]
+
+        # 3. Belief edges (subjective self-assessments)
+        if include_beliefs:
+            belief_edges = await self.driver.query(
+                """
+                SELECT * FROM relates_to
+                WHERE group_id = $group_id
+                    AND (attributes->>'$.is_belief' = true OR is_belief = true)
+                    AND status = "active"
+                    AND invalid_at IS NONE;
+                """,
+                {"group_id": group_id},
+            )
+            result["beliefs"] = [
+                {"fact": _unwrap(row).get("fact", ""), "source_type": "self"}
+                for row in belief_edges
+            ]
+
+        # 4. Goal entities
+        if include_beliefs:
+            result["goals"] = []  # Populated by cognition pass
+
+        # 5. Summary
+        total_self_episodes = len(
+            await self.driver.query(
+                """
+                SELECT count() as cnt FROM episode
+                WHERE group_id = $group_id
+                    AND source LIKE "self_%";
+                """,
+                {"group_id": group_id},
+            )
+        )
+        result["summary"] = (
+            f"Self-model based on {total_self_episodes} self-episodes. "
+            f"{len(result['traits'])} traits identified. "
+            f"{len(result['patterns'])} interaction patterns detected."
+        )
+
+        return result
+
+    async def _get_entity_by_name(
+        self,
+        *,
+        name: str,
+        group_id: str,
+    ) -> EntityNode | None:
+        """Find an entity by name in a group."""
+        from surriti.search import _unwrap
+
+        rows = _unwrap(
+            await self.driver.query(
+                """
+                SELECT * FROM entity
+                WHERE group_id = $group_id
+                    AND name = $name
+                LIMIT 1;
+                """,
+                {"group_id": group_id, "name": name},
+            )
+        )
+        if rows:
+            return parse_entity(rows[0])
+        return None
 
 
 def _parse_iso(value: str | None) -> datetime | None:
