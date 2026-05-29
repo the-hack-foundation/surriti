@@ -7,11 +7,12 @@ Sequencing rationale (each step depends only on prior steps):
 3. **reinforcement**-- update ``reinforcement_count`` / ``stability``.
 4. **associative**  -- recompute ``decay_score`` / ``weight``.
 5. **traits**       -- LLM-ratified hybrid synthesis.
-6. **goals**        -- LLM-ratified hybrid synthesis.
-7. **procedural**   -- pattern detection + (occasional) edge promotion.
-8. **consolidation**-- mint consolidated abstractions when threshold met.
-9. **clustering**   -- domain labelling, every Nth pass only.
-10. **prediction**  -- refresh per-group prediction sidecar.
+6. **self-awareness** -- extract structured self-model from self-episodes.
+7. **goals**        -- LLM-ratified hybrid synthesis.
+8. **procedural**   -- pattern detection + (occasional) edge promotion.
+9. **consolidation**-- mint consolidated abstractions when threshold met.
+10. **clustering**   -- domain labelling, every Nth pass only.
+11. **prediction**  -- refresh per-group prediction sidecar.
 
 Every step is wrapped in a ``try/except`` -- any failure is logged
 and skipped; cognition must never break ingest. Returns a small
@@ -34,6 +35,7 @@ from surriti.cognition import prediction as _pred
 from surriti.cognition import procedural as _proc
 from surriti.cognition import reinforcement as _reinf
 from surriti.cognition import traits as _traits
+from surriti.cognition import self_awareness as _selfaware
 from surriti.cognition.config import CognitionConfig
 
 logger = logging.getLogger("surriti.cognition")
@@ -89,6 +91,17 @@ async def run_cognition_pass(
             "traits",
             _traits.synthesize_traits(
                 driver, llm, embedder, group_id=group_id, episode_uuids=episode_uuids
+            ),
+        )
+    if config.self_awareness:
+        metrics["self_model_updated"] = await _safe(
+            "self_awareness",
+            _selfaware.run_self_awareness_pass(
+                driver=driver,
+                llm=llm,
+                group_id=group_id,
+                episode_uuids=episode_uuids,
+                config=config,
             ),
         )
     if config.goal_synthesis:

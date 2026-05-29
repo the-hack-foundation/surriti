@@ -77,6 +77,10 @@ class CognitionConfig:
     """Enable Phase D predictive-bundle synthesis (surfaced via
     ``recall(depth='deep')``)."""
 
+    self_awareness: bool = True
+    """Enable self-awareness pass: extract structured self-model
+    (traits, beliefs, patterns) from self-episodes via LLM."""
+
     max_episodes_per_pass: int = 32
     """Upper bound on how many recent episodes to consider per
     cognition pass per group. Caps both LLM cost and memory."""
