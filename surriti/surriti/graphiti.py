@@ -120,6 +120,11 @@ class MemoryContext:
     """Per-group prediction bundle (likely topics / preferences /
     questions) emitted by the cognitive layer. Only populated at
     ``depth='deep'``."""
+    self_model: dict | None = None
+    """Structured self-model (traits, beliefs, patterns) for the
+    assistant. Populated when ``self_awareness`` cognition is enabled.
+    Render into system prompts so the assistant is aware of its own
+    patterns."""
 
 
 class Surriti:
@@ -1384,6 +1389,16 @@ class Surriti:
         except Exception:
             logger.exception("recall: trait/goal sidecar load failed")
 
+        # Self-model sidecar. When self_awareness cognition is enabled,
+        # read the assistant's self-entity (assistant_{group_id}) and
+        # pull its structured self-model (traits, beliefs, patterns).
+        self_model: dict | None = None
+        try:
+            if self._cognition_config and self._cognition_config.self_awareness:
+                self_model = await self.get_self_model(group_id=group_id)
+        except Exception:
+            logger.exception("recall: self-model load failed")
+
         return MemoryContext(
             query=query,
             profiles=profiles,
@@ -1393,6 +1408,7 @@ class Surriti:
             traits=traits,
             goals=goals,
             prediction=prediction,
+            self_model=self_model,
             resolved_entities=[
                 {
                     "mention": r.mention.name,
