@@ -2,8 +2,9 @@
 import asyncio
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
-sys.path.insert(0, "/home/squire/projects/surriti/surriti")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "surriti"))
 
 from surriti import Surriti, DummyLLMClient, DummyEmbedder
 from surriti.driver import SurrealDriver

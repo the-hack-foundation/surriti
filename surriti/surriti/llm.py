@@ -250,6 +250,19 @@ class DummyLLMClient(LLMClient):
                         fact=sentence if sentence.endswith(".") else sentence + ".",
                     )
                 )
+            # Single-entity sentences: create a MENTIONS_WITH fact so
+            # the entity is retrievable via search/recall. Without this,
+            # sentences like "Michael is a software engineer." produce
+            # zero facts and the entire memory system returns empty.
+            if len(present) == 1:
+                facts.append(
+                    ExtractedFact(
+                        subject=present[0],
+                        predicate="MENTIONS_WITH",
+                        object=present[0],
+                        fact=sentence if sentence.endswith(".") else sentence + ".",
+                    )
+                )
         return ExtractionResult(entities=entities, facts=facts)
 
     async def find_contradictions(

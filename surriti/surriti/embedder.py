@@ -57,13 +57,18 @@ class DummyEmbedder(EmbedderClient):
 
 
 class OpenAIEmbedder(EmbedderClient):
-    """OpenAI ``text-embedding-3-*`` adapter. Optional dependency."""
+    """OpenAI ``text-embedding-3-*`` adapter. Optional dependency.
+    
+    Works with any OpenAI-compatible endpoint (vLLM, Ollama, etc.).
+    Pass ``api_key="EMPTY"`` when the server doesn't require auth.
+    """
 
     def __init__(
         self,
         model: str = "text-embedding-3-small",
         embedding_dim: int = 1536,
         api_key: str | None = None,
+        base_url: str | None = None,
     ) -> None:
         try:
             from openai import AsyncOpenAI  # type: ignore[import-not-found]
@@ -74,7 +79,10 @@ class OpenAIEmbedder(EmbedderClient):
 
         self.model = model
         self.embedding_dim = embedding_dim
-        self._client = AsyncOpenAI(api_key=api_key) if api_key else AsyncOpenAI()
+        kwargs: dict = {"api_key": api_key or "EMPTY"}
+        if base_url:
+            kwargs["base_url"] = base_url
+        self._client = AsyncOpenAI(**kwargs)
 
     async def create(self, input_data: str) -> list[float]:
         response = await self._client.embeddings.create(

@@ -25,7 +25,7 @@ from surriti.llm import ExtractedFact
 # aliasing). Everything else with subject == object is LLM garbage we
 # drop as defence-in-depth on top of the extraction prompt.
 IDENTITY_PREDICATES: frozenset[str] = frozenset(
-    {"is_named", "is_called", "is_self", "is_aka"}
+    {"is_named", "is_called", "is_self", "is_aka", "MENTIONS_WITH", "mentions_with"}
 )
 
 # Filler "places" that small models love to emit for ``lives_in`` /

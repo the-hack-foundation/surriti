@@ -267,7 +267,7 @@ async def backfill_fact_keys(driver) -> int:
             )
         )
         await driver.query(
-            "UPDATE relates_to SET fact_key = $key WHERE uuid = $uuid;",
+            "UPDATE relates_to SET fact_key = $key WHERE uuid = $uuid",
             {"key": key, "uuid": row.get("uuid")},
         )
         updated += 1

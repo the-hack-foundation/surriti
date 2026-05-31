@@ -125,38 +125,59 @@ class SurrealDriver:
         torn down (e.g. SurrealDB was restarted while myapp kept running).
         Recognised stale-connection signatures include "no close frame",
         "ConnectionClosed", "WebSocket", and "not connected".
+
+        Retries ONCE on transaction-conflict errors (SurrealDB's optimistic
+        concurrency control).
         """
 
-        try:
-            return await self.db.query(surql, variables or {})
-        except SurritiConnectionError:
-            raise
-        except Exception as exc:
-            msg = str(exc).lower()
-            stale = any(
-                tok in msg
-                for tok in (
-                    "no close frame",
-                    "connectionclosed",
-                    "connection closed",
-                    "websocket",
-                    "not connected",
-                    "broken pipe",
-                    "connection reset",
-                )
-            )
-            if not stale:
-                raise
-            logger.warning(
-                "SurrealDB connection appears stale (%s); reconnecting and retrying.",
-                exc,
-            )
+        import time
+
+        max_retries = 2
+        for attempt in range(max_retries + 1):
             try:
-                await self.close()
-            except Exception:  # pragma: no cover
-                logger.debug("close() raised during reconnect; ignoring", exc_info=True)
-            await self.connect()
-            return await self.db.query(surql, variables or {})
+                return await self.db.query(surql, variables or {})
+            except SurritiConnectionError:
+                raise
+            except Exception as exc:
+                msg = str(exc).lower()
+                # Retry on transaction conflicts (optimistic concurrency)
+                if "transaction conflict" in msg or "resource busy" in msg:
+                    if attempt < max_retries:
+                        backoff = 0.1 * (2**attempt)
+                        logger.debug(
+                            "Transaction conflict on query; retrying in %.2fs (attempt %d/%d).",
+                            backoff,
+                            attempt + 1,
+                            max_retries,
+                        )
+                        time.sleep(backoff)
+                        continue
+                    # Exhausted retries — re-raise
+                    raise
+                stale = any(
+                    tok in msg
+                    for tok in (
+                        "no close frame",
+                        "connectionclosed",
+                        "connection closed",
+                        "websocket",
+                        "not connected",
+                        "broken pipe",
+                        "connection reset",
+                    )
+                )
+                if not stale:
+                    raise
+                logger.warning(
+                    "SurrealDB connection appears stale (%s); reconnecting and retrying.",
+                    exc,
+                )
+                try:
+                    await self.close()
+                except Exception:  # pragma: no cover
+                    logger.debug("close() raised during reconnect; ignoring", exc_info=True)
+                await self.connect()
+                return await self.db.query(surql, variables or {})
 
     async def init_schema(self) -> None:
         """Apply the Surriti schema. Idempotent - safe to call repeatedly."""
@@ -167,8 +188,21 @@ class SurrealDriver:
             raise SurritiSchemaError(f"Failed to initialise schema: {exc}") from exc
 
     async def clear(self) -> None:
-        """Delete every record in tables managed by Surriti. Useful for tests."""
+        """Delete every record in tables managed by Surriti. Useful for tests.
+
+        Retries each DELETE individually to avoid transaction conflicts when
+        cleaning up large datasets.
+        """
 
         for table in ALL_TABLES:
-            await self.query(f"DELETE {table};")
+            for _ in range(3):
+                try:
+                    await self.query(f"DELETE {table};")
+                    break
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    if ("transaction conflict" in msg or "resource busy" in msg):
+                        import time; time.sleep(0.2)
+                        continue
+                    raise
 
