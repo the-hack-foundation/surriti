@@ -84,13 +84,37 @@ curl http://localhost:3000/health
 
 ## Hooks implemented
 
-| Hook                 | Behavior                                                                |
-| -------------------- | ----------------------------------------------------------------------- |
-| `prefetch(query)`    | Sync HTTP `POST /recall`. Returns a `MEMORY:` block for the next turn.  |
-| `sync_turn(u, a)`    | Stores `u` (or `a` if `u` is empty) via daemon thread — non-blocking.   |
-| `system_prompt_block`| Tells the model that `MEMORY` is authoritative.                         |
-| `on_session_end`     | Joins any in-flight store thread so writes complete before exit.        |
-| `shutdown`           | Same — drains pending store thread.                                     |
+| Hook                  | Behavior                                                                       |
+| --------------------- | ------------------------------------------------------------------------------ |
+| `prefetch(query)`     | Returns from cache if warm; otherwise sync `POST /recall` and cache result.    |
+| `queue_prefetch(q)`   | Fires `/recall` in a daemon thread immediately; result lands in cache.         |
+| `sync_turn(u, a)`     | Stores via daemon thread (non-blocking). Invalidates recall cache on success.  |
+| `system_prompt_block` | Tells the model that `MEMORY` is authoritative.                                |
+| `on_session_end`      | Joins any in-flight store thread so writes complete before exit.               |
+| `shutdown`            | Joins pending store thread and closes the persistent HTTP client.              |
+
+## Performance
+
+The plugin keeps overhead negligible on Hermes' hot path:
+
+- **Persistent `httpx.Client`** with HTTP keep-alive — reused TCP connection
+  saves ~25 ms per call vs. a fresh client.
+- **`queue_prefetch`** — Hermes fires this as soon as a query is known. By
+  the time `prefetch` is called for the same query (typically after the user
+  finishes typing or the agent finishes thinking), the recall is already done
+  and the result returns in ~0 ms.
+- **30 s in-memory result cache** (LRU, max 32 entries) — repeated identical
+  queries hit the cache. Cleared automatically when `sync_turn` writes new
+  facts so stale results never leak.
+
+Measured against the local `myapp`:
+
+| Path                                 | Latency |
+| ------------------------------------ | ------- |
+| Cold recall (first call)             | ~110 ms |
+| Cache hit                            |   ~0 ms |
+| `queue_prefetch` → `prefetch` (warm) |   ~0 ms |
+| Subsequent cold recall (keep-alive)  |  ~80 ms |
 
 ## CLI
 

@@ -20,6 +20,8 @@ import json
 import logging
 import os
 import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,11 @@ DEFAULT_URL = "http://localhost:3000"
 DEFAULT_TIMEOUT = 15.0
 CONFIG_FILENAME = "surriti.json"
 
+# Recall results are cached briefly to absorb retries and to let queue_prefetch
+# hand off to prefetch with zero latency.
+_CACHE_TTL_SECONDS = 30.0
+_CACHE_MAX_ENTRIES = 32
+
 
 class SurritiMemoryProvider(MemoryProvider):
     """Memory provider that proxies recall/store to the Surriti HTTP service."""
@@ -45,6 +52,13 @@ class SurritiMemoryProvider(MemoryProvider):
         self._hermes_home: Path | None = None
         self._sync_thread: threading.Thread | None = None
         self._available: bool | None = None
+        self._client: httpx.Client | None = None
+        # Cache: query -> (expires_at, formatted_block)
+        self._cache: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
+        self._cache_lock = threading.Lock()
+        # Prefetch tracking: query -> Event signaling completion
+        self._prefetch_inflight: dict[str, threading.Event] = {}
+        self._prefetch_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -80,6 +94,13 @@ class SurritiMemoryProvider(MemoryProvider):
         ).rstrip("/")
         self._timeout = float(cfg.get("timeout") or DEFAULT_TIMEOUT)
         self._user_id = cfg.get("user_id") or os.environ.get("SURRITI_USER_ID", "default")
+        # Persistent client with HTTP keep-alive — cuts ~10-30ms off each call
+        # by reusing the TCP connection across recall/store requests.
+        self._client = httpx.Client(
+            base_url=self._url,
+            timeout=self._timeout,
+            limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+        )
         logger.info(
             "Surriti memory provider initialized: url=%s user_id=%s session=%s",
             self._url, self._user_id, self._session_id,
@@ -88,6 +109,12 @@ class SurritiMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
 
     # ------------------------------------------------------------------
     # Config schema (consumed by `hermes memory setup`)
@@ -136,26 +163,94 @@ class SurritiMemoryProvider(MemoryProvider):
         )
 
     # ------------------------------------------------------------------
-    # Recall — synchronous, returns context for the next API call
+    # Recall — synchronous, returns context for the next API call.
+    # Hits the cache first (populated by queue_prefetch when available).
     # ------------------------------------------------------------------
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not query or not query.strip():
             return ""
+        key = self._cache_key(query)
+
+        # Fast path: queue_prefetch already finished.
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+
+        # If queue_prefetch is in flight for this exact query, wait for it
+        # rather than firing a duplicate request.
+        with self._prefetch_lock:
+            event = self._prefetch_inflight.get(key)
+        if event is not None:
+            # Bounded wait — fall through to a sync fetch on timeout.
+            if event.wait(timeout=self._timeout):
+                cached = self._cache_get(key)
+                if cached is not None:
+                    return cached
+
+        return self._do_recall(query, key)
+
+    def queue_prefetch(self, query: str) -> None:
+        """Fire recall in the background while the user/agent is still busy.
+
+        Hermes calls this as soon as a query is known. By the time `prefetch`
+        is called for the same query, the result is already cached and
+        returns instantly.
+        """
+        if not query or not query.strip():
+            return
+        key = self._cache_key(query)
+
+        if self._cache_get(key) is not None:
+            return  # already cached
+
+        with self._prefetch_lock:
+            if key in self._prefetch_inflight:
+                return  # already in flight
+            event = threading.Event()
+            self._prefetch_inflight[key] = event
+
+        def _worker() -> None:
+            try:
+                self._do_recall(query, key)
+            finally:
+                event.set()
+                with self._prefetch_lock:
+                    self._prefetch_inflight.pop(key, None)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _do_recall(self, query: str, cache_key: str) -> str:
+        """Perform the HTTP recall, format the block, and cache it."""
+        client = self._client
+        if client is None:
+            # Fallback if shutdown raced — create an ephemeral client.
+            client = httpx.Client(timeout=self._timeout)
+            owns_client = True
+        else:
+            owns_client = False
         try:
-            with httpx.Client(timeout=self._timeout) as client:
-                resp = client.post(
-                    f"{self._url}/recall",
-                    json={"query": query, "user_id": self._user_id, "limit": 10},
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            resp = client.post(
+                "/recall" if not owns_client else f"{self._url}/recall",
+                json={"query": query, "user_id": self._user_id, "limit": 10},
+            )
+            resp.raise_for_status()
+            data = resp.json()
         except Exception as exc:
             logger.warning("Surriti recall failed: %s", exc)
             return ""
+        finally:
+            if owns_client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
-        facts = data.get("facts") or []
-        entities = data.get("entities") or []
-        return self._format_recall_block(facts, entities)
+        block = self._format_recall_block(
+            data.get("facts") or [],
+            data.get("entities") or [],
+        )
+        self._cache_put(cache_key, block)
+        return block
 
     @staticmethod
     def _format_recall_block(facts: list[dict], entities: list[dict]) -> str:
@@ -200,21 +295,33 @@ class SurritiMemoryProvider(MemoryProvider):
         source_type = "user" if user_content else "assistant"
 
         def _send() -> None:
+            client = self._client
+            owns_client = False
+            if client is None:
+                client = httpx.Client(timeout=self._timeout)
+                owns_client = True
             try:
-                with httpx.Client(timeout=self._timeout) as client:
-                    resp = client.post(
-                        f"{self._url}/store",
-                        json={
-                            "content": content,
-                            "user_id": self._user_id,
-                            "name": "chat",
-                            "source_type": source_type,
-                            "source_description": f"hermes:{session_id or self._session_id}",
-                        },
-                    )
-                    resp.raise_for_status()
+                resp = client.post(
+                    "/store" if not owns_client else f"{self._url}/store",
+                    json={
+                        "content": content,
+                        "user_id": self._user_id,
+                        "name": "chat",
+                        "source_type": source_type,
+                        "source_description": f"hermes:{session_id or self._session_id}",
+                    },
+                )
+                resp.raise_for_status()
+                # New facts may have landed — invalidate stale recall cache.
+                self._cache_clear()
             except Exception as exc:
                 logger.warning("Surriti sync_turn failed: %s", exc)
+            finally:
+                if owns_client:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
 
         # Wait for any in-flight sync to finish first, then dispatch fresh.
         if self._sync_thread and self._sync_thread.is_alive():
@@ -230,6 +337,33 @@ class SurritiMemoryProvider(MemoryProvider):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _cache_key(query: str) -> str:
+        return query.strip().lower()
+
+    def _cache_get(self, key: str) -> str | None:
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            expires_at, block = entry
+            if expires_at < time.monotonic():
+                self._cache.pop(key, None)
+                return None
+            self._cache.move_to_end(key)
+            return block
+
+    def _cache_put(self, key: str, block: str) -> None:
+        with self._cache_lock:
+            self._cache[key] = (time.monotonic() + _CACHE_TTL_SECONDS, block)
+            self._cache.move_to_end(key)
+            while len(self._cache) > _CACHE_MAX_ENTRIES:
+                self._cache.popitem(last=False)
+
+    def _cache_clear(self) -> None:
+        with self._cache_lock:
+            self._cache.clear()
+
     def _read_config_file(self) -> dict:
         if self._hermes_home is None:
             home = os.environ.get("HERMES_HOME")
