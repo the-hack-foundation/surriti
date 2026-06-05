@@ -59,6 +59,10 @@ class EpisodicNode(_Base):
     """Cognitive-layer procedural label assigned by
     ``surriti.cognition.procedural`` (e.g. ``iterative_refinement``,
     ``optimization_request``). ``None`` until classified."""
+    cognition_processed_at: datetime | None = None
+    """When the background cognition pass last processed this episode."""
+    cognition_version: str | None = None
+    """Version marker for the cognition pass that processed this episode."""
 
 
 class EntityNode(_Base):

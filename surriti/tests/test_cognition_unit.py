@@ -209,6 +209,48 @@ async def test_scheduler_force_run_returns_metrics():
 
 
 @pytest.mark.asyncio
+async def test_scheduler_marks_recovered_episodes_processed():
+    from surriti.embedder import DummyEmbedder
+    from surriti.llm import DummyLLMClient
+    from surriti.testing import InMemoryDriver
+
+    driver = InMemoryDriver()
+    driver.records["episode"].append(
+        {
+            "uuid": "ep-1",
+            "group_id": "g",
+            "name": "ep",
+            "content": "Alice met Bob.",
+        }
+    )
+    sch = CognitionScheduler(
+        driver=driver,
+        llm=DummyLLMClient(),
+        embedder=DummyEmbedder(embedding_dim=8),
+        config=CognitionConfig(
+            enabled=True,
+            idle_seconds=60,
+            batch_threshold=99,
+            self_awareness=False,
+            trait_synthesis=False,
+            goal_synthesis=False,
+            procedural_synthesis=False,
+            consolidation=False,
+            prediction=False,
+        ),
+    )
+    sch.start()
+    recovered = await sch.recover_pending_episodes()
+    metrics = await sch.run_once("g")
+
+    assert recovered == 1
+    assert metrics["episodes"] == 1
+    assert driver.records["episode"][0]["cognition_processed_at"] is not None
+    assert driver.records["episode"][0]["cognition_version"]
+    await sch.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_notify_debounces_and_fires():
     from surriti.embedder import DummyEmbedder
     from surriti.llm import DummyLLMClient
@@ -235,6 +277,28 @@ def test_cognition_config_defaults():
     assert cfg.batch_threshold >= 1
     assert cfg.idle_seconds > 0
     assert cfg.consolidation_threshold >= 2
+
+
+@pytest.mark.asyncio
+async def test_reinforce_edges_on_recall_updates_recall_side_fields():
+    from surriti.cognition.reinforcement import reinforce_edges_on_recall
+    from surriti.testing import InMemoryDriver
+
+    driver = InMemoryDriver()
+    driver.records["relates_to"].append(
+        {"uuid": "edge-1", "group_id": "g", "recall_count": 2}
+    )
+
+    updated = await reinforce_edges_on_recall(
+        driver,
+        group_id="g",
+        edge_uuids=["edge-1", "edge-1"],
+    )
+
+    assert updated == 1
+    row = driver.records["relates_to"][0]
+    assert row["recall_count"] == 3
+    assert row["last_recalled_at"] is not None
 
 
 # ---------------------------------------------------------------- engine wiring
@@ -273,3 +337,71 @@ async def test_surriti_cognition_enabled_default():
     assert s._cognition is not None
     assert s._cognition.enabled is True
     await s.close()
+
+
+@pytest.mark.asyncio
+async def test_recall_uses_cognition_decay_config(monkeypatch):
+    from surriti.cognition import CognitionConfig
+    from surriti.embedder import DummyEmbedder
+    from surriti.graphiti import Surriti
+    from surriti.search import SearchResults
+    from surriti.testing import InMemoryDriver
+
+    seen = {}
+
+    async def fake_hybrid_search(driver, **kwargs):
+        del driver
+        cfg = kwargs["config"]
+        seen["decay_aware"] = cfg.decay_aware
+        seen["overrides"] = cfg.decay_half_life_overrides
+        return SearchResults()
+
+    monkeypatch.setattr("surriti.graphiti.hybrid_search", fake_hybrid_search)
+    s = Surriti(
+        InMemoryDriver(),
+        embedder=DummyEmbedder(embedding_dim=8),
+        cognition=CognitionConfig(
+            enabled=True,
+            decay_aware_recall=False,
+            decay_half_life_days={"episodic": 7.0},
+        ),
+    )
+
+    await s.recall("anything", group_id="g")
+
+    assert seen["decay_aware"] is False
+    assert seen["overrides"] == {"episodic": 7.0}
+
+
+@pytest.mark.asyncio
+async def test_self_awareness_uses_synthesize_hook():
+    from surriti.cognition.self_awareness import _extract_self_traits
+    from surriti.testing import InMemoryDriver
+
+    class SynthOnlyLLM:
+        async def synthesize(self, system, user):
+            assert "self-observations" in system.lower()
+            assert "I am concise" in user
+            return '{"traits":[{"trait":"concise","confidence":0.9}],"beliefs":[]}'
+
+    driver = InMemoryDriver()
+    driver.records["entity"].append(
+        {
+            "uuid": "self-1",
+            "group_id": "g",
+            "name": "assistant_g",
+            "summary": "",
+            "labels": ["SelfEntity", "Assistant"],
+        }
+    )
+
+    traits, beliefs = await _extract_self_traits(
+        driver,
+        SynthOnlyLLM(),
+        "g",
+        [{"content": "I am concise.", "source_description": "note"}],
+        CognitionConfig(),
+    )
+
+    assert traits == 1
+    assert beliefs == 0

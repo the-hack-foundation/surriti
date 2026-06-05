@@ -125,3 +125,59 @@ async def reinforce_recent_edges(
         updated += 1
     logger.debug("reinforce_recent_edges: group=%s updated=%d", group_id, updated)
     return updated
+
+
+async def reinforce_edges_on_recall(
+    driver: Any,
+    *,
+    group_id: str,
+    edge_uuids: list[str],
+    amount: int = 1,
+) -> int:
+    """Record recall/use reinforcement for returned memory edges.
+
+    This signal is intentionally separate from ``reinforcement_count``:
+    repeated user assertions and successful retrievals mean different
+    things. Recall reinforcement updates only ``recall_count`` and
+    ``last_recalled_at`` so ranking/analytics can use it without
+    pretending the fact was re-stated in a new episode.
+    """
+
+    uuids = list(dict.fromkeys(str(u) for u in edge_uuids if u))
+    if not uuids:
+        return 0
+    inc = max(1, int(amount))
+    now = datetime.now(timezone.utc)
+    rows = _unwrap(
+        await driver.query(
+            """
+            SELECT uuid, recall_count
+            FROM relates_to
+            WHERE group_id = $group_id
+              AND uuid IN $uuids;
+            """,
+            {"group_id": group_id, "uuids": uuids},
+        )
+    )
+    updated = 0
+    for row in rows:
+        edge_uuid = row.get("uuid")
+        if not edge_uuid:
+            continue
+        await driver.query(
+            """
+            UPDATE relates_to SET
+                recall_count = $recall_count,
+                last_recalled_at = $last_recalled_at
+            WHERE group_id = $group_id
+              AND uuid = $uuid;
+            """,
+            {
+                "group_id": group_id,
+                "uuid": edge_uuid,
+                "recall_count": int(row.get("recall_count") or 0) + inc,
+                "last_recalled_at": now,
+            },
+        )
+        updated += 1
+    return updated

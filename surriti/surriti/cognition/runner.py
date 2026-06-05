@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from surriti.cognition import affect as _affect
@@ -34,11 +35,13 @@ from surriti.cognition import perspective as _persp
 from surriti.cognition import prediction as _pred
 from surriti.cognition import procedural as _proc
 from surriti.cognition import reinforcement as _reinf
-from surriti.cognition import traits as _traits
 from surriti.cognition import self_awareness as _selfaware
+from surriti.cognition import traits as _traits
 from surriti.cognition.config import CognitionConfig
 
 logger = logging.getLogger("surriti.cognition")
+
+_COGNITION_VERSION = "2026-06-recall-reinforcement"
 
 
 async def run_cognition_pass(
@@ -142,6 +145,26 @@ async def run_cognition_pass(
             "prediction", _pred.synthesize_prediction(driver, llm, group_id=group_id)
         )
         metrics["prediction"] = "ok" if bundle else "skipped"
+
+    if episode_uuids:
+        await _safe(
+            "mark_processed",
+            driver.query(
+                """
+                UPDATE episode SET
+                    cognition_processed_at = $processed_at,
+                    cognition_version = $version
+                WHERE group_id = $group_id
+                  AND uuid IN $episode_uuids;
+                """,
+                {
+                    "group_id": group_id,
+                    "episode_uuids": list(episode_uuids),
+                    "processed_at": datetime.now(timezone.utc),
+                    "version": _COGNITION_VERSION,
+                },
+            ),
+        )
 
     metrics["duration_ms"] = int((time.monotonic() - started) * 1000)
     logger.info("cognition pass complete: %s", metrics)

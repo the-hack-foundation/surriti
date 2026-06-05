@@ -7,7 +7,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from surriti.driver import SurrealDriver
@@ -23,7 +23,6 @@ from surriti.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
 from surriti.relation_frames import (
     RelationFrame,
     RelationFrameRegistry,
-    make_slot_key,
     normalize_symmetric,
     qualifier_hash,
 )
@@ -38,10 +37,13 @@ from surriti.search import (
 )
 from surriti.search_filters import SearchFilters
 from surriti.temporal import invalidate_edges, resolve_contradictions
-from surriti.utils import parse_community, parse_edge, parse_entity, parse_episode
+from surriti.utils import parse_edge, parse_entity, parse_episode
 from surriti.validators import IDENTITY_PREDICATES, repair_fact
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from surriti.cognition import CognitionConfig, CognitionScheduler
 
 
 def _entity_name_key(name: str) -> str:
@@ -288,6 +290,7 @@ class Surriti:
                 config=self._cognition_config,
             )
             self._cognition.start()
+            await self._cognition.recover_pending_episodes()
         return self
 
     async def close(self) -> None:
@@ -1294,7 +1297,11 @@ class Surriti:
             candidate_limit=max(limit * 4, 40),
             only_valid=not include_invalid,
             filters=_filters,
-            decay_aware=True,
+            decay_aware=(
+                self._cognition_config.enabled
+                and self._cognition_config.decay_aware_recall
+            ),
+            decay_half_life_overrides=self._cognition_config.decay_half_life_days,
         )
         edge_results = await hybrid_search(
             self.driver,
@@ -1305,6 +1312,7 @@ class Surriti:
             ego_filter=ego_uuids if ego_uuids else None,
         )
         facts = edge_results.edges
+        await self._reinforce_recalled_edges(group_id=group_id, facts=facts)
 
         # Fallback: when caller asked for specific memory_classes but the
         # hybrid search produced nothing (e.g. empty query string used for
@@ -1331,6 +1339,7 @@ class Surriti:
                 )
             )
             facts = [parse_edge(r) for r in rows]
+            await self._reinforce_recalled_edges(group_id=group_id, facts=facts)
 
         episodes: list[EpisodicNode] = []
         communities: list[CommunityNode] = []
@@ -1421,6 +1430,25 @@ class Surriti:
                 if r.canonical_uuid is not None
             ],
         )
+
+    async def _reinforce_recalled_edges(
+        self,
+        *,
+        group_id: str,
+        facts: list[EntityEdge],
+    ) -> None:
+        if not facts or not self._cognition_config.enabled:
+            return
+        try:
+            from surriti.cognition.reinforcement import reinforce_edges_on_recall
+
+            await reinforce_edges_on_recall(
+                self.driver,
+                group_id=group_id,
+                edge_uuids=[f.uuid for f in facts if f.uuid],
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("recall: recall reinforcement failed")
 
     async def get_nodes_and_edges_by_episode(
         self, episode_uuids: list[str]
@@ -1833,7 +1861,6 @@ class Surriti:
         # ------------------------------------------------------------------
         from surriti.entity_resolution import (
             ResolvedEntity,
-            normalize_alias,
             resolve_entity_mentions,
         )
 
@@ -3028,52 +3055,46 @@ class Surriti:
             ),
         )
 
-        entities: list[EntityNode] = []
         edges: list[EntityEdge] = []
 
-        # Create/update a "self" entity for this group
+        # Create/update the assistant self-entity and every extracted
+        # object through the normal entity path so RELATE endpoints always
+        # point at persisted rows.
         self_entity_name = f"assistant_{group_id}" if group_id else "assistant"
-        self_entity = await self._get_entity_by_name(
-            name=self_entity_name,
-            group_id=group_id,
-        )
-        if self_entity is None:
-            self_entity_uuid = str(uuid4())
-            self_entity = EntityNode(
-                uuid=self_entity_uuid,
+        entity_inputs = [
+            ExtractedEntity(
                 name=self_entity_name,
                 summary=f"Self-referential entity for group {group_id or 'default'}",
                 labels=["SelfEntity", "Assistant"],
-                group_id=group_id,
-            )
-            await self.driver.query(
-                f"""
-                CREATE type::record("entity", $uuid) CONTENT {{
-                    uuid: $uuid,
-                    group_id: $group_id,
-                    name: $name,
-                    summary: $summary,
-                    labels: $labels,
-                    created_at: $created_at
-                }};
-                """,
-                {
-                    "uuid": self_entity_uuid,
-                    "group_id": group_id,
-                    "name": self_entity_name,
-                    "summary": self_entity.summary,
-                    "labels": self_entity.labels,
-                    "created_at": self_entity.created_at.isoformat(),
-                },
-            )
-        entities.append(self_entity)
+            ),
+            *extraction.entities,
+        ]
+        for fact in extraction.facts:
+            if fact.object:
+                entity_inputs.append(ExtractedEntity(name=fact.object, labels=["Entity"]))
+
+        entities = await self._upsert_entities(
+            entity_inputs,
+            group_id=group_id,
+            episode_uuid=episode.uuid,
+            episode_context=content,
+        )
+        entity_by_key = {_entity_name_key(e.name): e for e in entities}
+        self_entity = entity_by_key[_entity_name_key(self_entity_name)]
 
         # Create fact edges for each extracted self-fact
         for fact in extraction.facts:
+            obj = entity_by_key.get(_entity_name_key(fact.object))
+            if obj is None:
+                logger.debug(
+                    "Skipping self-fact with unresolved object %r", fact.object
+                )
+                continue
+            fact.subject = self_entity_name
             edge, invalidated = await self._add_fact_edge(
                 fact=fact,
-                subject=EntityNode(name=self_entity_name, labels=["SelfEntity"]),
-                obj=EntityNode(name=fact.object, labels=[]),
+                subject=self_entity,
+                obj=obj,
                 episode=episode,
                 group_id=group_id,
                 source_type="assistant",

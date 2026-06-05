@@ -40,6 +40,8 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     -- legacy rows simply read empty defaults.
     DEFINE FIELD IF NOT EXISTS affect            ON episode TYPE object FLEXIBLE DEFAULT {{}};
     DEFINE FIELD IF NOT EXISTS interaction_pattern ON episode TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS cognition_processed_at ON episode TYPE option<datetime>;
+    DEFINE FIELD IF NOT EXISTS cognition_version      ON episode TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS episode_uuid_idx     ON episode FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS episode_group_idx    ON episode FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS episode_content_fts  ON episode FIELDS content
@@ -176,6 +178,8 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     DEFINE FIELD IF NOT EXISTS weight             ON relates_to TYPE float DEFAULT 1.0;
     DEFINE FIELD IF NOT EXISTS reinforcement_count ON relates_to TYPE int DEFAULT 1;
     DEFINE FIELD IF NOT EXISTS last_reinforced_at  ON relates_to TYPE option<datetime>;
+    DEFINE FIELD IF NOT EXISTS recall_count        ON relates_to TYPE int DEFAULT 0;
+    DEFINE FIELD IF NOT EXISTS last_recalled_at    ON relates_to TYPE option<datetime>;
     DEFINE FIELD IF NOT EXISTS decay_score          ON relates_to TYPE float DEFAULT 1.0;
     DEFINE FIELD IF NOT EXISTS stability            ON relates_to TYPE string DEFAULT "episodic";
     DEFINE FIELD IF NOT EXISTS valence              ON relates_to TYPE option<float>;

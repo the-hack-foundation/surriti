@@ -55,6 +55,46 @@ class CognitionScheduler:
 
         self._stopped = False
 
+    async def recover_pending_episodes(self) -> int:
+        """Queue recent episodes that were persisted but not processed.
+
+        This closes the restart gap where ``add_episode`` wrote facts,
+        queued an in-memory debounce, and the process exited before that
+        debounce fired. Recovery is bounded so legacy databases without
+        markers do not schedule unbounded work at startup.
+        """
+
+        if not self._config.enabled or self._stopped:
+            return 0
+        try:
+            from surriti.search import _unwrap
+
+            limit = max(1, int(self._config.max_episodes_per_pass) * 16)
+            rows = _unwrap(
+                await self._driver.query(
+                    """
+                    SELECT group_id, uuid
+                    FROM episode
+                    WHERE cognition_processed_at IS NONE
+                    ORDER BY created_at DESC
+                    LIMIT $limit;
+                    """,
+                    {"limit": limit},
+                )
+            )
+        except Exception:
+            logger.exception("cognition recovery query failed")
+            return 0
+
+        recovered = 0
+        for row in rows:
+            episode_uuid = row.get("uuid")
+            if not episode_uuid:
+                continue
+            self.notify(str(row.get("group_id") or ""), str(episode_uuid))
+            recovered += 1
+        return recovered
+
     def notify(self, group_id: str, episode_uuid: str | None = None) -> None:
         """Record a new episode for ``group_id`` and arm a debounced
         cognition pass. Safe to call from inside ``add_episode``; never

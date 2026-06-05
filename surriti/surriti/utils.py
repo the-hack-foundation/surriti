@@ -61,6 +61,8 @@ def parse_episode(row: dict[str, Any]) -> EpisodicNode:
         entity_edges=list(row.get("entity_edges") or []),
         affect=dict(row.get("affect") or {}),
         interaction_pattern=row.get("interaction_pattern"),
+        cognition_processed_at=_coerce_dt(row.get("cognition_processed_at")),
+        cognition_version=row.get("cognition_version"),
     )
 
 
@@ -137,6 +139,8 @@ def parse_edge(row: dict[str, Any]) -> EntityEdge:
         weight=float(row.get("weight")) if row.get("weight") is not None else 1.0,
         reinforcement_count=int(row.get("reinforcement_count") or 1),
         last_reinforced_at=_coerce_dt(row.get("last_reinforced_at")),
+        recall_count=int(row.get("recall_count") or 0),
+        last_recalled_at=_coerce_dt(row.get("last_recalled_at")),
         decay_score=float(row.get("decay_score")) if row.get("decay_score") is not None else 1.0,
         stability=str(row.get("stability") or "episodic"),
         valence=float(row.get("valence")) if row.get("valence") is not None else None,

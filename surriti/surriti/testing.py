@@ -106,6 +106,12 @@ class InMemoryDriver:
                 if r.get("group_id") == v.get("g") and r.get("name") == v.get("n")
             ]
             return [rows[:1]]
+        if s.startswith("SELECT * FROM entity") and "name = $name" in s:
+            rows = [
+                r for r in self.records["entity"]
+                if r.get("group_id") == v.get("group_id") and r.get("name") == v.get("name")
+            ]
+            return [rows[:1]]
         if s.startswith("SELECT * FROM entity WHERE group_id") and "uuid = $u" in s:
             rows = [
                 r for r in self.records["entity"]
@@ -154,6 +160,14 @@ class InMemoryDriver:
                 and r.get("invalid_at") is None
             ]
             return [rows[:10]]
+        if "FROM relates_to" in s and "uuid IN $uuids" in s:
+            wanted = set(v.get("uuids") or [])
+            rows = [
+                {"uuid": r.get("uuid"), "recall_count": r.get("recall_count")}
+                for r in self.records["relates_to"]
+                if r.get("group_id") == v.get("group_id") and r.get("uuid") in wanted
+            ]
+            return [rows]
         if "FROM relates_to" in s and "valid_at <= $as_of" in s:
             # get_facts_as_of: edges valid at the given timestamp.
             rows = []
@@ -271,6 +285,14 @@ class InMemoryDriver:
                 rows = [r for r in rows if r.get("reference_time") <= v.get("ref")]
             rows.sort(key=lambda r: r.get("reference_time"), reverse=True)
             return [rows[: v.get("n", 10)]]
+        if "FROM episode" in s and "cognition_processed_at IS NONE" in s:
+            rows = [
+                {"group_id": r.get("group_id", ""), "uuid": r.get("uuid")}
+                for r in self.records["episode"]
+                if r.get("cognition_processed_at") is None
+            ]
+            rows.reverse()
+            return [rows[: int(v.get("limit") or 100)]]
         if s.startswith("SELECT content FROM episode WHERE uuid IN") or \
                 s.startswith("SELECT name, content FROM episode WHERE uuid IN"):
             uuids = set(v.get("u") or [])
@@ -285,6 +307,19 @@ class InMemoryDriver:
                         if episode_uuid not in merged:
                             merged.append(episode_uuid)
                     r["episodes"] = merged
+            return [[{"ok": True}]]
+        if s.startswith("UPDATE relates_to") and "last_recalled_at" in s:
+            for r in self.records["relates_to"]:
+                if r.get("group_id") == v.get("group_id") and r.get("uuid") == v.get("uuid"):
+                    r["recall_count"] = int(v.get("recall_count") or 0)
+                    r["last_recalled_at"] = v.get("last_recalled_at")
+            return [[{"ok": True}]]
+        if s.startswith("UPDATE episode SET") and "cognition_processed_at" in s:
+            wanted = set(v.get("episode_uuids") or [])
+            for r in self.records["episode"]:
+                if r.get("group_id") == v.get("group_id") and r.get("uuid") in wanted:
+                    r["cognition_processed_at"] = v.get("processed_at")
+                    r["cognition_version"] = v.get("version")
             return [[{"ok": True}]]
         if s.startswith("UPDATE relates_to") and "record::id(in) IN $aliases" in s:
             aliases = set(v.get("aliases") or [])

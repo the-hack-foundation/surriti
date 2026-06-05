@@ -24,6 +24,18 @@ from surriti.nodes import EpisodeType
 logger = logging.getLogger("surriti.cognition.self_awareness")
 
 
+async def _complete_json(llm: Any, *, system: str, prompt: str) -> str | None:
+    """Use the public LLM hook; tolerate legacy adapters with ``generate``."""
+
+    if hasattr(llm, "synthesize"):
+        response = await llm.synthesize(system, prompt)
+        if response:
+            return response
+    if hasattr(llm, "generate"):
+        return await llm.generate(prompt, system_prompt=system, temperature=0.3)
+    return None
+
+
 async def run_self_awareness_pass(
     *,
     driver: Any,
@@ -169,14 +181,16 @@ async def _extract_self_traits(
     """)
 
     try:
-        response = await llm.generate(
-            prompt,
-            system_prompt=(
+        response = await _complete_json(
+            llm,
+            prompt=prompt,
+            system=(
                 "You are analyzing self-observations of an AI assistant. "
                 "Return structured JSON. Be concise and accurate."
             ),
-            temperature=0.3,
         )
+        if not response:
+            return 0, 0
         # Parse JSON response and write to graph
         import json
         try:
@@ -235,7 +249,13 @@ async def _extract_self_patterns(
     """)
 
     try:
-        response = await llm.generate(prompt, temperature=0.3)
+        response = await _complete_json(
+            llm,
+            system="Return concise JSON describing assistant behavioral patterns.",
+            prompt=prompt,
+        )
+        if not response:
+            return 0
         import json
         try:
             data = json.loads(response)
@@ -289,7 +309,13 @@ async def _extract_traits_from_events(
     """)
 
     try:
-        response = await llm.generate(prompt, temperature=0.3)
+        response = await _complete_json(
+            llm,
+            system="Return concise JSON describing assistant traits and beliefs.",
+            prompt=prompt,
+        )
+        if not response:
+            return 0, 0
         import json
         try:
             data = json.loads(response)
