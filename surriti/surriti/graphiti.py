@@ -3175,9 +3175,13 @@ class Surriti:
                     """,
                     {"group_id": group_id, "src": self_entity.uuid},
                 )
+                trait_rows = _unwrap(trait_edges)
                 result["traits"] = [
-                    {"fact": _unwrap(row).get("fact", ""), "confidence": _unwrap(row).get("confidence", 1.0)}
-                    for row in trait_edges
+                    {
+                        "fact": row.get("fact", ""),
+                        "confidence": row.get("confidence", 1.0),
+                    }
+                    for row in trait_rows
                 ]
 
         # 2. Interaction patterns from procedural cognition
@@ -3193,40 +3197,90 @@ class Surriti:
                 """,
                 {"group_id": group_id},
             )
-            patterns = defaultdict(int)
-            for ep in episodes:
-                row = _unwrap(ep)
+            episode_rows = _unwrap(episodes)
+            patterns: dict[str, dict[str, Any]] = {}
+            for row in episode_rows:
                 pattern = row.get("interaction_pattern")
                 if pattern:
-                    patterns[pattern] += 1
+                    entry = patterns.setdefault(
+                        pattern,
+                        {"pattern": pattern, "count": 0, "source": "episode"},
+                    )
+                    entry["count"] += 1
+
+            self_entity = await self._get_entity_by_name(
+                name=f"assistant_{group_id}" if group_id else "assistant",
+                group_id=group_id,
+            )
+            if self_entity:
+                pattern_edges = _unwrap(
+                    await self.driver.query(
+                        """
+                        SELECT * FROM relates_to
+                        WHERE group_id = $group_id
+                            AND in = type::record("entity", $src)
+                            AND name = "has_pattern"
+                            AND status = "active"
+                            AND invalid_at IS NONE;
+                        """,
+                        {"group_id": group_id, "src": self_entity.uuid},
+                    )
+                )
+                for row in pattern_edges:
+                    fact = row.get("fact") or ""
+                    pattern = fact.removeprefix("has_pattern:").strip() or fact
+                    if pattern:
+                        patterns[pattern] = {
+                            "pattern": pattern,
+                            "count": 1,
+                            "confidence": row.get("confidence", 1.0),
+                            "source": "self_model",
+                        }
             result["patterns"] = [
-                {"pattern": k, "count": v, "confidence": v / max(len(episodes), 1)}
-                for k, v in sorted(patterns.items(), key=lambda x: -x[1])
+                {
+                    **entry,
+                    "confidence": entry.get(
+                        "confidence",
+                        entry["count"] / max(len(episode_rows), 1),
+                    ),
+                }
+                for entry in sorted(
+                    patterns.values(), key=lambda x: int(x.get("count") or 0), reverse=True
+                )
             ]
 
         # 3. Belief edges (subjective self-assessments)
         if include_beliefs:
-            belief_edges = await self.driver.query(
-                """
-                SELECT * FROM relates_to
-                WHERE group_id = $group_id
-                    AND (is_belief = true)
-                    AND status = "active"
-                    AND invalid_at IS NONE;
-                """,
-                {"group_id": group_id},
+            self_entity = await self._get_entity_by_name(
+                name=f"assistant_{group_id}" if group_id else "assistant",
+                group_id=group_id,
             )
-            result["beliefs"] = [
-                {"fact": _unwrap(row).get("fact", ""), "source_type": "self"}
-                for row in belief_edges
-            ]
+            if self_entity:
+                belief_rows = _unwrap(
+                    await self.driver.query(
+                        """
+                        SELECT * FROM relates_to
+                        WHERE group_id = $group_id
+                            AND in = type::record("entity", $src)
+                            AND name = "has_belief"
+                            AND is_belief = true
+                            AND status = "active"
+                            AND invalid_at IS NONE;
+                        """,
+                        {"group_id": group_id, "src": self_entity.uuid},
+                    )
+                )
+                result["beliefs"] = [
+                    {"fact": row.get("fact", ""), "source_type": "self"}
+                    for row in belief_rows
+                ]
 
         # 4. Goal entities
         if include_beliefs:
             result["goals"] = []  # Populated by cognition pass
 
         # 5. Summary
-        total_self_episodes = len(
+        count_rows = _unwrap(
             await self.driver.query(
                 """
                 SELECT count() as cnt FROM episode
@@ -3236,6 +3290,7 @@ class Surriti:
                 {"group_id": group_id},
             )
         )
+        total_self_episodes = int(count_rows[0].get("cnt") or 0) if count_rows else 0
         result["summary"] = (
             f"Self-model based on {total_self_episodes} self-episodes. "
             f"{len(result['traits'])} traits identified. "

@@ -45,9 +45,10 @@ def effective_confidence(
 
     now = now or datetime.now(timezone.utc)
     base = float(edge.confidence if edge.confidence is not None else 1.0)
-    last = edge.last_reinforced_at or edge.valid_at or edge.created_at
-    if last is None:
-        last = now
+    last_write = edge.last_reinforced_at or edge.valid_at or edge.created_at
+    last_recall = edge.last_recalled_at
+    dates = [d for d in (last_write, last_recall) if d is not None]
+    last = max(dates) if dates else now
     if last.tzinfo is None:
         last = last.replace(tzinfo=timezone.utc)
     delta_days = max(0.0, (now - last).total_seconds() / 86_400.0)
@@ -56,9 +57,11 @@ def effective_confidence(
         decay = 1.0
     else:
         decay = math.exp(-math.log(2.0) * delta_days / hl)
-    count = max(1, int(edge.reinforcement_count or 1))
-    reinforce = 1.0 + math.log1p(count - 1) / math.log(10.0)
-    score = base * decay * reinforce
+    episode_count = max(1, int(edge.reinforcement_count or 1))
+    recall_count = max(0, int(edge.recall_count or 0))
+    episode_boost = 1.0 + math.log1p(episode_count - 1) / math.log(10.0)
+    recall_boost = 1.0 + min(0.25, math.log1p(recall_count) / 20.0)
+    score = base * decay * episode_boost * recall_boost
     if score < 0.0:
         return 0.0
     if score > 1.0:

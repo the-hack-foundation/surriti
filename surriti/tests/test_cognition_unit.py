@@ -77,6 +77,23 @@ def test_effective_confidence_reinforcement_boost():
     assert effective_confidence(many, now=now) > effective_confidence(once, now=now)
 
 
+def test_effective_confidence_uses_bounded_recall_boost():
+    now = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    stale = _edge(
+        last_reinforced_at=now - timedelta(days=120),
+        confidence=0.5,
+        recall_count=0,
+    )
+    recalled = _edge(
+        last_reinforced_at=now - timedelta(days=120),
+        last_recalled_at=now,
+        confidence=0.5,
+        recall_count=1000,
+    )
+    assert effective_confidence(recalled, now=now) > effective_confidence(stale, now=now)
+    assert effective_confidence(recalled, now=now) <= 1.0
+
+
 def test_effective_confidence_clipped_to_unit_interval():
     now = datetime(2026, 5, 1, tzinfo=timezone.utc)
     edge = _edge(last_reinforced_at=now, reinforcement_count=10_000, confidence=1.0)
@@ -279,6 +296,12 @@ def test_cognition_config_defaults():
     assert cfg.consolidation_threshold >= 2
 
 
+def test_relation_frame_is_managed_table():
+    from surriti.schema import ALL_TABLES
+
+    assert "relation_frame" in ALL_TABLES
+
+
 @pytest.mark.asyncio
 async def test_reinforce_edges_on_recall_updates_recall_side_fields():
     from surriti.cognition.reinforcement import reinforce_edges_on_recall
@@ -405,3 +428,54 @@ async def test_self_awareness_uses_synthesize_hook():
 
     assert traits == 1
     assert beliefs == 0
+
+
+@pytest.mark.asyncio
+async def test_self_awareness_traits_are_visible_in_get_self_model():
+    from surriti.cognition.self_awareness import _extract_self_traits
+    from surriti.embedder import DummyEmbedder
+    from surriti.graphiti import Surriti
+    from surriti.testing import InMemoryDriver
+
+    class SynthOnlyLLM:
+        async def synthesize(self, system, user):
+            del system, user
+            return (
+                '{"traits":[{"trait":"concise","confidence":0.9}],'
+                '"beliefs":[{"belief":"I value brevity","confidence":0.7}]}'
+            )
+
+    driver = InMemoryDriver(enforce_entity_name_uniq=True)
+    s = Surriti(driver, embedder=DummyEmbedder(embedding_dim=8))
+    driver.records["entity"].append(
+        {
+            "uuid": "self-1",
+            "group_id": "g",
+            "name": "assistant_g",
+            "summary": "",
+            "labels": ["SelfEntity", "Assistant"],
+        }
+    )
+
+    first = await _extract_self_traits(
+        driver,
+        SynthOnlyLLM(),
+        "g",
+        [{"content": "I am concise.", "source_description": "note"}],
+        CognitionConfig(),
+    )
+    second = await _extract_self_traits(
+        driver,
+        SynthOnlyLLM(),
+        "g",
+        [{"content": "I am concise.", "source_description": "note"}],
+        CognitionConfig(),
+    )
+    model = await s.get_self_model(group_id="g")
+
+    assert first == (1, 1)
+    assert second == (1, 1)
+    assert model["traits"]
+    assert model["beliefs"]
+    assert len([r for r in driver.records["relates_to"] if r["name"] == "has_trait"]) == 1
+    assert len([r for r in driver.records["relates_to"] if r["name"] == "has_belief"]) == 1

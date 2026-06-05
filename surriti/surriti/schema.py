@@ -236,6 +236,7 @@ ALL_TABLES: tuple[str, ...] = (
     "entity",
     "entity_alias",
     "community",
+    "relation_frame",
 )
 
 

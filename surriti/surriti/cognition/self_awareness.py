@@ -13,6 +13,8 @@ The self-model is then available for:
 from __future__ import annotations
 
 import logging
+import hashlib
+import re
 import textwrap
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -63,7 +65,9 @@ async def run_self_awareness_pass(
 
     try:
         # 1. Query self-episodes
-        self_episodes = await _query_self_episodes(driver, group_id)
+        self_episodes = await _query_self_episodes(
+            driver, group_id, episode_uuids=episode_uuids
+        )
         metrics["self_episodes_read"] = len(self_episodes)
 
         if not self_episodes:
@@ -118,9 +122,29 @@ async def run_self_awareness_pass(
 async def _query_self_episodes(
     driver: Any,
     group_id: str,
+    episode_uuids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Query all self-referential episodes for a group."""
     from surriti.search import _unwrap
+
+    if episode_uuids:
+        rows = _unwrap(
+            await driver.query(
+                """
+                SELECT name, content, source, source_description,
+                       reference_time, created_at, group_id
+                FROM episode
+                WHERE group_id = $group_id
+                    AND uuid IN $episode_uuids
+                    AND source CONTAINS 'self_'
+                ORDER BY created_at DESC
+                LIMIT 100;
+                """,
+                {"group_id": group_id, "episode_uuids": list(episode_uuids)},
+            )
+        )
+        if rows:
+            return rows
 
     rows = _unwrap(
         await driver.query(
@@ -137,6 +161,175 @@ async def _query_self_episodes(
         )
     )
     return rows
+
+
+def _slug(value: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
+    if not text:
+        text = "self_model"
+    return text[:80]
+
+
+def _stable_uuid(prefix: str, group_id: str, value: str) -> str:
+    digest = hashlib.sha1(f"{group_id}\0{value}".encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}_{_slug(value)}_{digest}"
+
+
+async def _upsert_self_model_entity(
+    driver: Any,
+    *,
+    uuid: str,
+    group_id: str,
+    name: str,
+    summary: str,
+    labels: list[str],
+) -> str:
+    from surriti.search import _unwrap
+
+    rows = _unwrap(
+        await driver.query(
+            "SELECT * FROM entity WHERE group_id = $group_id AND uuid = $uuid LIMIT 1;",
+            {"group_id": group_id, "uuid": uuid},
+        )
+    )
+    payload = {
+        "uuid": uuid,
+        "group_id": group_id,
+        "name": name,
+        "summary": summary,
+        "labels": labels,
+        "created_at": datetime.now(timezone.utc),
+    }
+    if rows:
+        await driver.query(
+            """
+            UPDATE type::record("entity", $uuid) SET
+                summary = $summary,
+                labels = $labels
+            ;
+            """,
+            payload,
+        )
+        return uuid
+    try:
+        await driver.query(
+            """
+            CREATE type::record("entity", $uuid) CONTENT {
+                uuid: $uuid,
+                group_id: $group_id,
+                name: $name,
+                summary: $summary,
+                labels: $labels,
+                attributes: {},
+                created_at: $created_at
+            };
+            """,
+            payload,
+        )
+        return uuid
+    except Exception as exc:
+        if "entity_name_uniq" not in str(exc):
+            raise
+        fallback = _unwrap(
+            await driver.query(
+                """
+                SELECT * FROM entity
+                WHERE group_id = $group_id
+                  AND name = $name
+                LIMIT 1;
+                """,
+                {"group_id": group_id, "name": name},
+            )
+        )
+        if not fallback:
+            raise
+        payload["uuid"] = fallback[0].get("uuid")
+        await driver.query(
+            """
+            UPDATE type::record("entity", $uuid) SET
+                summary = $summary,
+                labels = $labels
+            ;
+            """,
+            payload,
+        )
+        return str(payload["uuid"])
+
+
+async def _upsert_self_model_edge(
+    driver: Any,
+    *,
+    group_id: str,
+    self_uuid: str,
+    target_uuid: str,
+    edge_uuid: str,
+    predicate: str,
+    fact: str,
+    confidence: float,
+    is_belief: bool = False,
+) -> None:
+    from surriti.search import _unwrap
+
+    rows = _unwrap(
+        await driver.query(
+            "SELECT * FROM relates_to WHERE group_id = $group_id AND uuid = $uuid LIMIT 1;",
+            {"group_id": group_id, "uuid": edge_uuid},
+        )
+    )
+    now = datetime.now(timezone.utc)
+    payload = {
+        "src": self_uuid,
+        "tgt": target_uuid,
+        "uuid": edge_uuid,
+        "group_id": group_id,
+        "name": predicate,
+        "fact": fact,
+        "confidence": float(confidence),
+        "is_belief": bool(is_belief),
+        "status": "active",
+        "source_type": "assistant",
+        "attributes": {"memory_class": "self_model"},
+        "created_at": now,
+    }
+    if rows:
+        await driver.query(
+            """
+            UPDATE relates_to SET
+                fact = $fact,
+                confidence = $confidence,
+                is_belief = $is_belief,
+                status = "active",
+                invalid_at = NONE,
+                attributes = $attributes
+            WHERE group_id = $group_id
+              AND uuid = $uuid;
+            """,
+            payload,
+        )
+        return
+    await driver.query(
+        """
+        RELATE (type::record("entity", $src))->relates_to->(type::record("entity", $tgt))
+        CONTENT {
+            uuid: $uuid,
+            group_id: $group_id,
+            name: $name,
+            fact: $fact,
+            confidence: $confidence,
+            is_belief: $is_belief,
+            status: $status,
+            source_type: $source_type,
+            attributes: $attributes,
+            episodes: [],
+            reinforcement_count: 1,
+            recall_count: 0,
+            decay_score: 1.0,
+            stability: "persistent",
+            created_at: $created_at
+        };
+        """,
+        payload,
+    )
 
 
 async def _extract_self_traits(
@@ -354,52 +547,27 @@ async def _write_self_trait(
     if not self_entity:
         return
 
-    trait_uuid = f"trait_{trait_name.replace(' ', '_')}_{group_id}"
+    trait_uuid = _stable_uuid("trait", group_id, trait_name)
     confidence = trait_data.get("confidence", 0.5)
     evidence = trait_data.get("evidence", "")
 
-    await driver.query(
-        """
-        CREATE type::record("entity", $uuid) CONTENT {
-            uuid: $uuid,
-            group_id: $group_id,
-            name: $name,
-            summary: $summary,
-            labels: $labels,
-            created_at: $created_at
-        };
-        """,
-        {
-            "uuid": trait_uuid,
-            "group_id": group_id,
-            "name": trait_name,
-            "summary": evidence or f"Self-trait: {trait_name}",
-            "labels": ["SelfTrait", "Trait"],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        },
+    trait_uuid = await _upsert_self_model_entity(
+        driver,
+        uuid=trait_uuid,
+        group_id=group_id,
+        name=trait_name,
+        summary=evidence or f"Self-trait: {trait_name}",
+        labels=["SelfTrait", "Trait"],
     )
-
-    await driver.query(
-        """
-        RELATE (type::record("entity", $src))->has_trait->(type::record("entity", $dst))
-        CONTENT {
-            uuid: $edge_uuid,
-            group_id: $group_id,
-            created_at: $created_at,
-            fact: $fact,
-            confidence: $confidence,
-            is_belief: false
-        };
-        """,
-        {
-            "src": self_entity["uuid"],
-            "dst": trait_uuid,
-            "edge_uuid": f"edge_trait_{trait_uuid}_{group_id}",
-            "group_id": group_id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "fact": f"has_trait: {trait_name}",
-            "confidence": confidence,
-        },
+    await _upsert_self_model_edge(
+        driver,
+        group_id=group_id,
+        self_uuid=self_entity["uuid"],
+        target_uuid=trait_uuid,
+        edge_uuid=f"edge_{trait_uuid}",
+        predicate="has_trait",
+        fact=f"has_trait: {trait_name}",
+        confidence=confidence,
     )
 
 
@@ -417,51 +585,27 @@ async def _write_self_belief(
     if not self_entity:
         return
 
-    belief_uuid = f"belief_{len(belief_text)}_{group_id}"
+    belief_uuid = _stable_uuid("belief", group_id, belief_text)
     confidence = belief_data.get("confidence", 0.5)
 
-    await driver.query(
-        """
-        CREATE type::record("entity", $uuid) CONTENT {
-            uuid: $uuid,
-            group_id: $group_id,
-            name: $name,
-            summary: $summary,
-            labels: $labels,
-            created_at: $created_at
-        };
-        """,
-        {
-            "uuid": belief_uuid,
-            "group_id": group_id,
-            "name": "self_belief",
-            "summary": belief_text,
-            "labels": ["SelfBelief"],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        },
+    belief_uuid = await _upsert_self_model_entity(
+        driver,
+        uuid=belief_uuid,
+        group_id=group_id,
+        name="self_belief",
+        summary=belief_text,
+        labels=["SelfBelief"],
     )
-
-    await driver.query(
-        """
-        RELATE (type::record("entity", $src))->has_belief->(type::record("entity", $dst))
-        CONTENT {
-            uuid: $edge_uuid,
-            group_id: $group_id,
-            created_at: $created_at,
-            fact: $fact,
-            confidence: $confidence,
-            is_belief: true
-        };
-        """,
-        {
-            "src": self_entity["uuid"],
-            "dst": belief_uuid,
-            "edge_uuid": f"edge_belief_{belief_uuid}_{group_id}",
-            "group_id": group_id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "fact": belief_text,
-            "confidence": confidence,
-        },
+    await _upsert_self_model_edge(
+        driver,
+        group_id=group_id,
+        self_uuid=self_entity["uuid"],
+        target_uuid=belief_uuid,
+        edge_uuid=f"edge_{belief_uuid}",
+        predicate="has_belief",
+        fact=belief_text,
+        confidence=confidence,
+        is_belief=True,
     )
 
 
@@ -479,49 +623,25 @@ async def _write_self_pattern(
     if not self_entity:
         return
 
-    pattern_uuid = f"pattern_{pattern_name.replace(' ', '_')}_{group_id}"
+    pattern_uuid = _stable_uuid("pattern", group_id, pattern_name)
 
-    await driver.query(
-        """
-        CREATE type::record("entity", $uuid) CONTENT {
-            uuid: $uuid,
-            group_id: $group_id,
-            name: $name,
-            summary: $summary,
-            labels: $labels,
-            created_at: $created_at
-        };
-        """,
-        {
-            "uuid": pattern_uuid,
-            "group_id": group_id,
-            "name": pattern_name,
-            "summary": str(pattern_data),
-            "labels": ["SelfPattern", "Pattern"],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        },
+    pattern_uuid = await _upsert_self_model_entity(
+        driver,
+        uuid=pattern_uuid,
+        group_id=group_id,
+        name=pattern_name,
+        summary=str(pattern_data),
+        labels=["SelfPattern", "Pattern"],
     )
-
-    await driver.query(
-        """
-        RELATE (type::record("entity", $src))->has_pattern->(type::record("entity", $dst))
-        CONTENT {
-            uuid: $edge_uuid,
-            group_id: $group_id,
-            created_at: $created_at,
-            fact: $fact,
-            confidence: $confidence
-        };
-        """,
-        {
-            "src": self_entity["uuid"],
-            "dst": pattern_uuid,
-            "edge_uuid": f"edge_pattern_{pattern_uuid}_{group_id}",
-            "group_id": group_id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "fact": f"has_pattern: {pattern_name}",
-            "confidence": 0.7,
-        },
+    await _upsert_self_model_edge(
+        driver,
+        group_id=group_id,
+        self_uuid=self_entity["uuid"],
+        target_uuid=pattern_uuid,
+        edge_uuid=f"edge_{pattern_uuid}",
+        predicate="has_pattern",
+        fact=f"has_pattern: {pattern_name}",
+        confidence=0.7,
     )
 
 
