@@ -3166,7 +3166,7 @@ class Surriti:
                 SELECT name, content, interaction_pattern, created_at
                 FROM episode
                 WHERE group_id = $group_id
-                    AND source LIKE "self_%"
+                    AND source CONTAINS 'self_'
                 ORDER BY created_at DESC
                 LIMIT 50;
                 """,
@@ -3189,7 +3189,7 @@ class Surriti:
                 """
                 SELECT * FROM relates_to
                 WHERE group_id = $group_id
-                    AND (attributes->>'$.is_belief' = true OR is_belief = true)
+                    AND (is_belief = true)
                     AND status = "active"
                     AND invalid_at IS NONE;
                 """,
@@ -3210,7 +3210,7 @@ class Surriti:
                 """
                 SELECT count() as cnt FROM episode
                 WHERE group_id = $group_id
-                    AND source LIKE "self_%";
+                    AND source CONTAINS 'self_';
                 """,
                 {"group_id": group_id},
             )

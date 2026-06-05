@@ -39,7 +39,10 @@ def _strip_record_id(value: Any) -> str:
 
     if value is None:
         return ""
-    text = str(value)
+    try:
+        text = str(value)
+    except Exception:
+        return ""
     if ":" in text:
         return text.split(":", 1)[1].strip("⟨⟩")
     return text

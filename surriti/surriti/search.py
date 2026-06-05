@@ -109,7 +109,7 @@ async def _fulltext_search_edges(
     group_id: str | None,
     limit: int,
 ) -> list[dict[str, Any]]:
-    where = "WHERE fact @1@ $q"
+    where = "WHERE fact @0@ $q"
     if group_id is not None:
         where += " AND group_id = $group_id"
     surql = f"""
@@ -385,7 +385,7 @@ async def _fulltext_search_nodes(
 ) -> list[dict[str, Any]]:
     # The entity FT index covers (name, summary); a single match on `name`
     # is sufficient for SurrealDB to use it.
-    where = "WHERE name @1@ $q"
+    where = "WHERE name @0@ $q"
     if group_id is not None:
         where += " AND group_id = $group_id"
     rows = await driver.query(
@@ -401,7 +401,7 @@ async def _fulltext_search_episodes(
     group_id: str | None,
     limit: int,
 ) -> list[dict[str, Any]]:
-    where = "WHERE content @1@ $q"
+    where = "WHERE content @0@ $q"
     if group_id is not None:
         where += " AND group_id = $group_id"
     rows = await driver.query(

@@ -22,8 +22,7 @@ from typing import Any, Literal
 # Words that are too generic to be useful entity names in the dummy extractor.
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with",
-    "is", "are", "was", "were", "be", "been", "being", "this", "that", "these",
-    "those", "it", "its", "from", "as", "by",
+    "this", "that", "these", "those", "it", "its", "from", "as", "by",
 }
 
 

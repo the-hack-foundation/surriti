@@ -117,7 +117,7 @@ async def _query_self_episodes(
                    reference_time, created_at, group_id
             FROM episode
             WHERE group_id = $group_id
-                AND source LIKE "self_%"
+                AND source CONTAINS 'self_'
             ORDER BY created_at DESC
             LIMIT 100;
             """,

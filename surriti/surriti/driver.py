@@ -49,6 +49,10 @@ class SurrealDriver:
         self.database = database
         self.username = username
         self.password = password
+        if not isinstance(embedding_dim, int) or embedding_dim <= 0:
+            raise ValueError(
+                f"embedding_dim must be a positive integer, got {embedding_dim!r}"
+            )
         self.embedding_dim = embedding_dim
         self._db: Any | None = None
 
@@ -130,7 +134,7 @@ class SurrealDriver:
         concurrency control).
         """
 
-        import time
+        import asyncio
 
         max_retries = 2
         for attempt in range(max_retries + 1):
@@ -150,7 +154,7 @@ class SurrealDriver:
                             attempt + 1,
                             max_retries,
                         )
-                        time.sleep(backoff)
+                        await asyncio.sleep(backoff)
                         continue
                     # Exhausted retries — re-raise
                     raise
@@ -202,7 +206,7 @@ class SurrealDriver:
                 except Exception as exc:
                     msg = str(exc).lower()
                     if ("transaction conflict" in msg or "resource busy" in msg):
-                        import time; time.sleep(0.2)
+                        import asyncio; await asyncio.sleep(0.2)
                         continue
                     raise
 

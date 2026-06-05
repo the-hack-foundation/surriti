@@ -51,7 +51,7 @@ class DummyEmbedder(EmbedderClient):
             idx2 = int.from_bytes(digest[4:8], "big") % self.embedding_dim
             vec[idx2] -= 1.0
         norm = math.sqrt(sum(x * x for x in vec))
-        if norm == 0:
+        if norm < 1e-10:
             return vec
         return [x / norm for x in vec]
 

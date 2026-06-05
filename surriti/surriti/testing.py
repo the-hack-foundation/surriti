@@ -227,7 +227,7 @@ class InMemoryDriver:
                 scored.append((cosine_similarity(vec, r["fact_embedding"]), r))
             scored.sort(key=lambda x: x[0], reverse=True)
             return [[r for _, r in scored[:10]]]
-        if "FROM relates_to" in s and "fact @1@" in s:
+        if "FROM relates_to" in s and ("fact @0@" in s or "fact @1@" in s):
             q = (v.get("q") or "").lower()
             tokens = [t for t in q.split() if t]
             rows = [
@@ -247,7 +247,7 @@ class InMemoryDriver:
                 scored.append((cosine_similarity(vec, r["name_embedding"]), r))
             scored.sort(key=lambda x: x[0], reverse=True)
             return [[r for _, r in scored[:10]]]
-        if "FROM entity" in s and "name @1@" in s:
+        if "FROM entity" in s and ("name @0@" in s or "name @1@" in s):
             q = (v.get("q") or "").lower()
             tokens = [t for t in q.split() if t]
             rows = [
