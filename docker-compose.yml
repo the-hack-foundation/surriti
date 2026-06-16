@@ -10,9 +10,9 @@ services:
     # container (mapped to the named volume below) so `docker compose down`
     # no longer wipes the graph. To do a full reset (DB + container):
     # `docker compose down -v`.
-    command: start --user root --pass root --bind 0.0.0.0:8000 rocksdb:/data/surreal.db
+    command: start --user ${SURRITI_SURREAL_USER:?SURRITI_SURREAL_USER must be set (for example in .env)} --pass ${SURRITI_SURREAL_PASS:?SURRITI_SURREAL_PASS must be set (for example in .env)} --bind 0.0.0.0:8000 rocksdb:/data/surreal.db
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - surrealdb_data:/data
     restart: unless-stopped
@@ -29,7 +29,7 @@ services:
     # Host port 8001 to avoid colliding with surrealdb on 8000.
     # Inside the docker network myapp reaches vllm at http://vllm:8000.
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
       - HF_HOME=/root/.cache/huggingface
@@ -86,7 +86,7 @@ services:
       dockerfile: myapp/Dockerfile
     container_name: surriti-myapp
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       PORT: "3000"
       VLLM_BASE_URL: "http://vllm:8000/v1"
@@ -96,9 +96,8 @@ services:
       SURRITI_SURREAL_URL:  "ws://surrealdb:8000/rpc"
       SURRITI_SURREAL_NS:   "myapp"
       SURRITI_SURREAL_DB:   "myapp"
-      # WARNING: root/root are dev/local defaults — override in production.
-      SURRITI_SURREAL_USER: "root"
-      SURRITI_SURREAL_PASS: "root"
+      SURRITI_SURREAL_USER: "${SURRITI_SURREAL_USER:?SURRITI_SURREAL_USER must be set (for example in .env)}"
+      SURRITI_SURREAL_PASS: "${SURRITI_SURREAL_PASS:?SURRITI_SURREAL_PASS must be set (for example in .env)}"
     depends_on:
       surrealdb:
         condition: service_healthy

@@ -34,14 +34,15 @@ Streaming event types (over the WebSocket)
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
-from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
@@ -76,10 +77,15 @@ VLLM_WAIT_S   = float(os.environ.get("VLLM_WAIT_S", "30"))
 SURREAL_URL  = os.environ.get("SURRITI_SURREAL_URL",  "ws://surrealdb:8000/rpc")
 SURREAL_NS   = os.environ.get("SURRITI_SURREAL_NS",   "myapp")
 SURREAL_DB   = os.environ.get("SURRITI_SURREAL_DB",   "myapp")
-# WARNING: "root"/"root" are dev/local defaults only. Set these env vars to
-# strong credentials before any non-local deployment.
-SURREAL_USER = os.environ.get("SURRITI_SURREAL_USER", "root")
-SURREAL_PASS = os.environ.get("SURRITI_SURREAL_PASS", "root")
+SURREAL_USER = os.environ.get("SURRITI_SURREAL_USER")
+SURREAL_PASS = os.environ.get("SURRITI_SURREAL_PASS")
+SURRITI_API_KEY = (os.environ.get("SURRITI_API_KEY") or "").strip()
+ALLOW_INSECURE_LOCAL = os.environ.get("SURRITI_ALLOW_INSECURE_LOCAL", "1") == "1"
+if not SURRITI_API_KEY and not ALLOW_INSECURE_LOCAL:
+    log.warning(
+        "SURRITI_API_KEY is empty while SURRITI_ALLOW_INSECURE_LOCAL=0; "
+        "all non-loopback requests will be denied."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +96,50 @@ _oa: AsyncOpenAI | None = None
 
 # Per-session event queues, written by /send, drained by /ws/{session_id}
 _sessions: dict[str, asyncio.Queue] = {}
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _extract_bearer_token(authorization: str | None) -> str:
+    if not authorization:
+        return ""
+    prefix = "bearer "
+    if authorization.lower().startswith(prefix):
+        return authorization[len(prefix):].strip()
+    return ""
+
+
+def _is_authorized(*, x_api_key: str | None, authorization: str | None, client_host: str | None) -> bool:
+    if ALLOW_INSECURE_LOCAL and _is_loopback_host(client_host):
+        return True
+    if not SURRITI_API_KEY:
+        return False
+    presented = (x_api_key or "").strip() or _extract_bearer_token(authorization)
+    return bool(presented) and secrets.compare_digest(presented, SURRITI_API_KEY)
+
+
+async def _verify_auth(
+    request: Request,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None),
+) -> None:
+    client_host = request.client.host if request.client else None
+    if _is_authorized(
+        x_api_key=x_api_key,
+        authorization=authorization,
+        client_host=client_host,
+    ):
+        return
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +212,10 @@ async def lifespan(app: FastAPI):
         llm_client = OpenAILLMClient(
             model=VLLM_MODEL, client=_oa, extra_body=_CHAT_EXTRA_BODY,
         )
+        if not SURREAL_USER or not SURREAL_PASS:
+            raise RuntimeError(
+                "Missing SURRITI_SURREAL_USER/SURRITI_SURREAL_PASS for myapp memory connection."
+            )
         driver = SurrealDriver(
             url=SURREAL_URL, namespace=SURREAL_NS, database=SURREAL_DB,
             username=SURREAL_USER, password=SURREAL_PASS,
@@ -468,7 +522,7 @@ async def _run_turn(req: SendRequest) -> None:
 # ---------------------------------------------------------------------------
 # Endpoints -- streaming
 # ---------------------------------------------------------------------------
-@app.post("/send")
+@app.post("/send", dependencies=[Depends(_verify_auth)])
 async def send(req: SendRequest) -> dict:
     """Queue a streaming turn. The events are pushed to ``/ws/{session_id}``."""
     if req.session_id not in _sessions:
@@ -480,6 +534,16 @@ async def send(req: SendRequest) -> dict:
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(ws: WebSocket, session_id: str) -> None:
+    client_host = ws.client.host if ws.client else None
+    x_api_key = ws.headers.get("x-api-key") or ws.query_params.get("api_key")
+    authorization = ws.headers.get("authorization")
+    if not _is_authorized(
+        x_api_key=x_api_key,
+        authorization=authorization,
+        client_host=client_host,
+    ):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     queue: asyncio.Queue = asyncio.Queue()
     _sessions[session_id] = queue
@@ -497,7 +561,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Endpoints -- legacy / diagnostic
 # ---------------------------------------------------------------------------
-@app.post("/prompt", response_model=PromptResponse)
+@app.post("/prompt", response_model=PromptResponse, dependencies=[Depends(_verify_auth)])
 async def prompt(req: PromptRequest) -> PromptResponse:
     recalled: list[str] = []
     if _memory is not None:
@@ -551,7 +615,7 @@ async def prompt(req: PromptRequest) -> PromptResponse:
     return PromptResponse(response=response_text, recalled_facts=recalled)
 
 
-@app.get("/memory/{user_id}")
+@app.get("/memory/{user_id}", dependencies=[Depends(_verify_auth)])
 async def get_memory(user_id: str) -> dict:
     """List EVERY entity and edge stored under ``group_id == user_id``."""
     if _memory is None:
@@ -569,9 +633,9 @@ async def get_memory(user_id: str) -> dict:
             "SELECT * FROM relates_to WHERE group_id = $g ORDER BY created_at;",
             {"g": user_id},
         ))
-    except Exception as exc:
-        log.warning("Memory dump failed: %s", exc)
-        return {"status": "error", "detail": str(exc), "nodes": [], "edges": []}
+    except Exception:
+        log.exception("Memory dump failed")
+        return {"status": "error", "detail": "memory_retrieval_failed", "nodes": [], "edges": []}
 
     nodes = [parse_entity(r) for r in node_rows]
     edges = [parse_edge(r) for r in edge_rows]
@@ -583,7 +647,7 @@ async def get_memory(user_id: str) -> dict:
     }
 
 
-@app.delete("/memory/{user_id}")
+@app.delete("/memory/{user_id}", dependencies=[Depends(_verify_auth)])
 async def delete_memory(user_id: str) -> dict:
     """Wipe every entity, edge, episode, and mention for ``group_id == user_id``.
 
@@ -608,7 +672,7 @@ async def delete_memory(user_id: str) -> dict:
     return {"status": "ok", "user_id": user_id, "tables_cleared": deleted}
 
 
-@app.get("/health")
+@app.get("/health", dependencies=[Depends(_verify_auth)])
 def health() -> dict:
     return {
         "status": "ok",
@@ -617,7 +681,8 @@ def health() -> dict:
         "embed_model": EMBED_MODEL,
         "embed_dim":   EMBED_DIM,
         "vllm":   VLLM_BASE_URL,
-        "active_sessions": list(_sessions.keys()),
+        "active_sessions": [],
+        "active_session_count": len(_sessions),
     }
 
 
