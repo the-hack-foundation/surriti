@@ -1,15 +1,16 @@
-"""Decay function for the cognitive layer.
+"""Linear memory-vitality decay for the cognitive layer.
 
-Effective confidence of an edge at read-time is::
+Surriti stores long-term fact priority in ``EntityEdge.decay_score`` on a
+simple 0..1 scale:
 
-    eff = base_confidence
-        * exp(-ln(2) * Δt_days / half_life_days(stability))
-        * (1 + log1p(reinforcement_count) / log(10))
+    1.00 == 100 vitality points
+    0.50 == 50 vitality points
+    0.00 == stagnant / archived candidate
 
-clipped to ``[0, 1]``. The function is pure and cheap; ``recall()``
-uses it as a multiplier on ranking scores, and the cognition pass
-periodically snapshots the value to ``edge.decay_score`` so SurrealQL
-can ``ORDER BY decay_score`` without recomputing.
+The production policy is intentionally inspectable: a memory loses one point
+per full day (``0.01``), and recall reinforcement adds four points (``0.04``;
+see ``reinforcement.reinforce_edges_on_recall``). Zero-score facts are
+handled by the associative pass.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from datetime import datetime, timezone
 
 from surriti.edges import EntityEdge
 
-# Default half-lives in days, keyed by ``EntityEdge.stability``.
 _DEFAULT_HALF_LIFE_DAYS: dict[str, float] = {
     "episodic": 30.0,
     "reinforced": 90.0,
@@ -27,12 +27,75 @@ _DEFAULT_HALF_LIFE_DAYS: dict[str, float] = {
     "consolidated": math.inf,
 }
 
+DEFAULT_DECAY_POINTS_PER_DAY = 0.01
+DEFAULT_RECALL_BOOST = 0.04
+
+PROTECTED_MEMORY_CLASSES: frozenset[str] = frozenset(
+    {
+        "constraint",
+        "style",
+        "preference",
+        "goal",
+        "trait",
+        "self_model",
+        "consolidated",
+        "archived_summary",
+    }
+)
+
 
 def half_life_for(stability: str, overrides: dict[str, float] | None = None) -> float:
+    """Compatibility shim for older callers that import half-life helpers."""
+
     table = _DEFAULT_HALF_LIFE_DAYS
     if overrides:
         table = {**table, **overrides}
     return table.get(stability or "episodic", table["episodic"])
+
+
+def _as_aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def is_decay_protected(edge: EntityEdge) -> bool:
+    """Return True when an edge should not be archived by passive decay."""
+
+    memory_class = str(edge.memory_class or "objective").strip().lower() or "objective"
+    return memory_class in PROTECTED_MEMORY_CLASSES or edge.stability == "consolidated"
+
+
+def linear_vitality(
+    edge: EntityEdge,
+    *,
+    now: datetime | None = None,
+    points_per_day: float = DEFAULT_DECAY_POINTS_PER_DAY,
+) -> float:
+    """Return the current 0..1 vitality score after lazy daily decay."""
+
+    now = now or datetime.now(timezone.utc)
+    score = float(edge.decay_score if edge.decay_score is not None else 1.0)
+
+    if is_decay_protected(edge):
+        return max(0.0, min(1.0, score))
+
+    last = (
+        edge.last_decayed_at
+        or edge.last_recalled_at
+        or edge.last_reinforced_at
+        or edge.valid_at
+        or edge.created_at
+    )
+    last = _as_aware(last)
+    if last is None:
+        return max(0.0, min(1.0, score))
+
+    days = max(0, int((now - last).total_seconds() // 86_400))
+    decayed = score - (days * max(0.0, float(points_per_day)))
+    return max(0.0, min(1.0, decayed))
 
 
 def effective_confidence(
@@ -41,29 +104,7 @@ def effective_confidence(
     now: datetime | None = None,
     half_life_overrides: dict[str, float] | None = None,
 ) -> float:
-    """Pure decay calculation; safe to call on any ``EntityEdge`` row."""
+    """Current ranking vitality for an edge."""
 
-    now = now or datetime.now(timezone.utc)
-    base = float(edge.confidence if edge.confidence is not None else 1.0)
-    last_write = edge.last_reinforced_at or edge.valid_at or edge.created_at
-    last_recall = edge.last_recalled_at
-    dates = [d for d in (last_write, last_recall) if d is not None]
-    last = max(dates) if dates else now
-    if last.tzinfo is None:
-        last = last.replace(tzinfo=timezone.utc)
-    delta_days = max(0.0, (now - last).total_seconds() / 86_400.0)
-    hl = half_life_for(edge.stability, half_life_overrides)
-    if math.isinf(hl):
-        decay = 1.0
-    else:
-        decay = math.exp(-math.log(2.0) * delta_days / hl)
-    episode_count = max(1, int(edge.reinforcement_count or 1))
-    recall_count = max(0, int(edge.recall_count or 0))
-    episode_boost = 1.0 + math.log1p(episode_count - 1) / math.log(10.0)
-    recall_boost = 1.0 + min(0.25, math.log1p(recall_count) / 20.0)
-    score = base * decay * episode_boost * recall_boost
-    if score < 0.0:
-        return 0.0
-    if score > 1.0:
-        return 1.0
-    return score
+    _ = half_life_overrides
+    return linear_vitality(edge, now=now)
