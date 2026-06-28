@@ -1,19 +1,4 @@
-"""Reinforcement pass.
-
-For the batch of episodes new since the last cognition pass, scan the
-edges that reference any of those episodes (via ``relates_to.episodes``)
-and update:
-
-- ``reinforcement_count``  -- distinct supporting episodes (len of the
-  ``episodes`` array).
-- ``last_reinforced_at``   -- max(``valid_at``, latest supporting
-  episode's ``reference_time``).
-- ``stability``            -- escalates ``episodic`` -> ``reinforced``
-  (count >= 3) -> ``persistent`` (count >= 7 AND span >= 7d).
-
-The pass is *purely heuristic*; no LLM. It is the cheapest cognition
-component and feeds every later phase, so it always runs.
-"""
+"""Reinforcement pass."""
 
 from __future__ import annotations
 
@@ -21,7 +6,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from surriti.cognition.decay import DEFAULT_RECALL_BOOST, effective_confidence
 from surriti.search import _unwrap
+from surriti.utils import parse_edge
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +23,6 @@ async def reinforce_recent_edges(
     group_id: str,
     episode_uuids: list[str],
 ) -> int:
-    """Update ``reinforcement_count`` / ``last_reinforced_at`` /
-    ``stability`` for every edge whose ``episodes`` array overlaps with
-    the supplied ``episode_uuids``. Returns the number of edges updated.
-    """
-
     if not episode_uuids:
         return 0
 
@@ -59,8 +41,6 @@ async def reinforce_recent_edges(
     if not rows:
         return 0
 
-    # Pull the supporting episodes' reference_times so we can compute
-    # ``last_reinforced_at`` and the time span for stability escalation.
     all_ep_uuids: set[str] = set()
     for row in rows:
         for u in row.get("episodes") or []:
@@ -102,10 +82,6 @@ async def reinforce_recent_edges(
                 stability = "persistent"
             elif count >= _REINFORCED_THRESHOLD:
                 stability = "reinforced" if stability == "episodic" else stability
-                if stability == "reinforced" and count >= _PERSISTENT_THRESHOLD:
-                    # caught in the branch above when span is met; stay
-                    # reinforced otherwise.
-                    pass
 
         await driver.query(
             """
@@ -134,15 +110,6 @@ async def reinforce_edges_on_recall(
     edge_uuids: list[str],
     amount: int = 1,
 ) -> int:
-    """Record recall/use reinforcement for returned memory edges.
-
-    This signal is intentionally separate from ``reinforcement_count``:
-    repeated user assertions and successful retrievals mean different
-    things. Recall reinforcement updates only ``recall_count`` and
-    ``last_recalled_at`` so ranking/analytics can use it without
-    pretending the fact was re-stated in a new episode.
-    """
-
     uuids = list(dict.fromkeys(str(u) for u in edge_uuids if u))
     if not uuids:
         return 0
@@ -151,7 +118,9 @@ async def reinforce_edges_on_recall(
     rows = _unwrap(
         await driver.query(
             """
-            SELECT uuid, recall_count
+            SELECT *,
+                record::id(in)  AS source_node_uuid,
+                record::id(out) AS target_node_uuid
             FROM relates_to
             WHERE group_id = $group_id
               AND uuid IN $uuids;
@@ -164,11 +133,17 @@ async def reinforce_edges_on_recall(
         edge_uuid = row.get("uuid")
         if not edge_uuid:
             continue
+        try:
+            current_score = effective_confidence(parse_edge(row), now=now)
+        except Exception:
+            current_score = float(row.get("decay_score") or 1.0)
+        next_score = max(0.0, min(1.0, current_score + (DEFAULT_RECALL_BOOST * inc)))
         await driver.query(
             """
             UPDATE relates_to SET
                 recall_count = $recall_count,
-                last_recalled_at = $last_recalled_at
+                last_recalled_at = $last_recalled_at,
+                decay_score = $decay_score
             WHERE group_id = $group_id
               AND uuid = $uuid;
             """,
@@ -177,6 +152,7 @@ async def reinforce_edges_on_recall(
                 "uuid": edge_uuid,
                 "recall_count": int(row.get("recall_count") or 0) + inc,
                 "last_recalled_at": now,
+                "decay_score": float(next_score),
             },
         )
         updated += 1
