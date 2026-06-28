@@ -1,15 +1,4 @@
-"""Associative edge weighting.
-
-After reinforcement / decay are refreshed, recompute a composite
-``weight`` on each edge in the group::
-
-    weight = clip(decay_score * (1 + assoc_boost), 0, 4)
-
-where ``assoc_boost`` reflects how many *other* edges share an entity or
-an episode with this one (a coarse proxy for hippocampal associative
-strength). The full N x N co-occurrence matrix is overkill for this
-purpose; we use cheap counts derivable from a single SurrealQL pass.
-"""
+"""Associative edge weighting."""
 
 from __future__ import annotations
 
@@ -21,7 +10,7 @@ from typing import Any
 from surriti.cognition.decay import effective_confidence
 from surriti.edges import EntityEdge
 from surriti.search import _unwrap
-from surriti.utils import _strip_record_id, parse_edge
+from surriti.utils import parse_edge
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +21,13 @@ async def refresh_weights(
     group_id: str,
     half_life_overrides: dict[str, float] | None = None,
 ) -> int:
-    """Recompute ``decay_score`` and ``weight`` for every active edge in
-    ``group_id``. Returns the number of edges updated."""
+    """Recompute composite associative weight for active edges.
+
+    Linear vitality is computed lazily from the edge timestamps.  We update
+    ``weight`` here but intentionally do not materialize ``decay_score`` on
+    every pass; recall reinforcement owns score writes so daily decay is not
+    counted twice between writes.
+    """
 
     rows = _unwrap(
         await driver.query(
@@ -53,7 +47,6 @@ async def refresh_weights(
     edges: list[EntityEdge] = [parse_edge(r) for r in rows]
     now = datetime.now(timezone.utc)
 
-    # Co-occurrence counts: how many edges touch each entity / episode.
     entity_freq: Counter[str] = Counter()
     episode_freq: Counter[str] = Counter()
     for e in edges:
@@ -65,8 +58,6 @@ async def refresh_weights(
     updated = 0
     for e in edges:
         decay = effective_confidence(e, now=now, half_life_overrides=half_life_overrides)
-        # Boost: average co-occurrence frequency of touched entities + episodes
-        # minus self contribution. Bounded for sanity.
         touched = (
             (entity_freq[e.source_node_uuid] - 1)
             + (entity_freq[e.target_node_uuid] - 1)
@@ -75,8 +66,8 @@ async def refresh_weights(
         assoc_boost = min(1.0, touched / 12.0)
         weight = max(0.0, min(4.0, decay * (1.0 + assoc_boost)))
         await driver.query(
-            "UPDATE relates_to SET decay_score = $d, weight = $w WHERE uuid = $u;",
-            {"u": e.uuid, "d": float(decay), "w": float(weight)},
+            "UPDATE relates_to SET weight = $w WHERE uuid = $u;",
+            {"u": e.uuid, "w": float(weight)},
         )
         updated += 1
     logger.debug("refresh_weights: group=%s updated=%d", group_id, updated)
