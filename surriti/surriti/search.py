@@ -1,13 +1,7 @@
-"""Hybrid search over the SurrealDB-backed knowledge graph.
-
-The strategy mirrors Graphiti's edge search: run a vector KNN query and a
-BM25 full-text query in parallel, then fuse the rankings with a configurable
-reranker (RRF, MMR, cross-encoder, node-distance, episode-mentions).
-"""
+"""Hybrid search over the SurrealDB-backed knowledge graph."""
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -33,7 +27,7 @@ from surriti.utils import (
 )
 
 DEFAULT_LIMIT = 10
-RRF_K = 60  # Standard Reciprocal Rank Fusion smoothing constant.
+RRF_K = 60
 
 
 class Reranker(str, Enum):
@@ -51,9 +45,7 @@ class SearchConfig:
     use_vector: bool = True
     use_fulltext: bool = True
     only_valid: bool = True
-    """If True, exclude edges whose ``invalid_at`` / ``expired_at`` are in the past."""
     focal_uuid: str | None = None
-    """Optional entity UUID; results are re-ranked by hop distance to it."""
     reranker: Reranker = Reranker.rrf
     mmr_lambda: float = 0.5
     cross_encoder: CrossEncoderClient | None = None
@@ -62,11 +54,8 @@ class SearchConfig:
     include_communities: bool = False
     filters: SearchFilters | None = None
     decay_aware: bool = False
-    """Multiply post-fusion scores by ``effective_confidence(edge, now)``
-    so reinforced/persistent edges outrank stale ones. Off by default
-    to preserve current ``Surriti.search`` semantics; ``Surriti.recall``
-    opts in."""
     decay_half_life_overrides: dict[str, float] | None = None
+    include_zero_vitality: bool = False
 
 
 @dataclass
@@ -76,7 +65,6 @@ class SearchResults:
     episodes: list[EpisodicNode] = field(default_factory=list)
     communities: list[CommunityNode] = field(default_factory=list)
     scores: dict[str, float] = field(default_factory=dict)
-    """Final fused score per edge UUID."""
 
 
 def _rrf_merge(rankings: list[list[str]], k: int = RRF_K) -> dict[str, float]:
@@ -124,14 +112,6 @@ async def _fulltext_search_edges(
 
 
 def _unwrap(rows: Any) -> list[dict[str, Any]]:
-    """Normalise SurrealDB query results to a flat list of dicts.
-
-    Handles the three shapes returned across SDK versions:
-    - ``[{"result": [...]}, ...]``       (legacy SDK 1.x multi-statement)
-    - ``[[...], ...]``                   (SDK 1.x list-of-lists)
-    - ``[{...}, {...}, ...]`` or ``{...}`` (SDK 2.0 flat result of last stmt)
-    """
-
     if rows is None:
         return []
     if isinstance(rows, dict):
@@ -142,7 +122,6 @@ def _unwrap(rows: Any) -> list[dict[str, Any]]:
         return list(rows)
     if not rows:
         return []
-    # SDK 2.0: flat list of row dicts (no "result" wrapper).
     if all(isinstance(r, dict) and "result" not in r for r in rows):
         return list(rows)
     last = rows[-1]
@@ -163,9 +142,6 @@ def _filter_valid(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if expired_at and expired_at <= now:
             continue
-        # Generic status guard: only "active" edges count as current truth.
-        # Older rows that pre-date the field default to "active" by virtue of
-        # the schema DEFAULT, so this is backwards-compatible.
         status = e.get("status")
         if status is not None and status != "active":
             continue
@@ -195,31 +171,23 @@ async def hybrid_search(
     raw_by_uuid: dict[str, dict[str, Any]] = {}
 
     if cfg.use_vector and query_embedding is not None:
-        vector_hits = await _vector_search_edges(
-            driver, query_embedding, group_id, cfg.candidate_limit
-        )
+        vector_hits = await _vector_search_edges(driver, query_embedding, group_id, cfg.candidate_limit)
         for hit in vector_hits:
             raw_by_uuid.setdefault(hit["uuid"], hit)
         rankings.append([h["uuid"] for h in vector_hits])
 
     if cfg.use_fulltext and query.strip():
-        ft_hits = await _fulltext_search_edges(
-            driver, query, group_id, cfg.candidate_limit
-        )
+        ft_hits = await _fulltext_search_edges(driver, query, group_id, cfg.candidate_limit)
         for hit in ft_hits:
             raw_by_uuid.setdefault(hit["uuid"], hit)
         rankings.append([h["uuid"] for h in ft_hits])
 
     fused = _rrf_merge(rankings)
-
     candidates = [raw_by_uuid[u] for u in fused if u in raw_by_uuid]
     if cfg.only_valid:
         candidates = _filter_valid(candidates)
     candidates = [c for c in candidates if edge_passes_filters(c, cfg.filters)]
 
-    # Ego filter: keep only edges whose source or target is in the
-    # provided uuid set. Used by ``Surriti.recall`` to limit fact
-    # retrieval to the entities mentioned in the user's query.
     if ego_filter:
         ego = set(ego_filter)
         candidates = [
@@ -237,30 +205,29 @@ async def hybrid_search(
         query_embedding=query_embedding,
     )
 
-    # Decay-aware multiplicative rescoring. We apply this *after* the
-    # configured reranker so it never displaces a focal/MMR/CE-driven
-    # ordering -- it only down-weights stale edges within the chosen
-    # candidate set. The fused score map is updated so callers reading
-    # ``SearchResults.scores`` see the same number we ranked by.
     if cfg.decay_aware and candidates:
         from surriti.cognition.decay import effective_confidence
-        from surriti.utils import parse_edge as _pe
 
         now = datetime.now(timezone.utc)
+        kept: list[dict[str, Any]] = []
         for c in candidates:
+            uid = c.get("uuid")
+            if uid is None:
+                continue
             try:
                 eff = effective_confidence(
-                    _pe(c),
+                    parse_edge(c),
                     now=now,
                     half_life_overrides=cfg.decay_half_life_overrides,
                 )
             except Exception:
                 eff = 1.0
-            uid = c.get("uuid")
-            if uid is None:
+            if eff <= 0.0 and not cfg.include_zero_vitality:
+                fused[uid] = 0.0
                 continue
-            base = fused.get(uid, 0.0) or 0.0
-            fused[uid] = float(base) * float(eff)
+            fused[uid] = float(fused.get(uid, 0.0) or 0.0) * float(eff)
+            kept.append(c)
+        candidates = kept
         candidates.sort(key=lambda e: fused.get(e["uuid"], 0.0), reverse=True)
 
     edges = [parse_edge(c) for c in candidates[: cfg.limit]]
@@ -300,7 +267,6 @@ async def _apply_reranker(
         )
     if cfg.reranker is Reranker.episode_mentions:
         return episode_mentions_rerank(candidates, cfg.limit)
-    # Default: RRF fused order
     candidates.sort(key=lambda e: fused.get(e["uuid"], 0.0), reverse=True)
     return candidates
 
@@ -311,13 +277,6 @@ async def _rerank_by_focal_distance(
     focal_uuid: str,
     fused: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
-    """Order candidates by hop distance from the focal entity (closer first).
-
-    Falls back to vector/text fused score when distances tie.
-    """
-
-    # One BFS up to depth 3 from the focal entity, recording each edge's UUID
-    # alongside the depth at which it was discovered.
     surql = """
         LET $focal = (SELECT * FROM entity WHERE uuid = $focal_uuid LIMIT 1)[0];
         RETURN IF $focal == NONE THEN [] ELSE
@@ -353,9 +312,6 @@ def parse_episodes(rows: list[dict[str, Any]]) -> list[EpisodicNode]:
     return [parse_episode(r) for r in rows]
 
 
-# ---------------------------------------------------------------- node / episode search
-
-
 async def _vector_search_nodes(
     driver: SurrealDriver,
     query_embedding: list[float],
@@ -383,8 +339,6 @@ async def _fulltext_search_nodes(
     group_id: str | None,
     limit: int,
 ) -> list[dict[str, Any]]:
-    # The entity FT index covers (name, summary); a single match on `name`
-    # is sufficient for SurrealDB to use it.
     where = "WHERE name @0@ $q"
     if group_id is not None:
         where += " AND group_id = $group_id"
