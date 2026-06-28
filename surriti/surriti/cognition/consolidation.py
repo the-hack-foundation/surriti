@@ -1,20 +1,14 @@
-"""Episodic -> semantic consolidation.
-
-When a single ``fact_key`` accumulates many supporting episodes spanning
-a meaningful time window, mint a single ``memory_class='consolidated'``
-abstraction edge whose ``consolidates`` field lists the supporting edge
-UUIDs. The originals stay queryable for provenance; ``recall()`` will
-prefer the consolidated edge when both surface (Phase E reranking).
-This is the "hippocampus -> cortex" pass.
-"""
+"""Episodic -> semantic consolidation."""
 
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
 from surriti.cognition._writes import upsert_synthetic_edge
+from surriti.cognition.decay import effective_confidence, is_decay_protected
 from surriti.search import _unwrap
 from surriti.utils import parse_edge
 
@@ -29,9 +23,6 @@ async def consolidate(
     threshold: int = 8,
     min_span_days: float = 14.0,
 ) -> int:
-    """Run the consolidation pass for ``group_id``. Returns number of
-    consolidated edges written / refreshed."""
-
     rows = _unwrap(
         await driver.query(
             """
@@ -50,24 +41,15 @@ async def consolidate(
     if not rows:
         return 0
     edges = [parse_edge(r) for r in rows]
-
-    # Group by fact_key.
     buckets: dict[str, list[Any]] = {}
     for e in edges:
-        if not e.fact_key:
-            continue
-        buckets.setdefault(e.fact_key, []).append(e)
+        if e.fact_key:
+            buckets.setdefault(e.fact_key, []).append(e)
 
-    # We also need per-edge supporting-episode timestamps.
     episode_uuids = sorted({u for e in edges for u in (e.episodes or [])})
     ep_times: dict[str, datetime] = {}
     if episode_uuids:
-        ep_rows = _unwrap(
-            await driver.query(
-                "SELECT uuid, reference_time FROM episode WHERE uuid IN $u;",
-                {"u": list(episode_uuids)},
-            )
-        )
+        ep_rows = _unwrap(await driver.query("SELECT uuid, reference_time FROM episode WHERE uuid IN $u;", {"u": list(episode_uuids)}))
         for er in ep_rows:
             t = er.get("reference_time")
             if isinstance(t, str):
@@ -83,7 +65,6 @@ async def consolidate(
     written = 0
     now = datetime.now(timezone.utc)
     for fact_key, bucket in buckets.items():
-        # Combined supporting episode set across all edges sharing the key.
         all_eps: set[str] = set()
         for e in bucket:
             all_eps.update(e.episodes or [])
@@ -92,17 +73,10 @@ async def consolidate(
         ts = [ep_times[u] for u in all_eps if u in ep_times]
         if len(ts) < 2:
             continue
-        span_days = (max(ts) - min(ts)).total_seconds() / 86_400.0
-        if span_days < min_span_days:
+        if (max(ts) - min(ts)).total_seconds() / 86_400.0 < min_span_days:
             continue
-
-        # Strongest edge (highest confidence) provides the canonical
-        # subject/object/predicate/fact for the consolidated row.
         canon = max(bucket, key=lambda e: float(e.confidence or 0))
         avg_conf = sum(float(e.confidence or 0) for e in bucket) / len(bucket)
-
-        # Skip if already consolidated (idempotency via the
-        # ``::consolidated`` qualifier on the fact_key).
         await upsert_synthetic_edge(
             driver,
             embedder,
@@ -122,4 +96,78 @@ async def consolidate(
         )
         written += 1
     logger.debug("consolidate: group=%s written=%d", group_id, written)
+    return written
+
+
+def _summary_text(edges: list[Any]) -> str:
+    facts = [str(e.fact or e.name or "").strip() for e in edges if (e.fact or e.name)]
+    if not facts:
+        return "Low-vitality memory cluster."
+    text = "; ".join(facts[:5])
+    if len(facts) > 5:
+        text += f"; and {len(facts) - 5} related older facts"
+    return f"Low-vitality memory cluster: {text}"
+
+
+async def consolidate_stagnant_edges(
+    driver: Any,
+    embedder: Any,
+    *,
+    group_id: str,
+    min_edges_per_summary: int = 5,
+    max_edges_per_pass: int = 120,
+) -> int:
+    rows = _unwrap(
+        await driver.query(
+            """
+            SELECT *,
+                record::id(in)  AS source_node_uuid,
+                record::id(out) AS target_node_uuid
+            FROM relates_to
+            WHERE group_id = $g
+              AND status = 'active'
+              AND stability != 'consolidated'
+            LIMIT $limit;
+            """,
+            {"g": group_id, "limit": int(max_edges_per_pass)},
+        )
+    )
+    if not rows:
+        return 0
+    now = datetime.now(timezone.utc)
+    buckets: dict[tuple[str, str, str], list[Any]] = defaultdict(list)
+    for row in rows:
+        try:
+            edge = parse_edge(row)
+        except Exception:
+            continue
+        if is_decay_protected(edge) or effective_confidence(edge, now=now) > 0.0:
+            continue
+        key = (edge.source_node_uuid or "unknown", edge.memory_class or "objective", edge.domain or edge.canonical_name or edge.name or "misc")
+        buckets[key].append(edge)
+
+    written = 0
+    for (_, memory_class, bucket_name), bucket in buckets.items():
+        if len(bucket) < min_edges_per_summary:
+            continue
+        canon = bucket[0]
+        await upsert_synthetic_edge(
+            driver,
+            embedder,
+            group_id=group_id,
+            subject_uuid=canon.source_node_uuid,
+            object_uuid=canon.target_node_uuid,
+            predicate=f"archived_summary_{bucket_name}",
+            fact_text=_summary_text(bucket),
+            memory_class="archived_summary",
+            confidence=0.5,
+            supporting_edge_uuids=[e.uuid for e in bucket],
+            consolidates=[e.uuid for e in bucket],
+            stability="consolidated",
+            extra_attrs={"summary_type": "stagnant", "source_memory_class": memory_class, "source_count": len(bucket), "lossy": True},
+            fact_key_qualifier=f"archived::{bucket_name}",
+            now=now,
+        )
+        written += 1
+    logger.debug("consolidate_stagnant_edges: group=%s written=%d", group_id, written)
     return written
