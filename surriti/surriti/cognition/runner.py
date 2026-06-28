@@ -41,7 +41,7 @@ from surriti.cognition.config import CognitionConfig
 
 logger = logging.getLogger("surriti.cognition")
 
-_COGNITION_VERSION = "2026-06-recall-reinforcement"
+_COGNITION_VERSION = "2026-06-linear-vitality"
 
 
 async def run_cognition_pass(
@@ -130,6 +130,17 @@ async def run_cognition_pass(
                 group_id=group_id,
                 threshold=config.consolidation_threshold,
                 min_span_days=config.consolidation_min_span_days,
+            ),
+        )
+    if config.consolidation and getattr(config, "stagnant_consolidation", False):
+        metrics["low_vitality_consolidated"] = await _safe(
+            "low_vitality_consolidation",
+            _consol.consolidate_stagnant_edges(
+                driver,
+                embedder,
+                group_id=group_id,
+                min_edges_per_summary=getattr(config, "stagnant_min_edges_per_summary", 5),
+                max_edges_per_pass=getattr(config, "stagnant_max_edges_per_pass", 120),
             ),
         )
     if (
