@@ -12,7 +12,7 @@ services:
     # `docker compose down -v`.
     command: start --user root --pass root --bind 0.0.0.0:8000 rocksdb:/data/surreal.db
     ports:
-      - "8000:8000"
+      - "18004:8000"
     volumes:
       - surrealdb_data:/data
     restart: unless-stopped
@@ -21,64 +21,6 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-
-  vllm:
-    image: vllm/vllm-openai:v0.18.0
-    container_name: surriti-vllm
-    ipc: host
-    # Host port 8001 to avoid colliding with surrealdb on 8000.
-    # Inside the docker network myapp reaches vllm at http://vllm:8000.
-    ports:
-      - "8001:8000"
-    environment:
-      - HF_TOKEN=${HF_TOKEN:-}
-      - HF_HOME=/root/.cache/huggingface
-      - VLLM_ENABLE_CUDA_COMPATIBILITY=0
-      - CUDA_MODULE_LOADING=LAZY
-      - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      - VLLM_IMAGE_FETCH_TIMEOUT=30
-      - VLLM_VIDEO_FETCH_TIMEOUT=120
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    command:
-      - "${MODEL_ID:-Qwen/Qwen3.5-4B}"
-      - --host
-      - "0.0.0.0"
-      - --port
-      - "8000"
-      - --served-model-name
-      - "${MODEL_ID:-Qwen/Qwen3.5-4B}"
-      - --dtype
-      - "float16"
-      - --enable-auto-tool-choice
-      - --tool-call-parser
-      - "hermes"
-      - --load-format
-      - "bitsandbytes"
-      - --quantization
-      - "bitsandbytes"
-      - --model-loader-extra-config
-      - '{"load_in_4bit":true,"bnb_4bit_quant_type":"nf4","bnb_4bit_compute_dtype":"float16","bnb_4bit_use_double_quant":false}'
-      - --max-model-len
-      - "16384"
-      - --gpu-memory-utilization
-      - "0.65"
-      - --enforce-eager
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    healthcheck:
-      # /v1/models returns 200 once the engine has finished loading.
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models > /dev/null || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 60
-      start_period: 600s
 
   myapp:
     build:
@@ -89,8 +31,9 @@ services:
       - "3000:3000"
     environment:
       PORT: "3000"
-      VLLM_BASE_URL: "http://vllm:8000/v1"
-      VLLM_MODEL:    "${MODEL_ID:-Qwen/Qwen3.5-4B}"
+      VLLM_BASE_URL: "http://192.168.122.1:7100/v1"
+      EMBED_BASE_URL: "http://192.168.122.1:7100/v1"
+      VLLM_MODEL:    "RedHatAI/Qwen3.6-35B-A3B-NVFP4"
       EMBED_MODEL:   "nomic-ai/nomic-embed-text-v1.5"
       EMBED_DIM:     "768"
       SURRITI_SURREAL_URL:  "ws://surrealdb:8000/rpc"
@@ -102,8 +45,6 @@ services:
     depends_on:
       surrealdb:
         condition: service_healthy
-      vllm:
-        condition: service_healthy
     restart: unless-stopped
 
   visualizer:
@@ -112,11 +53,11 @@ services:
       dockerfile: visualizer/Dockerfile
     container_name: visualizer
     ports:
-      - "7200:8000"
+      - "18005:8000"
     environment:
       - SURRITI_SURREAL_URL=ws://surrealdb:8000/rpc
-      - SURRITI_SURREAL_NS=${SURRITI_SURREAL_NS:-surriti}
-      - SURRITI_SURREAL_DB=${SURRITI_SURREAL_DB:-legba}
+      - SURRITI_SURREAL_NS=${SURRITI_SURREAL_NS:-myapp}
+      - SURRITI_SURREAL_DB=${SURRITI_SURREAL_DB:-myapp}
       - SURRITI_SURREAL_USER=${SURRITI_SURREAL_USER:-root}
       - SURRITI_SURREAL_PASS=${SURRITI_SURREAL_PASS:-root}
     depends_on:

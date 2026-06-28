@@ -61,6 +61,34 @@ async def find_similar_edges(
     if fact:
         rows.extend(await _fulltext_search_edges(driver, fact, group_id, limit))
 
+    # Fallback: when vector and fulltext searches return nothing (common with
+    # DummyEmbedder or very short facts), sweep active edges scoped to the
+    # same subject/object so the contradiction LLM gets a relevant pool rather
+    # than every edge in the group.
+    if not rows:
+        conditions = [
+            'group_id = $group_id',
+            'status = "active"',
+            "invalid_at IS NONE",
+        ]
+        params: dict = {"group_id": group_id, "limit": limit * 2}
+        if co_subject_uuid:
+            conditions.append('in = type::record("entity", $subj)')
+            params["subj"] = co_subject_uuid
+        if co_object_uuid:
+            conditions.append('out = type::record("entity", $obj)')
+            params["obj"] = co_object_uuid
+        rows = _unwrap(
+            await driver.query(
+                f"""
+                SELECT * FROM relates_to
+                WHERE {" AND ".join(conditions)}
+                LIMIT $limit;
+                """,
+                params,
+            )
+        )
+
     if co_object_uuid:
         co_rows = _unwrap(
             await driver.query(
@@ -165,6 +193,7 @@ async def resolve_contradictions(
         fact_embedding=new_fact_embedding,
         group_id=group_id,
         limit=similarity_limit,
+        co_subject_uuid=new_subject_uuid,
         co_object_uuid=new_object_uuid,
     )
     # Never let a candidate include the new edge itself, or any edge

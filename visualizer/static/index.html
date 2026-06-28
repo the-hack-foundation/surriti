@@ -144,6 +144,106 @@
           <input id="asOfSlider" type="range" min="0" max="100" value="100" disabled>
         </section>
 
+        <details id="layoutPanel" class="filter-group" open>
+          <summary>Layout</summary>
+          <div class="layout-controls">
+            <label class="layout-row">
+              <span>Leaf distance</span>
+              <span class="muted" data-layout-value="leafDistance">68</span>
+              <input type="range" min="30" max="200" step="1" value="68" data-layout-key="leafDistance">
+            </label>
+            <label class="layout-row">
+              <span>Normal distance</span>
+              <span class="muted" data-layout-value="normalDistance">120</span>
+              <input type="range" min="60" max="300" step="1" value="120" data-layout-key="normalDistance">
+            </label>
+            <label class="layout-row">
+              <span>Nexus distance</span>
+              <span class="muted" data-layout-value="hubDistance">280</span>
+              <input type="range" min="100" max="600" step="5" value="280" data-layout-key="hubDistance">
+            </label>
+            <label class="layout-row">
+              <span>Hub degree threshold</span>
+              <span class="muted" data-layout-value="hubDegree">7</span>
+              <input type="range" min="2" max="20" step="1" value="7" data-layout-key="hubDegree">
+            </label>
+            <label class="layout-row">
+              <span>Parallel spread</span>
+              <span class="muted" data-layout-value="multiEdgeSpread">0.22</span>
+              <input type="range" min="0" max="1.5" step="0.01" value="0.22" data-layout-key="multiEdgeSpread">
+            </label>
+            <label class="layout-row">
+              <span>Curve spread</span>
+              <span class="muted" data-layout-value="curveSpread">16</span>
+              <input type="range" min="6" max="40" step="1" value="16" data-layout-key="curveSpread">
+            </label>
+            <label class="layout-row">
+              <span>Repulsion</span>
+              <span class="muted" data-layout-value="charge">280</span>
+              <input type="range" min="80" max="900" step="5" value="280" data-layout-key="charge">
+            </label>
+            <label class="layout-row">
+              <span>Hub repulsion</span>
+              <span class="muted" data-layout-value="hubCharge">760</span>
+              <input type="range" min="200" max="2000" step="10" value="760" data-layout-key="hubCharge">
+            </label>
+            <label class="layout-row">
+              <span>Collision padding</span>
+              <span class="muted" data-layout-value="collisionPadding">12</span>
+              <input type="range" min="2" max="64" step="1" value="12" data-layout-key="collisionPadding">
+            </label>
+            <label class="layout-row">
+              <span>Hub collision pad</span>
+              <span class="muted" data-layout-value="hubCollisionPadding">48</span>
+              <input type="range" min="10" max="120" step="1" value="48" data-layout-key="hubCollisionPadding">
+            </label>
+            <label class="layout-row">
+              <span>Leaf orbit</span>
+              <span class="muted" data-layout-value="leafOrbitStrength">0.160</span>
+              <input type="range" min="0" max="0.5" step="0.005" value="0.16" data-layout-key="leafOrbitStrength">
+            </label>
+            <label class="layout-row">
+              <span>Leaf orbit radius</span>
+              <span class="muted" data-layout-value="leafOrbitRadius">82</span>
+              <input type="range" min="40" max="200" step="1" value="82" data-layout-key="leafOrbitRadius">
+            </label>
+            <label class="layout-row">
+              <span>Leaf fan spread</span>
+              <span class="muted" data-layout-value="leafFanSpread">1.80</span>
+              <input type="range" min="0.3" max="4" step="0.05" value="1.8" data-layout-key="leafFanSpread">
+            </label>
+            <label class="layout-row">
+              <span>Hub repel strength</span>
+              <span class="muted" data-layout-value="hubRepelStrength">0.95</span>
+              <input type="range" min="0" max="2" step="0.05" value="0.95" data-layout-key="hubRepelStrength">
+            </label>
+            <label class="layout-row">
+              <span>Edge avoidance</span>
+              <span class="muted" data-layout-value="edgeAvoidance">0.45</span>
+              <input type="range" min="0" max="1.5" step="0.05" value="0.45" data-layout-key="edgeAvoidance">
+            </label>
+            <label class="layout-row">
+              <span>Edge clearance</span>
+              <span class="muted" data-layout-value="edgeAvoidanceDistance">30</span>
+              <input type="range" min="10" max="80" step="1" value="30" data-layout-key="edgeAvoidanceDistance">
+            </label>
+            <label class="layout-row">
+              <span>Gravity</span>
+              <span class="muted" data-layout-value="gravity">0.020</span>
+              <input type="range" min="0.001" max="0.08" step="0.001" value="0.02" data-layout-key="gravity">
+            </label>
+            <div class="action-row layout-actions">
+              <button id="layoutResetBtn" type="button">Reset layout</button>
+              <button id="layoutSaveBtn" type="button">Save layout</button>
+            </div>
+            <div class="action-row layout-actions">
+              <button id="layoutExportBtn" type="button">Export layout</button>
+              <button id="layoutImportBtn" type="button">Import layout</button>
+              <input id="layoutImportInput" type="file" accept="application/json" hidden>
+            </div>
+          </div>
+        </details>
+
         <section class="metrics" aria-label="Graph metrics">
           <div><span id="nodeCount">0</span><small>nodes</small></div>
           <div><span id="linkCount">0</span><small>edges</small></div>

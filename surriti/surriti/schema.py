@@ -40,6 +40,8 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     -- legacy rows simply read empty defaults.
     DEFINE FIELD IF NOT EXISTS affect            ON episode TYPE object FLEXIBLE DEFAULT {{}};
     DEFINE FIELD IF NOT EXISTS interaction_pattern ON episode TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS cognition_processed_at ON episode TYPE option<datetime>;
+    DEFINE FIELD IF NOT EXISTS cognition_version      ON episode TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS episode_uuid_idx     ON episode FIELDS uuid UNIQUE;
     DEFINE INDEX IF NOT EXISTS episode_group_idx    ON episode FIELDS group_id;
     DEFINE INDEX IF NOT EXISTS episode_content_fts  ON episode FIELDS content
@@ -62,8 +64,8 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     DEFINE FIELD IF NOT EXISTS aliases           ON entity TYPE array<string> DEFAULT [];
     DEFINE FIELD IF NOT EXISTS profile_summary   ON entity TYPE string DEFAULT "";
     DEFINE FIELD IF NOT EXISTS profile_embedding ON entity TYPE option<array<float>>;
-    DEFINE FIELD IF NOT EXISTS salience          ON entity TYPE float DEFAULT 0;
-    DEFINE FIELD IF NOT EXISTS mention_count     ON entity TYPE int DEFAULT 0;
+    DEFINE FIELD OVERWRITE salience          ON entity TYPE option<float> DEFAULT 0;
+    DEFINE FIELD OVERWRITE mention_count     ON entity TYPE option<int> DEFAULT 0;
     DEFINE FIELD IF NOT EXISTS last_seen_at      ON entity TYPE option<datetime>;
     DEFINE FIELD IF NOT EXISTS merged_into       ON entity TYPE option<string>;
     -- Cognitive layer (additive). All optional / cached / safe defaults.
@@ -173,10 +175,12 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     -- rows load forward without backfill. Populated lazily by
     -- ``surriti.cognition`` (reinforcement / decay / consolidation /
     -- belief / affect passes) and read by recall + rerankers.
-    DEFINE FIELD IF NOT EXISTS weight             ON relates_to TYPE float DEFAULT 1.0;
-    DEFINE FIELD IF NOT EXISTS reinforcement_count ON relates_to TYPE int DEFAULT 1;
+    DEFINE FIELD OVERWRITE weight             ON relates_to TYPE option<float> DEFAULT 1.0;
+    DEFINE FIELD OVERWRITE reinforcement_count ON relates_to TYPE option<int> DEFAULT 1;
     DEFINE FIELD IF NOT EXISTS last_reinforced_at  ON relates_to TYPE option<datetime>;
-    DEFINE FIELD IF NOT EXISTS decay_score          ON relates_to TYPE float DEFAULT 1.0;
+    DEFINE FIELD OVERWRITE recall_count        ON relates_to TYPE option<int> DEFAULT 0;
+    DEFINE FIELD IF NOT EXISTS last_recalled_at    ON relates_to TYPE option<datetime>;
+    DEFINE FIELD OVERWRITE decay_score          ON relates_to TYPE option<float> DEFAULT 1.0;
     DEFINE FIELD IF NOT EXISTS stability            ON relates_to TYPE string DEFAULT "episodic";
     DEFINE FIELD IF NOT EXISTS valence              ON relates_to TYPE option<float>;
     DEFINE FIELD IF NOT EXISTS intensity            ON relates_to TYPE option<float>;
@@ -232,6 +236,7 @@ ALL_TABLES: tuple[str, ...] = (
     "entity",
     "entity_alias",
     "community",
+    "relation_frame",
 )
 
 
@@ -267,7 +272,7 @@ async def backfill_fact_keys(driver) -> int:
             )
         )
         await driver.query(
-            "UPDATE relates_to SET fact_key = $key WHERE uuid = $uuid;",
+            "UPDATE relates_to SET fact_key = $key WHERE uuid = $uuid",
             {"key": key, "uuid": row.get("uuid")},
         )
         updated += 1

@@ -1,7 +1,6 @@
 # Build context is the parent directory; keep it tight.
 # Only `legba/`, `surriti/`, and `visualizer/` are needed by the Dockerfiles.
 graphiti/
-myapp/
 frontend/
 **/.git/
 **/__pycache__/

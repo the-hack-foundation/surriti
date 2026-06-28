@@ -47,6 +47,7 @@ from pydantic import BaseModel
 
 from surriti import Surriti
 from surriti.driver import SurrealDriver
+from surriti.embedder import OpenAIEmbedder
 from surriti.llm_clients import OpenAILLMClient
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -55,8 +56,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://vllm:8000/v1").rstrip("/")
-VLLM_MODEL    = os.environ.get("VLLM_MODEL", "Qwen/Qwen3.5-4B")
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://192.168.122.1:8001/v1").rstrip("/")
+EMBED_BASE_URL = os.environ.get("EMBED_BASE_URL", "http://192.168.122.1:7100/v1").rstrip("/")
+VLLM_MODEL    = os.environ.get("VLLM_MODEL", "RedHatAI/Qwen3.6-35B-A3B-NVFP4")
 EMBED_MODEL   = os.environ.get("EMBED_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 EMBED_DIM     = int(os.environ.get("EMBED_DIM", "768"))
 PORT          = int(os.environ.get("PORT", "3000"))
@@ -73,9 +75,9 @@ _CHAT_EXTRA_BODY: dict = {
 # already gates startup on vLLM. Override via env if running standalone.
 VLLM_WAIT_S   = float(os.environ.get("VLLM_WAIT_S", "30"))
 
-SURREAL_URL  = os.environ.get("SURRITI_SURREAL_URL",  "ws://surrealdb:8000/rpc")
-SURREAL_NS   = os.environ.get("SURRITI_SURREAL_NS",   "myapp")
-SURREAL_DB   = os.environ.get("SURRITI_SURREAL_DB",   "myapp")
+SURREAL_URL  = os.environ.get("SURRITI_SURREAL_URL",  "ws://localhost:18004/rpc")
+SURREAL_NS   = os.environ.get("SURRITI_SURREAL_NS",   "surriti")
+SURREAL_DB   = os.environ.get("SURRITI_SURREAL_DB",   "surriti")
 # WARNING: "root"/"root" are dev/local defaults only. Set these env vars to
 # strong credentials before any non-local deployment.
 SURREAL_USER = os.environ.get("SURRITI_SURREAL_USER", "root")
@@ -158,7 +160,11 @@ async def lifespan(app: FastAPI):
         log.warning("vLLM readiness wait failed: %s -- continuing anyway.", exc)
 
     try:
-        embedder = FastEmbedEmbedder(EMBED_MODEL, EMBED_DIM)
+        embedder = OpenAIEmbedder(
+            model=EMBED_MODEL,
+            embedding_dim=EMBED_DIM,
+            base_url=EMBED_BASE_URL,
+        )
         llm_client = OpenAILLMClient(
             model=VLLM_MODEL, client=_oa, extra_body=_CHAT_EXTRA_BODY,
         )
@@ -171,8 +177,8 @@ async def lifespan(app: FastAPI):
         await mem.connect()
         _memory = mem
         log.info(
-            "Surriti memory connected to %s (model=%s embed=%s dim=%d)",
-            SURREAL_URL, VLLM_MODEL, EMBED_MODEL, EMBED_DIM,
+            "Surriti memory connected to %s (llm=%s @ %s  embed=%s @ %s  dim=%d)",
+            SURREAL_URL, VLLM_MODEL, VLLM_BASE_URL, EMBED_MODEL, EMBED_BASE_URL, EMBED_DIM,
         )
     except Exception as exc:  # pragma: no cover - integration path
         log.warning("Surriti memory unavailable (%s) -- running without memory.", exc)
@@ -209,6 +215,33 @@ class SendRequest(BaseModel):
     # Accepted but ignored; kept for CLI compatibility.
     mode: str | None = None
     files: list[dict] | None = None
+
+
+class RecallRequest(BaseModel):
+    query: str
+    user_id: str = "default"
+    limit: int = 10
+
+
+class RecallResponse(BaseModel):
+    facts: list[dict] = []
+    entities: list[dict] = []
+
+
+class StoreRequest(BaseModel):
+    content: str
+    user_id: str = "default"
+    name: str = "chat"
+    source_type: str = "user"
+    source_description: str = ""
+
+
+class StoreResponse(BaseModel):
+    episode_uuid: str = ""
+    entities_added: int = 0
+    edges_added: int = 0
+    invalidated: int = 0
+    new_facts: list[dict] = []
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +525,83 @@ async def websocket_endpoint(ws: WebSocket, session_id: str) -> None:
         log.info("WebSocket disconnected: session=%s", session_id)
     finally:
         _sessions.pop(session_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints -- pure memory ops (used by Hermes memory provider plugin)
+# ---------------------------------------------------------------------------
+@app.post("/recall", response_model=RecallResponse)
+async def recall(req: RecallRequest) -> RecallResponse:
+    """Pure recall — search the graph, return facts and entities.
+
+    No LLM call, no episode storage. Used by external agents that
+    handle their own generation and just need memory context.
+    """
+    if _memory is None:
+        return RecallResponse()
+    try:
+        results = await _memory.search(req.query, group_id=req.user_id, limit=req.limit)
+    except Exception as exc:
+        log.warning("Recall failed: %s", exc)
+        return RecallResponse()
+    names = _node_index(results.nodes)
+    facts = [_edge_view(e, names, results.scores.get(e.uuid))
+             for e in results.edges[:req.limit]
+             if e.fact and not e.invalid_at]
+    entities = [_node_view(n) for n in results.nodes[:req.limit]]
+    return RecallResponse(facts=facts, entities=entities)
+
+
+@app.post("/store", response_model=StoreResponse)
+async def store(req: StoreRequest) -> StoreResponse:
+    """Pure ingest — extract entities/facts and persist as an episode.
+
+    No LLM chat response. Used by external agents to push completed
+    turns into memory.
+    """
+    if _memory is None:
+        return StoreResponse()
+    try:
+        prev_uuids: list[str] = []
+        try:
+            prev = await _memory.retrieve_episodes(
+                group_ids=[req.user_id], last_n=4,
+            )
+            prev_uuids = [p.uuid for p in prev]
+        except Exception as exc:
+            log.warning("retrieve_episodes failed: %s", exc)
+
+        speaker_name: str | None = None
+        try:
+            un = await _memory.upsert_user(group_id=req.user_id)
+            speaker_name = (un.attributes or {}).get("display_name")
+        except Exception as exc:
+            log.warning("upsert_user failed: %s", exc)
+
+        stored = await _memory.add_episode(
+            name=req.name,
+            episode_body=req.content,
+            group_id=req.user_id,
+            source_description=req.source_description,
+            previous_episode_uuids=prev_uuids or None,
+            custom_extraction_instructions=EXTRACTION_INSTRUCTIONS,
+            speaker_id=req.user_id,
+            speaker_name=speaker_name,
+            source_type=req.source_type,
+        )
+        await _bootstrap_display_name(req.user_id, stored, current=speaker_name)
+    except Exception as exc:
+        log.warning("Store failed: %s", exc)
+        return StoreResponse()
+
+    names = _node_index(stored.nodes)
+    return StoreResponse(
+        episode_uuid=stored.episode.uuid,
+        entities_added=len(stored.nodes),
+        edges_added=len(stored.edges),
+        invalidated=len(stored.invalidated_edges),
+        new_facts=[_edge_view(e, names) for e in stored.edges],
+    )
 
 
 # ---------------------------------------------------------------------------

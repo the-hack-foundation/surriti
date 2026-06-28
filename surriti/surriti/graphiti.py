@@ -7,7 +7,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from surriti.driver import SurrealDriver
@@ -23,7 +23,6 @@ from surriti.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
 from surriti.relation_frames import (
     RelationFrame,
     RelationFrameRegistry,
-    make_slot_key,
     normalize_symmetric,
     qualifier_hash,
 )
@@ -38,10 +37,13 @@ from surriti.search import (
 )
 from surriti.search_filters import SearchFilters
 from surriti.temporal import invalidate_edges, resolve_contradictions
-from surriti.utils import parse_community, parse_edge, parse_entity, parse_episode
+from surriti.utils import parse_edge, parse_entity, parse_episode
 from surriti.validators import IDENTITY_PREDICATES, repair_fact
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from surriti.cognition import CognitionConfig, CognitionScheduler
 
 
 def _entity_name_key(name: str) -> str:
@@ -120,6 +122,11 @@ class MemoryContext:
     """Per-group prediction bundle (likely topics / preferences /
     questions) emitted by the cognitive layer. Only populated at
     ``depth='deep'``."""
+    self_model: dict | None = None
+    """Structured self-model (traits, beliefs, patterns) for the
+    assistant. Populated when ``self_awareness`` cognition is enabled.
+    Render into system prompts so the assistant is aware of its own
+    patterns."""
 
 
 class Surriti:
@@ -283,6 +290,7 @@ class Surriti:
                 config=self._cognition_config,
             )
             self._cognition.start()
+            await self._cognition.recover_pending_episodes()
         return self
 
     async def close(self) -> None:
@@ -1037,6 +1045,11 @@ class Surriti:
         group_id: str | None = None,
         config: SearchConfig | None = None,
         return_results: bool | None = None,
+        # Convenience kwargs that map to SearchConfig fields
+        limit: int | None = None,
+        depth: str | None = None,
+        rerank_strategy: str | None = None,
+        only_valid: bool | None = None,
     ) -> SearchResults | list[EntityEdge]:
         """Hybrid (vector + BM25) search over EntityEdge facts.
 
@@ -1044,7 +1057,19 @@ class Surriti:
         calls that use ``group_ids`` / ``num_results`` / ``search_filter`` /
         ``center_node_uuid`` return the edge list unless ``return_results`` is
         explicitly set.
+
+        Convenience kwargs (mapped to SearchConfig):
+
+        * ``limit`` – maximum results to return
+        * ``depth`` – search depth: ``"fast"`` (limit=10), ``"normal"`` (limit=25),
+          ``"deep"`` (limit=50, includes community search)
+        * ``rerank_strategy`` – reranker name: ``"rrf"``, ``"mmr"``,
+          ``"cross_encoder"``, ``"node_distance"``, ``"episode_mentions"``
+        * ``only_valid`` – when True, exclude edges whose ``invalid_at`` /
+          ``expired_at`` are in the past
         """
+
+        from surriti.search import Reranker
 
         graphiti_style = any(
             value is not None
@@ -1054,12 +1079,25 @@ class Surriti:
         cfg = config or SearchConfig()
         if num_results is not None:
             cfg.limit = num_results
+        if limit is not None:
+            cfg.limit = limit
         if center_node_uuid is not None:
             cfg.focal_uuid = center_node_uuid
         if search_filter is not None:
             cfg.filters = search_filter
         if cfg.cross_encoder is None:
             cfg.cross_encoder = self.cross_encoder
+        # Map convenience kwargs
+        if only_valid is not None:
+            cfg.only_valid = only_valid
+        if rerank_strategy is not None:
+            try:
+                cfg.reranker = Reranker(rerank_strategy)
+            except ValueError:
+                pass  # keep default reranker
+        if depth is not None:
+            depth_map = {"fast": 10, "normal": 25, "deep": 50}
+            cfg.limit = depth_map.get(depth, cfg.limit)
         effective_group_id = group_id
         if effective_group_id is None and group_ids:
             effective_group_id = group_ids[0]
@@ -1150,6 +1188,9 @@ class Surriti:
         limit: int = 20,
         include_invalid: bool = False,
         memory_classes: list[str] | None = None,
+        # Convenience kwargs for test / API compatibility
+        include_edges: bool = False,
+        include_entities: bool = False,
     ) -> "MemoryContext":
         """Build a query-focused memory context.
 
@@ -1175,6 +1216,11 @@ class Surriti:
         label them as historical so the LLM does not treat them as current
         truth.  Useful for queries like "where did X previously work?"
         where the *old* fact is exactly what is wanted.
+
+        ``include_edges`` / ``include_entities``: compatibility flags.
+        ``include_edges`` has no effect (edges are always returned as
+        ``facts``).  ``include_entities`` is a no-op for now; entity
+        resolution is always performed.
         """
 
         from surriti.entity_resolution import resolve_entity_mentions
@@ -1251,7 +1297,11 @@ class Surriti:
             candidate_limit=max(limit * 4, 40),
             only_valid=not include_invalid,
             filters=_filters,
-            decay_aware=True,
+            decay_aware=(
+                self._cognition_config.enabled
+                and self._cognition_config.decay_aware_recall
+            ),
+            decay_half_life_overrides=self._cognition_config.decay_half_life_days,
         )
         edge_results = await hybrid_search(
             self.driver,
@@ -1262,6 +1312,7 @@ class Surriti:
             ego_filter=ego_uuids if ego_uuids else None,
         )
         facts = edge_results.edges
+        await self._reinforce_recalled_edges(group_id=group_id, facts=facts)
 
         # Fallback: when caller asked for specific memory_classes but the
         # hybrid search produced nothing (e.g. empty query string used for
@@ -1288,6 +1339,7 @@ class Surriti:
                 )
             )
             facts = [parse_edge(r) for r in rows]
+            await self._reinforce_recalled_edges(group_id=group_id, facts=facts)
 
         episodes: list[EpisodicNode] = []
         communities: list[CommunityNode] = []
@@ -1346,6 +1398,16 @@ class Surriti:
         except Exception:
             logger.exception("recall: trait/goal sidecar load failed")
 
+        # Self-model sidecar. When self_awareness cognition is enabled,
+        # read the assistant's self-entity (assistant_{group_id}) and
+        # pull its structured self-model (traits, beliefs, patterns).
+        self_model: dict | None = None
+        try:
+            if self._cognition_config and self._cognition_config.self_awareness:
+                self_model = await self.get_self_model(group_id=group_id)
+        except Exception:
+            logger.exception("recall: self-model load failed")
+
         return MemoryContext(
             query=query,
             profiles=profiles,
@@ -1355,6 +1417,7 @@ class Surriti:
             traits=traits,
             goals=goals,
             prediction=prediction,
+            self_model=self_model,
             resolved_entities=[
                 {
                     "mention": r.mention.name,
@@ -1367,6 +1430,25 @@ class Surriti:
                 if r.canonical_uuid is not None
             ],
         )
+
+    async def _reinforce_recalled_edges(
+        self,
+        *,
+        group_id: str,
+        facts: list[EntityEdge],
+    ) -> None:
+        if not facts or not self._cognition_config.enabled:
+            return
+        try:
+            from surriti.cognition.reinforcement import reinforce_edges_on_recall
+
+            await reinforce_edges_on_recall(
+                self.driver,
+                group_id=group_id,
+                edge_uuids=[f.uuid for f in facts if f.uuid],
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("recall: recall reinforcement failed")
 
     async def get_nodes_and_edges_by_episode(
         self, episode_uuids: list[str]
@@ -1779,7 +1861,6 @@ class Surriti:
         # ------------------------------------------------------------------
         from surriti.entity_resolution import (
             ResolvedEntity,
-            normalize_alias,
             resolve_entity_mentions,
         )
 
@@ -1944,10 +2025,10 @@ class Surriti:
         await self.driver.query(
             """
             UPDATE relates_to
-            SET in = type::record("entity", $canonical), source_node_uuid = $canonical
+            SET in = type::record("entity", $canonical)
             WHERE group_id = $group_id AND record::id(in) IN $aliases;
             UPDATE relates_to
-            SET out = type::record("entity", $canonical), target_node_uuid = $canonical
+            SET out = type::record("entity", $canonical)
             WHERE group_id = $group_id AND record::id(out) IN $aliases;
             UPDATE mentions
             SET out = type::record("entity", $canonical)
@@ -2891,6 +2972,356 @@ class Surriti:
             )
             edges.append(ee)
         return edges
+
+
+    # ------------------------------------------------------------------
+    # Self-awareness API
+    # ------------------------------------------------------------------
+
+    async def add_self_episode(
+        self,
+        *,
+        episode_type: EpisodeType,
+        content: str,
+        group_id: str = "",
+        name: str | None = None,
+        reference_time: datetime | None = None,
+    ) -> AddEpisodeResults:
+        """Store a self-referential episode for operational self-awareness.
+
+        Self-episodes are stored in the universal memory graph alongside
+        world/user facts, but are flagged with a special source type so the
+        cognition layer can process them differently (self-model extraction,
+        pattern detection, belief refinement).
+
+        Supported types:
+        - ``self_observation`` — explicit reflection ("I was too verbose")
+        - ``self_correction`` — noticing a mistake
+        - ``self_success`` — noticing a win
+        - ``self_pattern`` — recurring behavioral trend
+
+        Parameters
+        ----------
+        episode_type : EpisodeType
+            One of the self-episode types from EpisodeType enum.
+        content : str
+            The self-observation content.
+        group_id : str
+            Tenant/group ID for isolation.
+        name : str | None
+            Optional episode name. Defaults to f"self_{episode_type.value}".
+        reference_time : datetime | None
+            Optional timestamp. Defaults to now.
+
+        Returns
+        -------
+        AddEpisodeResults with the stored episode and any derived entities/edges.
+        """
+        if episode_type not in (
+            EpisodeType.self_observation,
+            EpisodeType.self_correction,
+            EpisodeType.self_success,
+            EpisodeType.self_pattern,
+        ):
+            raise ValueError(
+                f"Invalid episode_type {episode_type!r}. "
+                f"Must be one of: self_observation, self_correction, "
+                f"self_success, self_pattern"
+            )
+
+        episode_name = name or f"self_{episode_type.value}"
+        ref_time = reference_time or datetime.now(timezone.utc)
+
+        episode = EpisodicNode(
+            uuid=str(uuid4()),
+            name=episode_name,
+            content=content,
+            source=episode_type,
+            source_description=f"self_{episode_type.value}",
+            reference_time=ref_time,
+            group_id=group_id,
+        )
+        await self._save_episode(episode)
+
+        # Extract self-referential entities/facts via LLM
+        extraction = await self.llm.extract(
+            content,
+            group_id=group_id,
+            custom_instructions=(
+                "This is a SELF-REFERENTIAL episode about the AI assistant's "
+                "own behavior, not about the user or the world. Extract facts "
+                "about the assistant's behavior, patterns, or self-assessment. "
+                "Do NOT extract facts about external entities or world knowledge."
+            ),
+        )
+
+        edges: list[EntityEdge] = []
+
+        # Create/update the assistant self-entity and every extracted
+        # object through the normal entity path so RELATE endpoints always
+        # point at persisted rows.
+        self_entity_name = f"assistant_{group_id}" if group_id else "assistant"
+        entity_inputs = [
+            ExtractedEntity(
+                name=self_entity_name,
+                summary=f"Self-referential entity for group {group_id or 'default'}",
+                labels=["SelfEntity", "Assistant"],
+            ),
+            *extraction.entities,
+        ]
+        for fact in extraction.facts:
+            if fact.object:
+                entity_inputs.append(ExtractedEntity(name=fact.object, labels=["Entity"]))
+
+        entities = await self._upsert_entities(
+            entity_inputs,
+            group_id=group_id,
+            episode_uuid=episode.uuid,
+            episode_context=content,
+        )
+        entity_by_key = {_entity_name_key(e.name): e for e in entities}
+        self_entity = entity_by_key[_entity_name_key(self_entity_name)]
+
+        # Create fact edges for each extracted self-fact
+        for fact in extraction.facts:
+            obj = entity_by_key.get(_entity_name_key(fact.object))
+            if obj is None:
+                logger.debug(
+                    "Skipping self-fact with unresolved object %r", fact.object
+                )
+                continue
+            fact.subject = self_entity_name
+            edge, invalidated = await self._add_fact_edge(
+                fact=fact,
+                subject=self_entity,
+                obj=obj,
+                episode=episode,
+                group_id=group_id,
+                source_type="assistant",
+            )
+            edges.append(edge)
+            if invalidated:
+                edges.extend(invalidated)
+
+        # Link episode to self-entity
+        episodic_edges = await self._link_mentions(
+            episode=episode,
+            entities=[self_entity],
+            group_id=group_id,
+        )
+
+        return AddEpisodeResults(
+            episode=episode,
+            episodic_edges=episodic_edges,
+            nodes=entities,
+            edges=edges,
+        )
+
+    async def get_self_model(
+        self,
+        *,
+        group_id: str,
+        include_traits: bool = True,
+        include_patterns: bool = True,
+        include_beliefs: bool = True,
+    ) -> dict[str, Any]:
+        """Return the current self-model for a group.
+
+        The self-model is a synthesized view of the assistant's own
+        behavior patterns, traits, beliefs, and goals derived from
+        self-episodes stored via :meth:`add_self_episode`.
+
+        Parameters
+        ----------
+        group_id : str
+            Tenant/group ID.
+        include_traits : bool
+            Include synthesized trait entities.
+        include_patterns : bool
+            Include interaction pattern analysis.
+        include_beliefs : bool
+            Include belief edges (subjective self-assessments).
+
+        Returns
+        -------
+        Dict with keys: traits, patterns, beliefs, goals, summary.
+        """
+        from surriti.search import _unwrap
+
+        result: dict[str, Any] = {
+            "group_id": group_id,
+            "traits": [],
+            "patterns": [],
+            "beliefs": [],
+            "goals": [],
+            "summary": "",
+        }
+
+        # 1. Trait entities tied to the self-entity
+        if include_traits:
+            self_entity = await self._get_entity_by_name(
+                name=f"assistant_{group_id}" if group_id else "assistant",
+                group_id=group_id,
+            )
+            if self_entity:
+                trait_edges = await self.driver.query(
+                    """
+                    SELECT * FROM relates_to
+                    WHERE group_id = $group_id
+                        AND in = type::record("entity", $src)
+                        AND name = "has_trait"
+                        AND status = "active"
+                        AND invalid_at IS NONE;
+                    """,
+                    {"group_id": group_id, "src": self_entity.uuid},
+                )
+                trait_rows = _unwrap(trait_edges)
+                result["traits"] = [
+                    {
+                        "fact": row.get("fact", ""),
+                        "confidence": row.get("confidence", 1.0),
+                    }
+                    for row in trait_rows
+                ]
+
+        # 2. Interaction patterns from procedural cognition
+        if include_patterns:
+            episodes = await self.driver.query(
+                """
+                SELECT name, content, interaction_pattern, created_at
+                FROM episode
+                WHERE group_id = $group_id
+                    AND source CONTAINS 'self_'
+                ORDER BY created_at DESC
+                LIMIT 50;
+                """,
+                {"group_id": group_id},
+            )
+            episode_rows = _unwrap(episodes)
+            patterns: dict[str, dict[str, Any]] = {}
+            for row in episode_rows:
+                pattern = row.get("interaction_pattern")
+                if pattern:
+                    entry = patterns.setdefault(
+                        pattern,
+                        {"pattern": pattern, "count": 0, "source": "episode"},
+                    )
+                    entry["count"] += 1
+
+            self_entity = await self._get_entity_by_name(
+                name=f"assistant_{group_id}" if group_id else "assistant",
+                group_id=group_id,
+            )
+            if self_entity:
+                pattern_edges = _unwrap(
+                    await self.driver.query(
+                        """
+                        SELECT * FROM relates_to
+                        WHERE group_id = $group_id
+                            AND in = type::record("entity", $src)
+                            AND name = "has_pattern"
+                            AND status = "active"
+                            AND invalid_at IS NONE;
+                        """,
+                        {"group_id": group_id, "src": self_entity.uuid},
+                    )
+                )
+                for row in pattern_edges:
+                    fact = row.get("fact") or ""
+                    pattern = fact.removeprefix("has_pattern:").strip() or fact
+                    if pattern:
+                        patterns[pattern] = {
+                            "pattern": pattern,
+                            "count": 1,
+                            "confidence": row.get("confidence", 1.0),
+                            "source": "self_model",
+                        }
+            result["patterns"] = [
+                {
+                    **entry,
+                    "confidence": entry.get(
+                        "confidence",
+                        entry["count"] / max(len(episode_rows), 1),
+                    ),
+                }
+                for entry in sorted(
+                    patterns.values(), key=lambda x: int(x.get("count") or 0), reverse=True
+                )
+            ]
+
+        # 3. Belief edges (subjective self-assessments)
+        if include_beliefs:
+            self_entity = await self._get_entity_by_name(
+                name=f"assistant_{group_id}" if group_id else "assistant",
+                group_id=group_id,
+            )
+            if self_entity:
+                belief_rows = _unwrap(
+                    await self.driver.query(
+                        """
+                        SELECT * FROM relates_to
+                        WHERE group_id = $group_id
+                            AND in = type::record("entity", $src)
+                            AND name = "has_belief"
+                            AND is_belief = true
+                            AND status = "active"
+                            AND invalid_at IS NONE;
+                        """,
+                        {"group_id": group_id, "src": self_entity.uuid},
+                    )
+                )
+                result["beliefs"] = [
+                    {"fact": row.get("fact", ""), "source_type": "self"}
+                    for row in belief_rows
+                ]
+
+        # 4. Goal entities
+        if include_beliefs:
+            result["goals"] = []  # Populated by cognition pass
+
+        # 5. Summary
+        count_rows = _unwrap(
+            await self.driver.query(
+                """
+                SELECT count() as cnt FROM episode
+                WHERE group_id = $group_id
+                    AND source CONTAINS 'self_';
+                """,
+                {"group_id": group_id},
+            )
+        )
+        total_self_episodes = int(count_rows[0].get("cnt") or 0) if count_rows else 0
+        result["summary"] = (
+            f"Self-model based on {total_self_episodes} self-episodes. "
+            f"{len(result['traits'])} traits identified. "
+            f"{len(result['patterns'])} interaction patterns detected."
+        )
+
+        return result
+
+    async def _get_entity_by_name(
+        self,
+        *,
+        name: str,
+        group_id: str,
+    ) -> EntityNode | None:
+        """Find an entity by name in a group."""
+        from surriti.search import _unwrap
+
+        rows = _unwrap(
+            await self.driver.query(
+                """
+                SELECT * FROM entity
+                WHERE group_id = $group_id
+                    AND name = $name
+                LIMIT 1;
+                """,
+                {"group_id": group_id, "name": name},
+            )
+        )
+        if rows:
+            return parse_entity(rows[0])
+        return None
 
 
 def _parse_iso(value: str | None) -> datetime | None:

@@ -19,6 +19,18 @@ class EpisodeType(str, Enum):
     json = "json"
     text = "text"
     fact_triple = "fact_triple"
+    # Self-referential episode types for operational self-awareness.
+    # Stored in the universal memory graph alongside world/user facts.
+    self_observation = "self_observation"  # explicit reflection ("I was too verbose")
+    self_correction = "self_correction"    # noticing a mistake
+    self_success = "self_success"          # noticing a win
+    self_pattern = "self_pattern"          # recurring behavioral trend
+    # Reinforcement signal types (automatic, outcome-driven).
+    tool_failure = "tool_failure"          # failed tool call recorded automatically
+    user_frustration = "user_frustration"  # detected via interruption/correction/feedback
+    goal_completion = "goal_completion"    # successful task execution
+    high_confidence_success = "high_confidence_success"  # high-quality output
+    abandonment = "abandonment"            # user stops responding
 
 
 class _Base(BaseModel):
@@ -47,6 +59,10 @@ class EpisodicNode(_Base):
     """Cognitive-layer procedural label assigned by
     ``surriti.cognition.procedural`` (e.g. ``iterative_refinement``,
     ``optimization_request``). ``None`` until classified."""
+    cognition_processed_at: datetime | None = None
+    """When the background cognition pass last processed this episode."""
+    cognition_version: str | None = None
+    """Version marker for the cognition pass that processed this episode."""
 
 
 class EntityNode(_Base):

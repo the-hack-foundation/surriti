@@ -55,37 +55,22 @@ If the CONTEXT block is omitted there is no prior context to consider.
 
 Return STRICT JSON with two arrays:
 
-{
-  "entities": [
-    {"name": "<a real name from the input>", "labels": ["Person"], "summary": "..."}
-  ],
-  "facts": [
-    {"subject": "<entity name>",
-     "predicate": "snake_case_verb",
-     "relation_phrase": "<verbatim verb phrase from the source>",
-     "object":  "<entity name>",
-     "fact":    "A complete natural-language sentence.",
-     "operation": "assert",
-     "temporal": false,
-     "singleton": false,
-     "domain": null,
-     "memory_class": "objective",
-     "qualifiers": {},
-     "argument_roles": {},
-     "source_span": "<verbatim slice of CURRENT EPISODE>",
-     "replaces": []}
-  ]
-}
+{"entities":[{"name":"...","labels":["..."],"summary":"..."}],
+ "facts":[{"subject":"...","predicate":"...","object":"...",
+           "fact":"...","operation":"assert","temporal":false,
+           "singleton":false,"domain":null,"memory_class":"objective",
+           "relation_phrase":"...","qualifiers":{},"argument_roles":{},
+           "source_span":"...","replaces":[]}]}
 
 WHAT COUNTS AS A FACT (extract these from CURRENT EPISODE):
-- Self-introductions and properties of the speaker ("my name is X",
-  "I'm X", "I am 5 months old", "I work at Acme", "I live in Berlin",
+- Self-introductions and properties ("my name is X", "I'm X",
+  "I am 5 months old", "I work at Acme", "I live in Berlin",
   "I like pizza", "my birthday is October 14").
 - Properties of other named entities ("Alice works at Acme").
-- Compound sentences split into one fact per claim.
-- VALUES become entities too: dates, ages, places, companies must
-  appear in `entities` AND be the `object` of the fact. NEVER use a
-  literal placeholder like "speaker" or "value" as subject or object.
+- Compound sentences: split into one fact per claim.
+- VALUES become entities: dates, ages, places, companies must
+  appear in `entities` AND be the `object` of the fact.
+  NEVER use placeholders like "speaker" or "value" as subject/object.
 - When in doubt, extract.
 
 WHAT TO SKIP (return no fact, but mention any named entities):
@@ -93,82 +78,41 @@ WHAT TO SKIP (return no fact, but mention any named entities):
 - Pure questions ("where do I work?", "what's my name?").
 - Vague placeholder objects: if the object would be a meaningless
   filler like "world", "everywhere", "thing", "something", "nothing",
-  "someone", DROP the fact entirely. Such words are not entities.
+  "someone", DROP the fact entirely.
 
-FACT METADATA -- general rubric, NOT a closed list of predicates:
-- `operation` (default "assert"). Use "terminate" when the input
-  explicitly negates a previously true state ("I quit X", "I no
-  longer X", "X is not true anymore", "I stopped X"). The fact then
-  describes the PRIOR state being closed. Use "correct" when the
-  input explicitly replaces a previously stated value with a new one
-  for the same slot ("actually it's X, not Y"; "I meant X"). Use
-  "qualify" when the input adds a scoped variant of an existing
-  state without overriding it ("I live in Florida in the winter"
-  alongside a year-round residence). Use "noop" only to ignore the
-  fact. Otherwise omit or "assert".
-- `temporal` = true when the fact describes a CURRENT state of the
-  subject that can change over time (where they live, who they work
-  for, what they do, how they feel, what they own, what they prefer
-  right now).
-- `singleton` = true when the subject can hold only ONE such value
-  true at a time (people live in one place, hold one current job
-  title, have one current age, have one current employer).
-- `domain` = a short free-form bucket label (one or two words) you
-  pick to group facts that obviously describe the same slot, so the
-  engine can scope contradictions. Use the SAME label across facts
-  that share a slot. Examples of labels you might invent: "employment",
-  "residence", "naming", "preference", "identity". Free text -- pick
-  whatever fits.
-- `memory_class` = closed vocabulary tag for the *kind* of fact.
-  ONE of these six values, default `"objective"`:
-    * `"objective"`   - verifiable claim about the world or the user
-                        ("Jessica works at Target", "I am 32",
-                        "Acme is in Berlin"). Default. Use whenever
-                        the other classes don't fit.
-    * `"preference"`  - a soft user wish about how the assistant or
-                        the world should behave ("respond as a Russian
-                        gopnik", "I prefer concise answers", "I like
-                        to be addressed by my first name", "use
-                        metric units").
-    * `"style"`       - a communication-style directive constraining
-                        HOW the assistant writes ("be terse", "no
-                        emojis", "write in bullet points",
-                        "always use markdown").
-    * `"constraint"`  - a HARD rule / forbidden action ("never call
-                        me after 9pm", "do not store credit card
-                        numbers", "never mention politics").
-    * `"trait"`       - a persistent personal trait, value, or belief
-                        ("values privacy", "is risk-averse",
-                        "is a vegetarian").
-    * `"sentiment"`   - an emotional pattern or opinion ("dislikes
-                        small talk", "is frustrated with bug reports",
-                        "loves jazz"). When the user expresses a
-                        preference about the assistant's behaviour use
-                        `"preference"` / `"style"` / `"constraint"`
-                        instead.
-  Pick the most specific class. Subjective directives ("respond as",
-  "prefer", "always", "never", "I want you to", "stop doing") are
-  almost always preference / style / constraint, NOT objective.
-- `relation_phrase` = the verbatim verb phrase from the source ("is
-  the wife of", "moved to", "no longer works at"). Lets the engine
-  canonicalize alias predicates without losing the original wording.
-- `qualifiers` = optional dict of conditions that scope the claim
-  ({"season": "winter"}, {"role": "weekday"}, {"location": "remote"}).
-  Two facts that share subject+predicate+object but differ in
-  qualifiers represent distinct slots and coexist.
-- `argument_roles` = optional dict naming the semantic role each
-  argument plays ({"subject": "employee", "object": "employer"};
-  {"object_role_relative_to_subject": "wife"}). Used by the
-  direction-repair pass for symmetric/inverse-pair frames.
-- `source_span` = the verbatim slice of CURRENT EPISODE that produced
-  the fact. Forwarded to the LLM frame classifier on cold-start so a
-  brand-new predicate gets typed correctly.
-- `replaces` = optional list of prior fact descriptions this one
-  closes (free text like "X works_at OldCo"). Helps `terminate` /
-  `correct` find their target when wording differs.
+FIELD REFERENCE (use defaults unless input suggests otherwise):
+  operation       : assert | terminate | correct | qualify | noop
+                    (default: assert)
+  temporal        : true/false — current state that can change
+  singleton       : true/false — only one value valid at a time
+  domain          : free-form bucket (employment, residence, etc.)
+  memory_class    : objective | preference | style | constraint |
+                    trait | sentiment (default: objective)
+  relation_phrase : verbatim verb phrase from source
+  qualifiers      : {condition: value} — scopes the claim
+  argument_roles  : {subject: role, object: role} — semantic roles
+  source_span     : verbatim text slice from CURRENT EPISODE
+  replaces        : [prior fact descriptions] — what this closes
 
-WORKED EXAMPLES (general patterns; the predicate names are illustrative
-only -- the real ones come from the input):
+MEMORY_CLASS GUIDE:
+  objective   — verifiable claim about the world/user ("Jessica
+                works at Target", "I am 32", "Acme is in Berlin")
+  preference  — soft wish about how assistant/world should behave
+                ("respond as X", "I prefer concise answers")
+  style       — communication-style directive ("be terse", "no
+                emojis", "write in bullet points")
+  constraint  — hard rule / forbidden action ("never call me after
+                9pm", "do not store credit card numbers")
+  trait       — persistent personal trait/value/belief ("values
+                privacy", "is risk-averse", "is a vegetarian")
+  sentiment   — emotional pattern/opinion ("dislikes small talk",
+                "loves jazz")
+  Subjective directives ("respond as", "prefer", "always", "never",
+  "I want you to", "stop doing") are almost always preference/style/
+  constraint, NOT objective.
+
+WORKED EXAMPLES (predicate names are illustrative; real ones come
+from the input):
 
   "I work at Acme" ->
     {"subject":"<speaker>", "predicate":"works_at",
@@ -196,22 +140,6 @@ only -- the real ones come from the input):
      "qualifiers":{"season":"winter"},
      "source_span":"I live in Florida during the winter"}
 
-  "I love jazz now" ->
-    {"subject":"<speaker>", "predicate":"likes",
-     "relation_phrase":"love", "object":"jazz",
-     "fact":"... likes jazz.",
-     "operation":"assert", "temporal":true, "singleton":false,
-     "domain":"preference", "memory_class":"sentiment",
-     "source_span":"I love jazz now"}
-
-  "Respond to me as a stereotypical Russian gopnik" ->
-    {"subject":"<speaker>", "predicate":"wants_assistant_persona",
-     "relation_phrase":"respond to me as", "object":"stereotypical Russian gopnik",
-     "fact":"... wants the assistant to respond as a stereotypical Russian gopnik.",
-     "operation":"assert", "temporal":true, "singleton":true,
-     "domain":"assistant_persona", "memory_class":"preference",
-     "source_span":"Respond to me as a stereotypical Russian gopnik"}
-
   "Be terse and never use emojis" ->
     [{"subject":"<speaker>", "predicate":"wants_assistant_style",
       "relation_phrase":"be", "object":"terse",
@@ -225,22 +153,6 @@ only -- the real ones come from the input):
       "operation":"assert", "temporal":true, "singleton":false,
       "domain":"assistant_style", "memory_class":"constraint",
       "source_span":"never use emojis"}]
-
-  "Never call me after 9pm" ->
-    {"subject":"<speaker>", "predicate":"forbids_assistant_action",
-     "relation_phrase":"never call me", "object":"calls after 9pm",
-     "fact":"... forbids the assistant from calling after 9pm.",
-     "operation":"assert", "temporal":true, "singleton":false,
-     "domain":"contact_rules", "memory_class":"constraint",
-     "source_span":"Never call me after 9pm"}
-
-  "I really value privacy" ->
-    {"subject":"<speaker>", "predicate":"values",
-     "relation_phrase":"really value", "object":"privacy",
-     "fact":"... values privacy.",
-     "operation":"assert", "temporal":true, "singleton":false,
-     "domain":"values", "memory_class":"trait",
-     "source_span":"I really value privacy"}
 
   "I sold the Civic and bought a Tesla" ->
     [{"subject":"<speaker>", "predicate":"sold_vehicle",
@@ -256,47 +168,44 @@ only -- the real ones come from the input):
       "operation":"assert", "temporal":true, "singleton":true,
       "domain":"vehicle", "memory_class":"objective",
       "source_span":"bought a Tesla"}]
-  Note how the *event* fact (sold/lost/replaced/disposed) carries a
-  `replaces` list naming the prior states it terminates, so the engine
-  can close them without a second contradiction-detection round-trip.
+  Note: the *event* fact (sold/lost/replaced/disposed) carries a
+  `replaces` list naming the prior states it terminates, so the
+  engine can close them without a second contradiction-detection
+  round-trip.
 
-COMPOUND CLAIMS -- one sentence often packs multiple facts. "I work
-night shifts at a hospital on Tuesdays and Thursdays" yields THREE
-facts (works_at hospital; works_shift night; works_on [Tuesdays,
-Thursdays] -- emit each weekday as a separate fact OR use object
-list). "I keep my passport in the blue safe in the garage" yields
-TWO facts (keeps_in passport->blue safe; located_in blue safe->
-garage). Always decompose -- do not pick the most prominent claim
-and drop the rest.
+COMPOUND CLAIMS — one sentence often packs multiple facts.
+"I work night shifts at a hospital on Tuesdays and Thursdays"
+yields THREE facts (works_at hospital; works_shift night;
+works_on [Tuesdays, Thursdays]). "I keep my passport in the blue
+safe in the garage" yields TWO facts (keeps_in passport->blue
+safe; located_in blue safe->garage). Always decompose.
 
-SUBJECTIVE-DIRECTIVE PREDICATE VOCABULARY (use these exact predicates
-when the user is telling the assistant how to behave -- this keeps
-deduplication reliable):
-- `wants_assistant_persona`  - persona / role-play directives
-                               ("respond as X", "act like X")
+SUBJECTIVE-DIRECTIVE PREDICATE VOCABULARY (use these exact
+predicates when the user tells the assistant how to behave):
+- `wants_assistant_persona`  - persona/role-play ("respond as X",
+                               "act like X")
 - `wants_assistant_style`    - positive style preferences
-                               ("be terse", "use markdown",
-                                "always include examples")
+                               ("be terse", "use markdown")
 - `forbids_assistant_action` - hard prohibitions
                                ("never X", "don't X", "stop doing X")
-- `prefers_communication`    - preferences for how/when the assistant
-                               communicates ("text only", "no calls
-                               after 9pm" -> use forbids_*)
+- `prefers_communication`    - communication preferences
+                               ("text only", "no calls after 9pm"
+                                -> use forbids_*)
 - `values`                   - trait-class assertions
                                ("I value X", "I care about X")
 - `feels_about`              - sentiment-class assertions
                                ("I love jazz", "I dislike X")
-For all other facts use whatever snake_case predicate fits the verb.
+For all other facts use whatever snake_case predicate fits.
 
 HARD RULES (violations make the output unusable):
 - Extract facts ONLY from CURRENT EPISODE. CONTEXT is read-only.
 - NEVER invent entities, predicates, or relations not supported by
-  the input. Do NOT use placeholder names like Alice, Bob, Acme, Foo,
-  Bar unless they appear in the text.
+  the input. Do NOT use placeholder names like Alice, Bob, Acme,
+  Foo, Bar unless they appear in the text.
 - NEVER emit a self-loop fact (subject == object). For naming, the
   subject is the SPEAKER and the object is the new name.
-- Tokens that look like internal metadata -- bracketed labels
-  (`[chat]`, `[turn-a]`), bare UUIDs -- are NOT entities. Ignore them.
+- Tokens that look like internal metadata — bracketed labels
+  (`[chat]`, `[turn-a]`), bare UUIDs — are NOT entities.
 - Use the EXACT entity name strings inside facts (subject/object).
 - Predicates are snake_case verbs. Avoid `related_to`.
 - Each fact's `fact` is a complete natural-language sentence.
@@ -744,11 +653,13 @@ class OpenAILLMClient(LLMClient):
         *,
         model: str = "gpt-4o-mini",
         api_key: str | None = None,
+        base_url: str | None = None,
         temperature: float = 0.0,
         client: Any | None = None,
         extra_body: dict | None = None,
     ) -> None:
         self.model = model
+        self.base_url = base_url
         self.temperature = temperature
         self.extra_body = extra_body
         if client is not None:
@@ -765,7 +676,10 @@ class OpenAILLMClient(LLMClient):
             raise SurritiConfigError(
                 "OPENAI_API_KEY is not set and no api_key argument was provided."
             )
-        self._client = AsyncOpenAI(api_key=key)
+        # Prefer explicit base_url, then OPENAI_BASE_URL (user convention),
+        # then OPENAI_API_BASE (SDK convention), then let SDK default.
+        url = base_url or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+        self._client = AsyncOpenAI(api_key=key, base_url=url)
 
     async def _complete(self, system: str, user: str) -> str:
         try:

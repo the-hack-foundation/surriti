@@ -1,0 +1,7 @@
+name: surriti
+version: 1.0.0
+description: "Temporal knowledge-graph memory backed by Surriti + SurrealDB."
+hooks:
+  - prefetch
+  - sync_turn
+  - on_session_end

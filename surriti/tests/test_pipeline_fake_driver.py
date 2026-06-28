@@ -15,6 +15,7 @@ from surriti.llm import (
     ScriptedLLMClient,
     ScriptedResponse,
 )
+from surriti.nodes import EpisodeType
 from surriti.testing import InMemoryDriver as FakeSurrealDriver
 
 
@@ -71,6 +72,58 @@ async def test_search_returns_facts():
     results = await surriti.search("Alice Acme", group_id="g1")
     assert results.edges, "search should surface at least one edge"
     assert any("Acme" in e.fact for e in results.edges)
+
+
+@pytest.mark.asyncio
+async def test_recall_reinforces_returned_edges():
+    driver = FakeSurrealDriver()
+    surriti = Surriti(driver, embedder=DummyEmbedder(embedding_dim=64))
+    await surriti.add_episode(
+        name="e1",
+        episode_body="Alice works at Acme Corp.",
+        group_id="g1",
+    )
+
+    ctx = await surriti.recall("Alice Acme", group_id="g1")
+
+    assert ctx.facts
+    recalled = [r for r in driver.records["relates_to"] if r.get("last_recalled_at")]
+    assert recalled
+    assert all(int(r.get("recall_count") or 0) >= 1 for r in recalled)
+
+
+@pytest.mark.asyncio
+async def test_add_self_episode_persists_object_entities_before_edges():
+    response = ScriptedResponse(
+        entities=[ExtractedEntity(name="verbosity", labels=["Behavior"])],
+        facts=[
+            ExtractedFact(
+                "assistant",
+                "has_pattern",
+                "verbosity",
+                "Assistant has a verbosity pattern.",
+            )
+        ],
+    )
+    driver = FakeSurrealDriver(enforce_entity_name_uniq=True)
+    surriti = Surriti(
+        driver,
+        llm_client=ScriptedLLMClient([response]),
+        embedder=DummyEmbedder(embedding_dim=64),
+    )
+
+    result = await surriti.add_self_episode(
+        episode_type=EpisodeType.self_observation,
+        content="I was too verbose in the last answer.",
+        group_id="g1",
+    )
+
+    entity_ids = {r["uuid"] for r in driver.records["entity"]}
+    assert {e.name for e in result.nodes} >= {"assistant_g1", "verbosity"}
+    assert result.edges
+    for edge in result.edges:
+        assert edge.source_node_uuid in entity_ids
+        assert edge.target_node_uuid in entity_ids
 
 
 # ---------------------------------------------------------------------------

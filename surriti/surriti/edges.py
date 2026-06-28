@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import Field
 
-from surriti.nodes import _Base, utc_now
+from surriti.nodes import _Base
 
 
 def make_fact_key(
@@ -141,6 +141,10 @@ class EntityEdge(_Edge):
     last_reinforced_at: datetime | None = None
     """Timestamp of the most recent reinforcement (newest supporting
     episode)."""
+    recall_count: int = 0
+    """Number of times this edge was returned by ``Surriti.recall()``."""
+    last_recalled_at: datetime | None = None
+    """Timestamp of the most recent recall-side reinforcement."""
     decay_score: float = 1.0
     """Snapshotted ``effective_confidence`` produced by the decay
     function; refreshed on each cognition pass."""

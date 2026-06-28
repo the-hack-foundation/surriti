@@ -52,6 +52,13 @@ const controls = {
   minConfidenceLabel: document.querySelector("#minConfidenceLabel"),
   validAfter: document.querySelector("#validAfter"),
   validBefore: document.querySelector("#validBefore"),
+  layoutPanel: document.querySelector("#layoutPanel"),
+  layoutReset: document.querySelector("#layoutResetBtn"),
+  layoutSave: document.querySelector("#layoutSaveBtn"),
+  layoutExport: document.querySelector("#layoutExportBtn"),
+  layoutImport: document.querySelector("#layoutImportBtn"),
+  layoutImportInput: document.querySelector("#layoutImportInput"),
+  layoutInputs: Array.from(document.querySelectorAll("[data-layout-key]")),
 };
 
 const counts = {
@@ -91,6 +98,40 @@ let cognitionData = null;                 // last /api/cognition/summary result
 let frozen = false;
 let conflictsCache = [];
 let egoFocus = null;                      // { nodeId, depth, includeEpisodes, includeInvalidated }
+
+const layoutDefaults = {
+  linkDistance: 130,
+
+  leafDistance: 68,
+  normalDistance: 120,
+  hubDistance: 280,
+
+  multiEdgeSpread: 0.22,
+  curveSpread: 16,
+
+  hubDegree: 7,
+  leafDegree: 1,
+
+  charge: 280,
+  episodeCharge: 140,
+  hubCharge: 760,
+
+  collisionPadding: 12,
+  hubCollisionPadding: 48,
+
+  gravity: 0.02,
+  linkStrength: 0.22,
+
+  leafOrbitStrength: 0.16,
+  leafOrbitRadius: 82,
+  leafFanSpread: 1.8,
+
+  hubRepelStrength: 0.95,
+  edgeAvoidance: 0.45,
+  edgeAvoidanceDistance: 30,
+};
+
+let layoutConfig = { ...layoutDefaults };
 
 const lensDefaults = {
   truth: { apiView: "entities", edgeVisibility: "active", statusPreset: "current", aggregate: true },
@@ -184,6 +225,7 @@ function persistState() {
       selectedFrames: Array.from(selectedFrames),
       selection: selected ? { id: selected.item.id, type: selected.type } : null,
       egoFocus,
+      layoutConfig,
     };
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
     catch { /* quota exceeded — skip */ }
@@ -218,6 +260,104 @@ function applyPersisted(p) {
   if (p.asOfSlider != null) controls.asOfSlider.value = p.asOfSlider;
   if (Array.isArray(p.selectedFrames)) selectedFrames = new Set(p.selectedFrames);
   if (p.egoFocus) egoFocus = p.egoFocus;
+  if (p.layoutConfig && typeof p.layoutConfig === "object") {
+    layoutConfig = normalizeLayoutConfig({ ...layoutDefaults, ...p.layoutConfig });
+  }
+}
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function normalizeLayoutConfig(config) {
+  const src = config && typeof config === "object" ? config : {};
+  const toNum = (key) => Number.isFinite(Number(src[key])) ? Number(src[key]) : layoutDefaults[key];
+  return {
+    linkDistance:           clampNumber(toNum("linkDistance"),           60,    400),
+    leafDistance:           clampNumber(toNum("leafDistance"),           30,    200),
+    normalDistance:         clampNumber(toNum("normalDistance"),         60,    300),
+    hubDistance:            clampNumber(toNum("hubDistance"),            100,   600),
+    multiEdgeSpread:        clampNumber(toNum("multiEdgeSpread"),        0,     1.5),
+    curveSpread:            clampNumber(toNum("curveSpread"),            6,     40),
+    hubDegree:              clampNumber(toNum("hubDegree"),              2,     20),
+    leafDegree:             clampNumber(toNum("leafDegree"),             1,     3),
+    charge:                 clampNumber(toNum("charge"),                 80,    900),
+    episodeCharge:          clampNumber(toNum("episodeCharge"),          40,    600),
+    hubCharge:              clampNumber(toNum("hubCharge"),              200,   2000),
+    collisionPadding:       clampNumber(toNum("collisionPadding"),       2,     64),
+    hubCollisionPadding:    clampNumber(toNum("hubCollisionPadding"),    10,    120),
+    gravity:                clampNumber(toNum("gravity"),                0.001, 0.08),
+    linkStrength:           clampNumber(toNum("linkStrength"),           0.05,  0.8),
+    leafOrbitStrength:      clampNumber(toNum("leafOrbitStrength"),      0,     0.5),
+    leafOrbitRadius:        clampNumber(toNum("leafOrbitRadius"),        40,    200),
+    leafFanSpread:          clampNumber(toNum("leafFanSpread"),          0.3,   4.0),
+    hubRepelStrength:       clampNumber(toNum("hubRepelStrength"),       0,     2.0),
+    edgeAvoidance:          clampNumber(toNum("edgeAvoidance"),          0,     1.5),
+    edgeAvoidanceDistance:  clampNumber(toNum("edgeAvoidanceDistance"),  10,    80),
+  };
+}
+
+function formatLayoutValue(key, value) {
+  const floatKeys = ["multiEdgeSpread", "leafFanSpread", "hubRepelStrength", "edgeAvoidance"];
+  const preciseKeys = ["gravity", "leafOrbitStrength"];
+  if (floatKeys.includes(key)) return Number(value).toFixed(2);
+  if (preciseKeys.includes(key)) return Number(value).toFixed(3);
+  return String(Math.round(Number(value)));
+}
+
+function syncLayoutControls() {
+  if (!controls.layoutInputs || !controls.layoutInputs.length) return;
+  controls.layoutInputs.forEach(input => {
+    const key = input.dataset.layoutKey;
+    if (!key || layoutConfig[key] == null) return;
+    input.value = String(layoutConfig[key]);
+    const label = document.querySelector(`[data-layout-value="${key}"]`);
+    if (label) label.textContent = formatLayoutValue(key, layoutConfig[key]);
+  });
+}
+
+function updateLayoutValue(key, value) {
+  if (!Object.prototype.hasOwnProperty.call(layoutConfig, key)) return;
+  layoutConfig = normalizeLayoutConfig({ ...layoutConfig, [key]: Number(value) });
+  syncLayoutControls();
+  persistState();
+  applyLayoutForces();
+  if (!frozen && simulation) simulation.alpha(0.35).restart();
+}
+
+function resetLayoutConfig() {
+  layoutConfig = { ...layoutDefaults };
+  syncLayoutControls();
+  persistState();
+  render();
+  if (!frozen && simulation) simulation.alpha(0.5).restart();
+}
+
+function exportLayoutConfig() {
+  const payload = {
+    exported_at: new Date().toISOString(),
+    layoutConfig,
+  };
+  downloadBlob("surriti-layout.json", new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+}
+
+async function importLayoutConfigFromFile(file) {
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    const incoming = parsed && parsed.layoutConfig && typeof parsed.layoutConfig === "object"
+      ? parsed.layoutConfig
+      : parsed;
+    layoutConfig = normalizeLayoutConfig({ ...layoutDefaults, ...(incoming || {}) });
+    syncLayoutControls();
+    persistState();
+    render();
+    if (!frozen && simulation) simulation.alpha(0.5).restart();
+    setStatus("Layout imported.");
+  } catch (err) {
+    setStatus(`Layout import failed: ${err.message}`, true);
+  }
 }
 
 // ---------- Theme ----------
@@ -368,7 +508,9 @@ function filteredGraph() {
     edges.forEach((e, i) => {
       const n = edges.length;
       // For 1 edge: curve = 0. For multiple: fan out.
-      e._curve = n === 1 ? 0 : (i - (n - 1) / 2) * 18;
+      e._curve = n === 1 ? 0 : (i - (n - 1) / 2) * layoutConfig.curveSpread;
+      // Pair multiplicity drives distance so multi-edge node pairs spread out.
+      e._pairMultiplicity = n;
       // Reverse curve sign when this edge runs against the canonical pair direction.
       const a = idOf(e.source), b = idOf(e.target);
       if (a > b) e._curve = -e._curve;
@@ -411,6 +553,215 @@ function nodeRadius(node) {
   if (node.kind === "episode") return Math.min(18, 8 + degree * 0.7);
   if (node.kind === "community") return Math.min(26, 13 + degree * 0.9);
   return Math.min(24, 10 + degree * 0.85);
+}
+
+function nodeDegree(node) {
+  return Number((node && node.degree) || 0);
+}
+
+// ---------- Layout topology annotation ----------
+
+function stableHash(value) {
+  const s = String(value);
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 16777619) >>> 0;
+  }
+  return h;
+}
+
+function outwardAngleForParent(parent, leaves) {
+  const nonLeafNeighbors = [];
+  for (const l of parent._incidentLinks || []) {
+    const other = idOf(l.source) === parent.id ? l.target : l.source;
+    if (other && typeof other === "object" && !other._isLeaf) {
+      nonLeafNeighbors.push(other);
+    }
+  }
+  if (nonLeafNeighbors.length) {
+    let cx = 0, cy = 0;
+    for (const n of nonLeafNeighbors) { cx += n.x || parent.x || 0; cy += n.y || parent.y || 0; }
+    cx /= nonLeafNeighbors.length;
+    cy /= nonLeafNeighbors.length;
+    return Math.atan2((parent.y || 0) - cy, (parent.x || 0) - cx);
+  }
+  const { width, height } = dimensions();
+  return Math.atan2((parent.y || 0) - height / 2, (parent.x || 0) - width / 2);
+}
+
+function annotateLayoutGraph(graph) {
+  const degree = new Map();
+  const incident = new Map();
+  for (const n of graph.nodes) { degree.set(n.id, 0); incident.set(n.id, []); }
+  for (const l of graph.links) {
+    const s = idOf(l.source);
+    const t = idOf(l.target);
+    degree.set(s, (degree.get(s) || 0) + 1);
+    degree.set(t, (degree.get(t) || 0) + 1);
+    incident.get(s)?.push(l);
+    incident.get(t)?.push(l);
+  }
+  for (const n of graph.nodes) {
+    n._layoutDegree = degree.get(n.id) || 0;
+    n._isHub  = n._layoutDegree >= layoutConfig.hubDegree;
+    n._isLeaf = n._layoutDegree <= layoutConfig.leafDegree;
+    n._incidentLinks = incident.get(n.id) || [];
+  }
+  const nodeById = new Map(graph.nodes.map(n => [n.id, n]));
+  for (const l of graph.links) {
+    const s = nodeById.get(idOf(l.source));
+    const t = nodeById.get(idOf(l.target));
+    l._sourceNode = s;
+    l._targetNode = t;
+    const sHub = !!s?._isHub, tHub = !!t?._isHub;
+    const sLeaf = !!s?._isLeaf, tLeaf = !!t?._isLeaf;
+    l._isHubHub  = sHub && tHub;
+    l._isHubLeaf = (sHub && tLeaf) || (tHub && sLeaf);
+    l._isLeafLeaf = sLeaf && tLeaf;
+  }
+  assignLeafParents(graph);
+  return graph;
+}
+
+function assignLeafParents(graph) {
+  const nodeById = new Map(graph.nodes.map(n => [n.id, n]));
+  for (const n of graph.nodes) { n._leafParentId = null; n._leafParent = null; }
+  for (const n of graph.nodes) {
+    if (!n._isLeaf) continue;
+    const l = n._incidentLinks && n._incidentLinks[0];
+    if (!l) continue;
+    const s = nodeById.get(idOf(l.source));
+    const t = nodeById.get(idOf(l.target));
+    const other = s && s.id === n.id ? t : s;
+    if (other) { n._leafParentId = other.id; n._leafParent = other; }
+  }
+}
+
+// ---------- Custom layout forces ----------
+
+function forceHubRepel() {
+  let nodes = [];
+  function force(alpha) {
+    const hubs = nodes.filter(n => n._isHub);
+    for (let i = 0; i < hubs.length; i++) {
+      for (let j = i + 1; j < hubs.length; j++) {
+        const a = hubs[i], b = hubs[j];
+        const dx = (b.x || 0) - (a.x || 0);
+        const dy = (b.y || 0) - (a.y || 0);
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const minDist = (nodeRadius(a) + nodeRadius(b)) * 2.5 + 120;
+        if (dist >= minDist) continue;
+        const push = ((minDist - dist) / minDist) * layoutConfig.hubRepelStrength * alpha;
+        const nx = dx / dist, ny = dy / dist;
+        a.vx -= nx * push * 12; a.vy -= ny * push * 12;
+        b.vx += nx * push * 12; b.vy += ny * push * 12;
+      }
+    }
+  }
+  force.initialize = function (_) { nodes = _; };
+  return force;
+}
+
+function forceLeafOrbit() {
+  let nodes = [];
+  let leavesByParent = new Map();
+  function force(alpha) {
+    for (const [parentId, leaves] of leavesByParent.entries()) {
+      const parent = nodes.find(n => n.id === parentId);
+      if (!parent || !leaves.length) continue;
+      const baseAngle = outwardAngleForParent(parent, leaves);
+      leaves.forEach((leaf, i) => {
+        const count = leaves.length;
+        const spread = layoutConfig.leafFanSpread;
+        const angle = count === 1
+          ? baseAngle
+          : baseAngle - spread / 2 + (i / (count - 1)) * spread;
+        const targetX = (parent.x || 0) + Math.cos(angle) * layoutConfig.leafOrbitRadius;
+        const targetY = (parent.y || 0) + Math.sin(angle) * layoutConfig.leafOrbitRadius;
+        leaf.vx += (targetX - (leaf.x || 0)) * layoutConfig.leafOrbitStrength * alpha;
+        leaf.vy += (targetY - (leaf.y || 0)) * layoutConfig.leafOrbitStrength * alpha;
+      });
+    }
+  }
+  force.initialize = function (_) {
+    nodes = _;
+    leavesByParent = new Map();
+    for (const n of nodes) {
+      if (n._isLeaf && n._leafParentId) {
+        if (!leavesByParent.has(n._leafParentId)) leavesByParent.set(n._leafParentId, []);
+        leavesByParent.get(n._leafParentId).push(n);
+      }
+    }
+    for (const leaves of leavesByParent.values()) {
+      leaves.sort((a, b) => stableHash(a.id) - stableHash(b.id));
+    }
+  };
+  return force;
+}
+
+function forceEdgeAvoidance(links) {
+  let nodes = [];
+  function force(alpha) {
+    const distance = layoutConfig.edgeAvoidanceDistance;
+    const strength = layoutConfig.edgeAvoidance * alpha;
+    if (strength <= 0 || !links || !links.length) return;
+    for (const link of links) {
+      const s = link.source, t = link.target;
+      if (!s || !t || typeof s !== "object" || typeof t !== "object") continue;
+      const sx = s.x || 0, sy = s.y || 0, tx = t.x || 0, ty = t.y || 0;
+      const ldx = tx - sx, ldy = ty - sy;
+      const ll2 = ldx * ldx + ldy * ldy;
+      if (ll2 < 1) continue;
+      for (const n of nodes) {
+        if (n === s || n === t) continue;
+        const nx_ = (n.x || 0) - sx, ny_ = (n.y || 0) - sy;
+        const t2 = Math.max(0, Math.min(1, (nx_ * ldx + ny_ * ldy) / ll2));
+        const px = sx + t2 * ldx - (n.x || 0);
+        const py = sy + t2 * ldy - (n.y || 0);
+        const d2 = px * px + py * py;
+        if (d2 > distance * distance || d2 === 0) continue;
+        const d = Math.sqrt(d2);
+        const push = ((distance - d) / distance) * strength * 8;
+        n.vx -= (px / d) * push;
+        n.vy -= (py / d) * push;
+      }
+    }
+  }
+  force.initialize = function (_) { nodes = _; };
+  return force;
+}
+
+function applyLayoutForces() {
+  if (!simulation) return;
+  const linkForce = simulation.force("link");
+  if (linkForce) {
+    linkForce
+      .distance(linkDistance)
+      .strength(d => {
+        if (d._isHubLeaf) return layoutConfig.linkStrength * 0.9;
+        if (d._isHubHub)  return layoutConfig.linkStrength * 0.55;
+        return layoutConfig.linkStrength;
+      });
+  }
+  simulation.force("charge", d3.forceManyBody().strength(d => {
+    if (d._isHub)           return -layoutConfig.hubCharge;
+    if (d.kind === "episode") return -layoutConfig.episodeCharge;
+    return -layoutConfig.charge;
+  }));
+  simulation.force("collide", d3.forceCollide().radius(d => {
+    if (d._isHub) return nodeRadius(d) + layoutConfig.hubCollisionPadding;
+    return nodeRadius(d) + layoutConfig.collisionPadding;
+  }).iterations(2));
+  const { width, height } = dimensions();
+  simulation
+    .force("x", d3.forceX(width / 2).strength(layoutConfig.gravity))
+    .force("y", d3.forceY(height / 2).strength(layoutConfig.gravity))
+    .force("hubRepel",      forceHubRepel())
+    .force("leafOrbit",     forceLeafOrbit())
+    .force("edgeAvoidance", forceEdgeAvoidance(
+      (simulation.force("link") || { links: () => [] }).links()
+    ));
 }
 
 function linkColorFor(link) {
@@ -502,7 +853,7 @@ function isSymmetric(link) {
 
 // ---------- Render ----------
 function render() {
-  const graph = filteredGraph();
+  const graph = annotateLayoutGraph(filteredGraph());
   const { width, height } = dimensions();
   counts.nodes.textContent = graph.nodes.length;
   counts.links.textContent = graph.links.length;
@@ -608,12 +959,32 @@ function render() {
     .text(d => qualityBadge(d, { conflictByNode, mentionByNode, historicalOnly, aliasNodeIds }));
 
   simulation = d3.forceSimulation(graph.nodes)
-    .force("link", d3.forceLink(graph.links).id(d => d.id).distance(linkDistance).strength(0.42))
-    .force("charge", d3.forceManyBody().strength(d => d.kind === "episode" ? -130 : -260))
-    .force("center", d3.forceCenter(width / 2, height / 2))
-    .force("collide", d3.forceCollide().radius(d => nodeRadius(d) + 12).iterations(2))
-    .force("x", d3.forceX(width / 2).strength(0.035))
-    .force("y", d3.forceY(height / 2).strength(0.035));
+    .force("link", d3.forceLink(graph.links)
+      .id(d => d.id)
+      .distance(linkDistance)
+      .strength(d => {
+        if (d._isHubLeaf) return layoutConfig.linkStrength * 0.9;
+        if (d._isHubHub)  return layoutConfig.linkStrength * 0.55;
+        return layoutConfig.linkStrength;
+      })
+    )
+    .force("charge", d3.forceManyBody().strength(d => {
+      if (d._isHub)             return -layoutConfig.hubCharge;
+      if (d.kind === "episode") return -layoutConfig.episodeCharge;
+      return -layoutConfig.charge;
+    }))
+    .force("hubRepel",      forceHubRepel())
+    .force("leafOrbit",     forceLeafOrbit())
+    .force("edgeAvoidance", forceEdgeAvoidance(graph.links))
+    .force("center",  d3.forceCenter(width / 2, height / 2))
+    .force("collide", d3.forceCollide().radius(d => {
+      if (d._isHub) return nodeRadius(d) + layoutConfig.hubCollisionPadding;
+      return nodeRadius(d) + layoutConfig.collisionPadding;
+    }).iterations(2))
+    .force("x", d3.forceX(width / 2).strength(layoutConfig.gravity))
+    .force("y", d3.forceY(height / 2).strength(layoutConfig.gravity))
+    .alphaDecay(0.025)
+    .velocityDecay(0.38);
 
   // rAF-throttled tick: at most one DOM update per animation frame.
   let pending = false;
@@ -644,9 +1015,21 @@ function qualityBadge(node, indexes) {
 }
 
 function linkDistance(link) {
-  if (link.kind === "mentions") return 86;
-  if (link.kind === "has_member") return 118;
-  return 142;
+  const pairMultiplicity = Math.max(1, Number(link._pairMultiplicity || 1));
+
+  let base = layoutConfig.normalDistance;
+  if (link._isHubHub) {
+    base = layoutConfig.hubDistance;
+  } else if (link._isHubLeaf) {
+    base = layoutConfig.leafDistance;
+  } else if (link.kind === "mentions") {
+    base = layoutConfig.leafDistance * 0.9;
+  } else if (link.kind === "has_member") {
+    base = layoutConfig.normalDistance;
+  }
+
+  const multiSpread = 1 + ((pairMultiplicity - 1) * layoutConfig.multiEdgeSpread);
+  return Math.min(700, base * multiSpread);
 }
 
 function dragBehavior() {
@@ -1699,6 +2082,21 @@ controls.group.addEventListener("change", () => {
 });
 controls.kinds.forEach(input => input.addEventListener("change", () => { render(); persistState(); }));
 controls.memoryClasses.forEach(input => input.addEventListener("change", () => { render(); persistState(); }));
+controls.layoutInputs.forEach(input => input.addEventListener("input", () => {
+  updateLayoutValue(input.dataset.layoutKey, input.value);
+}));
+controls.layoutReset?.addEventListener("click", resetLayoutConfig);
+controls.layoutSave?.addEventListener("click", () => {
+  persistState();
+  setStatus("Layout saved.");
+});
+controls.layoutExport?.addEventListener("click", exportLayoutConfig);
+controls.layoutImport?.addEventListener("click", () => controls.layoutImportInput?.click());
+controls.layoutImportInput?.addEventListener("change", async () => {
+  const file = controls.layoutImportInput.files && controls.layoutImportInput.files[0];
+  await importLayoutConfigFromFile(file);
+  controls.layoutImportInput.value = "";
+});
 controls.theme.addEventListener("click", toggleTheme);
 controls.export.addEventListener("click", e => {
   e.stopPropagation();
@@ -1747,6 +2145,7 @@ document.addEventListener("keydown", e => {
 
 // ---------- Boot ----------
 applyPersisted(loadPersisted());
+syncLayoutControls();
 updateMinConfidenceLabel();
 loadGroups();
 loadTimelineBounds();

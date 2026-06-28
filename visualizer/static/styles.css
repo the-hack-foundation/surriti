@@ -229,6 +229,31 @@ h1, h2, h3, h4, p { margin: 0; }
   padding: 4px 12px 12px;
 }
 
+.layout-controls {
+  display: grid;
+  gap: 10px;
+  padding: 8px 12px 12px;
+}
+
+.layout-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 10px;
+  align-items: center;
+  font-size: 12px;
+}
+
+.layout-row input[type="range"] {
+  grid-column: 1 / -1;
+  width: 100%;
+}
+
+.layout-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
 /* ---------- Toolbar ---------- */
 .toolbar {
   display: grid;

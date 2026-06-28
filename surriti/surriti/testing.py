@@ -106,10 +106,22 @@ class InMemoryDriver:
                 if r.get("group_id") == v.get("g") and r.get("name") == v.get("n")
             ]
             return [rows[:1]]
+        if s.startswith("SELECT * FROM entity") and "name = $name" in s:
+            rows = [
+                r for r in self.records["entity"]
+                if r.get("group_id") == v.get("group_id") and r.get("name") == v.get("name")
+            ]
+            return [rows[:1]]
         if s.startswith("SELECT * FROM entity WHERE group_id") and "uuid = $u" in s:
             rows = [
                 r for r in self.records["entity"]
                 if r.get("group_id") == v.get("g") and r.get("uuid") == v.get("u")
+            ]
+            return [rows[:1]]
+        if s.startswith("SELECT * FROM entity") and "uuid = $uuid" in s:
+            rows = [
+                r for r in self.records["entity"]
+                if r.get("group_id") == v.get("group_id") and r.get("uuid") == v.get("uuid")
             ]
             return [rows[:1]]
         if s.startswith("SELECT * FROM entity WHERE group_id") and "uuid IN" in s:
@@ -154,6 +166,20 @@ class InMemoryDriver:
                 and r.get("invalid_at") is None
             ]
             return [rows[:10]]
+        if "FROM relates_to" in s and "uuid = $uuid" in s:
+            rows = [
+                r for r in self.records["relates_to"]
+                if r.get("group_id") == v.get("group_id") and r.get("uuid") == v.get("uuid")
+            ]
+            return [rows[:1]]
+        if "FROM relates_to" in s and "uuid IN $uuids" in s:
+            wanted = set(v.get("uuids") or [])
+            rows = [
+                {"uuid": r.get("uuid"), "recall_count": r.get("recall_count")}
+                for r in self.records["relates_to"]
+                if r.get("group_id") == v.get("group_id") and r.get("uuid") in wanted
+            ]
+            return [rows]
         if "FROM relates_to" in s and "valid_at <= $as_of" in s:
             # get_facts_as_of: edges valid at the given timestamp.
             rows = []
@@ -200,6 +226,14 @@ class InMemoryDriver:
             ]
             if "domain" in v:
                 rows = [r for r in rows if r.get("domain") == v.get("domain")]
+            if 'AND name = "has_trait"' in s:
+                rows = [r for r in rows if r.get("name") == "has_trait"]
+            if 'AND name = "has_belief"' in s:
+                rows = [r for r in rows if r.get("name") == "has_belief"]
+            if 'AND name = "has_pattern"' in s:
+                rows = [r for r in rows if r.get("name") == "has_pattern"]
+            if "is_belief = true" in s:
+                rows = [r for r in rows if r.get("is_belief") is True]
             limit = v.get("limit", 50)
             return [rows[:limit]]
         if "FROM relates_to" in s and "(in = $rec OR out = $rec)" in s:
@@ -227,7 +261,7 @@ class InMemoryDriver:
                 scored.append((cosine_similarity(vec, r["fact_embedding"]), r))
             scored.sort(key=lambda x: x[0], reverse=True)
             return [[r for _, r in scored[:10]]]
-        if "FROM relates_to" in s and "fact @1@" in s:
+        if "FROM relates_to" in s and ("fact @0@" in s or "fact @1@" in s):
             q = (v.get("q") or "").lower()
             tokens = [t for t in q.split() if t]
             rows = [
@@ -247,7 +281,7 @@ class InMemoryDriver:
                 scored.append((cosine_similarity(vec, r["name_embedding"]), r))
             scored.sort(key=lambda x: x[0], reverse=True)
             return [[r for _, r in scored[:10]]]
-        if "FROM entity" in s and "name @1@" in s:
+        if "FROM entity" in s and ("name @0@" in s or "name @1@" in s):
             q = (v.get("q") or "").lower()
             tokens = [t for t in q.split() if t]
             rows = [
@@ -256,7 +290,32 @@ class InMemoryDriver:
                 and v.get("group_id") in (None, r.get("group_id"))
             ]
             return [rows]
-        if s.startswith("SELECT * FROM episode"):
+        if "SELECT count() as cnt FROM episode" in s:
+            rows = [
+                r for r in self.records["episode"]
+                if r.get("group_id") == v.get("group_id")
+                and "self_" in str(r.get("source") or "")
+            ]
+            return [[{"cnt": len(rows)}]]
+        if "FROM episode" in s and "uuid IN $episode_uuids" in s:
+            wanted = set(v.get("episode_uuids") or [])
+            rows = [
+                r for r in self.records["episode"]
+                if r.get("group_id") == v.get("group_id")
+                and r.get("uuid") in wanted
+                and "self_" in str(r.get("source") or "")
+            ]
+            rows.sort(key=lambda r: r.get("created_at"), reverse=True)
+            return [rows[:100]]
+        if "FROM episode" in s and "cognition_processed_at IS NONE" in s:
+            rows = [
+                {"group_id": r.get("group_id", ""), "uuid": r.get("uuid")}
+                for r in self.records["episode"]
+                if r.get("cognition_processed_at") is None
+            ]
+            rows.reverse()
+            return [rows[: int(v.get("limit") or 100)]]
+        if (s.startswith("SELECT * FROM episode") or "FROM episode" in s) and "uuid IN $u" not in s:
             groups = set(v.get("groups") or [])
             rows = [
                 r for r in self.records["episode"]
@@ -267,6 +326,8 @@ class InMemoryDriver:
             ]
             if v.get("source") is not None:
                 rows = [r for r in rows if r.get("source") == v.get("source")]
+            if "source CONTAINS 'self_'" in s:
+                rows = [r for r in rows if "self_" in str(r.get("source") or "")]
             if v.get("ref") is not None:
                 rows = [r for r in rows if r.get("reference_time") <= v.get("ref")]
             rows.sort(key=lambda r: r.get("reference_time"), reverse=True)
@@ -285,6 +346,28 @@ class InMemoryDriver:
                         if episode_uuid not in merged:
                             merged.append(episode_uuid)
                     r["episodes"] = merged
+            return [[{"ok": True}]]
+        if s.startswith("UPDATE relates_to") and "last_recalled_at" in s:
+            for r in self.records["relates_to"]:
+                if r.get("group_id") == v.get("group_id") and r.get("uuid") == v.get("uuid"):
+                    r["recall_count"] = int(v.get("recall_count") or 0)
+                    r["last_recalled_at"] = v.get("last_recalled_at")
+            return [[{"ok": True}]]
+        if s.startswith("UPDATE relates_to") and "fact = $fact" in s:
+            for r in self.records["relates_to"]:
+                if r.get("group_id") == v.get("group_id") and r.get("uuid") == v.get("uuid"):
+                    for key in ("fact", "confidence", "is_belief", "attributes"):
+                        if key in v:
+                            r[key] = v[key]
+                    r["status"] = "active"
+                    r["invalid_at"] = None
+            return [[{"ok": True}]]
+        if s.startswith("UPDATE episode SET") and "cognition_processed_at" in s:
+            wanted = set(v.get("episode_uuids") or [])
+            for r in self.records["episode"]:
+                if r.get("group_id") == v.get("group_id") and r.get("uuid") in wanted:
+                    r["cognition_processed_at"] = v.get("processed_at")
+                    r["cognition_version"] = v.get("version")
             return [[{"ok": True}]]
         if s.startswith("UPDATE relates_to") and "record::id(in) IN $aliases" in s:
             aliases = set(v.get("aliases") or [])
