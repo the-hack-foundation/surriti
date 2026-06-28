@@ -188,6 +188,33 @@ class SurrealDriver:
 
         try:
             await self.query(schema_ddl(self.embedding_dim))
+            # Backfill cognitive-layer fields added after initial deployment.
+            # Records inserted before these fields existed have NONE, which
+            # fails SurrealDB's TYPE validation on any subsequent UPDATE.
+            await self.query(
+                "UPDATE relates_to SET recall_count = 0"
+                " WHERE recall_count IS NONE;"
+            )
+            await self.query(
+                "UPDATE relates_to SET reinforcement_count = 1"
+                " WHERE reinforcement_count IS NONE;"
+            )
+            await self.query(
+                "UPDATE relates_to SET weight = 1.0"
+                " WHERE weight IS NONE;"
+            )
+            await self.query(
+                "UPDATE relates_to SET decay_score = 1.0"
+                " WHERE decay_score IS NONE;"
+            )
+            await self.query(
+                "UPDATE entity SET salience = 0.0"
+                " WHERE salience IS NONE;"
+            )
+            await self.query(
+                "UPDATE entity SET mention_count = 0"
+                " WHERE mention_count IS NONE;"
+            )
         except Exception as exc:
             raise SurritiSchemaError(f"Failed to initialise schema: {exc}") from exc
 

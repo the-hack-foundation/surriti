@@ -64,8 +64,8 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     DEFINE FIELD IF NOT EXISTS aliases           ON entity TYPE array<string> DEFAULT [];
     DEFINE FIELD IF NOT EXISTS profile_summary   ON entity TYPE string DEFAULT "";
     DEFINE FIELD IF NOT EXISTS profile_embedding ON entity TYPE option<array<float>>;
-    DEFINE FIELD IF NOT EXISTS salience          ON entity TYPE float DEFAULT 0;
-    DEFINE FIELD IF NOT EXISTS mention_count     ON entity TYPE int DEFAULT 0;
+    DEFINE FIELD OVERWRITE salience          ON entity TYPE option<float> DEFAULT 0;
+    DEFINE FIELD OVERWRITE mention_count     ON entity TYPE option<int> DEFAULT 0;
     DEFINE FIELD IF NOT EXISTS last_seen_at      ON entity TYPE option<datetime>;
     DEFINE FIELD IF NOT EXISTS merged_into       ON entity TYPE option<string>;
     -- Cognitive layer (additive). All optional / cached / safe defaults.
@@ -175,12 +175,12 @@ def schema_ddl(embedding_dim: int = 768) -> str:
     -- rows load forward without backfill. Populated lazily by
     -- ``surriti.cognition`` (reinforcement / decay / consolidation /
     -- belief / affect passes) and read by recall + rerankers.
-    DEFINE FIELD IF NOT EXISTS weight             ON relates_to TYPE float DEFAULT 1.0;
-    DEFINE FIELD IF NOT EXISTS reinforcement_count ON relates_to TYPE int DEFAULT 1;
+    DEFINE FIELD OVERWRITE weight             ON relates_to TYPE option<float> DEFAULT 1.0;
+    DEFINE FIELD OVERWRITE reinforcement_count ON relates_to TYPE option<int> DEFAULT 1;
     DEFINE FIELD IF NOT EXISTS last_reinforced_at  ON relates_to TYPE option<datetime>;
-    DEFINE FIELD IF NOT EXISTS recall_count        ON relates_to TYPE int DEFAULT 0;
+    DEFINE FIELD OVERWRITE recall_count        ON relates_to TYPE option<int> DEFAULT 0;
     DEFINE FIELD IF NOT EXISTS last_recalled_at    ON relates_to TYPE option<datetime>;
-    DEFINE FIELD IF NOT EXISTS decay_score          ON relates_to TYPE float DEFAULT 1.0;
+    DEFINE FIELD OVERWRITE decay_score          ON relates_to TYPE option<float> DEFAULT 1.0;
     DEFINE FIELD IF NOT EXISTS stability            ON relates_to TYPE string DEFAULT "episodic";
     DEFINE FIELD IF NOT EXISTS valence              ON relates_to TYPE option<float>;
     DEFINE FIELD IF NOT EXISTS intensity            ON relates_to TYPE option<float>;
