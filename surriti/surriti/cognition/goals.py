@@ -109,7 +109,7 @@ async def _resolve_speaker_uuid(
     user_rows = _unwrap(
         await driver.query(
             """
-            SELECT uuid FROM entity
+            SELECT uuid, created_at FROM entity
             WHERE group_id = $g AND 'user' IN labels
             ORDER BY created_at DESC
             LIMIT 1;
@@ -123,7 +123,7 @@ async def _resolve_speaker_uuid(
     any_rows = _unwrap(
         await driver.query(
             """
-            SELECT uuid FROM entity
+            SELECT uuid, created_at FROM entity
             WHERE group_id = $g
             ORDER BY created_at DESC
             LIMIT 1;

@@ -73,7 +73,7 @@ class CognitionScheduler:
             rows = _unwrap(
                 await self._driver.query(
                     """
-                    SELECT group_id, uuid
+                    SELECT group_id, uuid, created_at
                     FROM episode
                     WHERE cognition_processed_at IS NONE
                     ORDER BY created_at DESC
