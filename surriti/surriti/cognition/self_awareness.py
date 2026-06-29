@@ -339,72 +339,53 @@ async def _extract_self_traits(
     episodes: list[dict[str, Any]],
     config: CognitionConfig,
 ) -> tuple[int, int]:
-    """Extract self-traits from self_observation episodes.
+    """Extract self-traits/beliefs from self_observation episodes.
 
-    Returns (traits_extracted, beliefs_extracted).
+    Understands both structured JSON (reflective_self_observation / interaction_event)
+    and legacy prose. Returns (traits_extracted, beliefs_extracted).
     """
     if not episodes:
         return 0, 0
 
-    # Build a prompt with all self-observations
-    ep_texts = "\n\n".join(
-        f"[{ep.get('source_description', '')}] {ep.get('content', '')}"
-        for ep in episodes
-    )
+    ep_texts = _render_episodes_for_llm(episodes)
 
     prompt = textwrap.dedent(f"""\
-        You are an AI assistant analyzing your own self-observations.
-        Extract structured self-model data from these observations.
+        Analyze these AI assistant self-observations and extract durable behavioral traits and beliefs.
+        Episodes may contain structured JSON (reflective_self_observation or interaction_event).
+        Prefer lesson_candidates from structured entries; use evidence field for confidence.
 
         Self-observations:
         {ep_texts}
 
-        Return JSON with this structure:
+        Return JSON:
         {{
           "traits": [
-            {{"trait": "concise", "evidence": "multiple observations mention brevity", "confidence": 0.8}}
+            {{"trait": "<concise label>", "evidence": "<direct quote or signal>", "confidence": 0.0, "support_count": 1}}
           ],
           "beliefs": [
-            {{"belief": "I tend to be verbose in technical contexts", "confidence": 0.7}}
+            {{"belief": "<first-person operational belief about behavior>", "confidence": 0.0, "evidence": "<direct evidence>"}}
           ]
         }}
 
-        Only include traits/beliefs directly supported by the observations.
-        Be honest and specific.
+        Rules: confidence >= 0.5 required. No private feelings, no hidden motives. Operational only.
     """)
 
     try:
         response = await _complete_json(
-            llm,
-            prompt=prompt,
-            system=(
-                "You are analyzing self-observations of an AI assistant. "
-                "Return structured JSON. Be concise and accurate."
-            ),
+            llm, prompt=prompt,
+            system="Extract structured self-model data from AI observations. Return only valid JSON.",
         )
         if not response:
             return 0, 0
-        # Parse JSON response and write to graph
         import json
-        try:
-            data = json.loads(response)
-        except json.JSONDecodeError:
-            logger.warning("self-awareness: failed to parse LLM response as JSON")
-            return 0, 0
-
-        traits_count = 0
-        beliefs_count = 0
-
-        for trait in data.get("traits", []):
-            await _write_self_trait(driver, group_id, trait)
-            traits_count += 1
-
-        for belief in data.get("beliefs", []):
-            await _write_self_belief(driver, group_id, belief)
-            beliefs_count += 1
-
-        return traits_count, beliefs_count
-
+        data = json.loads(_strip_fences(response))
+        traits = [x for x in data.get("traits", []) if float(x.get("confidence", 0)) >= 0.5]
+        beliefs = [x for x in data.get("beliefs", []) if float(x.get("confidence", 0)) >= 0.5]
+        for x in traits:
+            await _write_self_trait(driver, group_id, x)
+        for x in beliefs:
+            await _write_self_belief(driver, group_id, x)
+        return len(traits), len(beliefs)
     except Exception:
         logger.exception("self-awareness: trait extraction failed")
         return 0, 0
@@ -421,47 +402,36 @@ async def _extract_self_patterns(
     if not episodes:
         return 0
 
-    ep_texts = "\n\n".join(
-        f"[{ep.get('source_description', '')}] {ep.get('content', '')}"
-        for ep in episodes
-    )
+    ep_texts = _render_episodes_for_llm(episodes)
 
     prompt = textwrap.dedent(f"""\
-        You are an AI assistant analyzing your own behavioral patterns.
-        Extract structured pattern data.
+        Identify recurring behavioral patterns from these AI assistant self-observations.
+        Prefer future_behavior_adjustments from structured reflective_self_observation entries.
+        Only include patterns appearing in >= 2 episodes or explicitly labeled recurring.
 
-        Self-pattern observations:
+        Observations:
         {ep_texts}
 
         Return JSON:
         {{
           "patterns": [
-            {{"pattern": "prefers structured responses", "frequency": "high", "context": "technical queries"}}
+            {{"pattern": "<description>", "frequency": "occasional|recurring|frequent", "context": "<domain>"}}
           ]
         }}
     """)
 
     try:
         response = await _complete_json(
-            llm,
-            system="Return concise JSON describing assistant behavioral patterns.",
-            prompt=prompt,
+            llm, system="Extract recurring behavioral patterns. Return only valid JSON.", prompt=prompt,
         )
         if not response:
             return 0
         import json
-        try:
-            data = json.loads(response)
-        except json.JSONDecodeError:
-            return 0
-
-        patterns_count = 0
-        for pattern in data.get("patterns", []):
-            await _write_self_pattern(driver, group_id, pattern)
-            patterns_count += 1
-
-        return patterns_count
-
+        data = json.loads(_strip_fences(response))
+        patterns = data.get("patterns", [])
+        for x in patterns:
+            await _write_self_pattern(driver, group_id, x)
+        return len(patterns)
     except Exception:
         logger.exception("self-awareness: pattern extraction failed")
         return 0
@@ -474,89 +444,151 @@ async def _extract_traits_from_events(
     episodes: list[dict[str, Any]],
     config: CognitionConfig,
 ) -> tuple[int, int]:
-    """Extract traits from self_correction and self_success episodes."""
+    """Extract traits/beliefs from self_correction and self_success episodes.
+
+    These carry the richest signal: corrections = what not to do, successes = what works.
+    Understands structured reflective_self_observation JSON.
+    """
     if not episodes:
         return 0, 0
 
-    ep_texts = "\n\n".join(
-        f"[{ep.get('source_description', '')}] {ep.get('content', '')}"
-        for ep in episodes
-    )
+    ep_texts = _render_episodes_for_llm(episodes)
 
     prompt = textwrap.dedent(f"""\
-        You are an AI assistant analyzing your own corrections and successes.
-        Extract traits and beliefs from these events.
+        Analyze these AI assistant correction and success events. Extract durable operational lessons.
+        For corrections: what went wrong, what adjustment is needed.
+        For successes: what worked, what to reinforce.
+        Prefer lesson_candidates and future_behavior_adjustments from structured JSON entries.
 
-        Self-corrections/successes:
+        Events:
         {ep_texts}
 
         Return JSON:
         {{
           "traits": [
-            {{"trait": "adaptable", "evidence": "acknowledges and corrects mistakes", "confidence": 0.9}}
+            {{"trait": "<label>", "evidence": "<quote>", "confidence": 0.0, "support_count": 1}}
           ],
           "beliefs": [
-            {{"belief": "I value accuracy over speed", "confidence": 0.7}}
+            {{"belief": "<first-person operational belief>", "confidence": 0.0, "evidence": "<evidence>"}}
           ]
         }}
+
+        Rules: confidence >= 0.5. Beliefs must reference this user's specific interaction patterns.
     """)
 
     try:
         response = await _complete_json(
-            llm,
-            system="Return concise JSON describing assistant traits and beliefs.",
-            prompt=prompt,
+            llm, system="Extract operational lessons from assistant events. Return only valid JSON.", prompt=prompt,
         )
         if not response:
             return 0, 0
         import json
-        try:
-            data = json.loads(response)
-        except json.JSONDecodeError:
-            return 0, 0
-
-        traits_count = 0
-        beliefs_count = 0
-
-        for trait in data.get("traits", []):
-            await _write_self_trait(driver, group_id, trait)
-            traits_count += 1
-
-        for belief in data.get("beliefs", []):
-            await _write_self_belief(driver, group_id, belief)
-            beliefs_count += 1
-
-        return traits_count, beliefs_count
-
+        data = json.loads(_strip_fences(response))
+        traits = [x for x in data.get("traits", []) if float(x.get("confidence", 0)) >= 0.5]
+        beliefs = [x for x in data.get("beliefs", []) if float(x.get("confidence", 0)) >= 0.5]
+        for x in traits:
+            await _write_self_trait(driver, group_id, x)
+        for x in beliefs:
+            await _write_self_belief(driver, group_id, x)
+        return len(traits), len(beliefs)
     except Exception:
         logger.exception("self-awareness: event trait extraction failed")
         return 0, 0
+
+
+# ---------------------------------------------------------------------------
+# Helpers for structured-JSON episode content
+# ---------------------------------------------------------------------------
+
+def _strip_fences(text: str) -> str:
+    """Remove accidental markdown code fences from LLM responses."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        parts = t.split("```")
+        t = parts[1] if len(parts) > 1 else t
+        if t.startswith("json"):
+            t = t[4:]
+    return t.strip()
+
+
+def _render_episodes_for_llm(episodes: list[dict[str, Any]], limit: int = 12) -> str:
+    """Render episodes for LLM prompt.
+
+    For episodes whose content is valid JSON, render structured fields
+    (kind, lesson_candidates, future_behavior_adjustments, interaction_summary)
+    instead of the raw JSON blob.  Falls back to raw content.
+    """
+    import json as _json
+    lines: list[str] = []
+    for ep in episodes[:limit]:
+        src = ep.get("source_description") or ep.get("source", "")
+        raw = ep.get("content", "")
+        try:
+            data = _json.loads(raw)
+        except Exception:
+            data = None
+
+        if isinstance(data, dict) and data.get("kind") in (
+            "reflective_self_observation", "interaction_event"
+        ):
+            parts: list[str] = [f"[{src}] kind={data['kind']}"]
+            if data.get("interaction_summary"):
+                parts.append(f"  summary: {data['interaction_summary']}")
+            q = data.get("perceived_interaction_quality")
+            if isinstance(q, dict):
+                parts.append(f"  quality: {q.get('score', '?')} — {q.get('reason', '')}")
+            sigs = (data.get("observable_signals") or {}).get("feedback", [])
+            if sigs:
+                parts.append(f"  signals: {', '.join(sigs)}")
+            for lc in (data.get("lesson_candidates") or []):
+                lc_text = lc.get("lesson", "")
+                lc_conf = lc.get("confidence", 0)
+                lc_ev = lc.get("evidence", "")
+                if lc_text:
+                    parts.append(f"  lesson (conf={lc_conf:.2f}): {lc_text}")
+                    if lc_ev:
+                        parts.append(f"    evidence: {lc_ev}")
+            for adj in (data.get("future_behavior_adjustments") or []):
+                parts.append(f"  adjustment: {adj}")
+            lines.append("\n".join(parts))
+        else:
+            # Prose or unknown — truncate
+            content = str(raw or "")
+            if len(content) > 600:
+                content = content[:600] + "…"
+            lines.append(f"[{src}] {content}")
+
+    return "\n\n".join(lines) if lines else "(no episodes)"
 
 
 async def _write_self_trait(
     driver: Any,
     group_id: str,
     trait_data: dict[str, Any],
-) -> None:
-    """Write a self-trait edge to the graph."""
+) -> str | None:
+    """Write a self-trait edge. Returns entity UUID or None if skipped."""
     trait_name = trait_data.get("trait", "")
     if not trait_name:
-        return
+        return None
 
     self_entity = await _get_self_entity(driver, group_id)
     if not self_entity:
-        return
+        return None
 
     trait_uuid = _stable_uuid("trait", group_id, trait_name)
-    confidence = trait_data.get("confidence", 0.5)
+    confidence = float(trait_data.get("confidence", 0.5))
     evidence = trait_data.get("evidence", "")
+    support = int(trait_data.get("support_count", 1))
+    summary = evidence or f"Self-trait: {trait_name}"
+    if support > 1:
+        summary = f"{summary} (seen {support}x)"
 
     trait_uuid = await _upsert_self_model_entity(
         driver,
         uuid=trait_uuid,
         group_id=group_id,
         name=trait_name,
-        summary=evidence or f"Self-trait: {trait_name}",
+        summary=summary,
         labels=["SelfTrait", "Trait"],
     )
     await _upsert_self_model_edge(
@@ -569,31 +601,36 @@ async def _write_self_trait(
         fact=f"has_trait: {trait_name}",
         confidence=confidence,
     )
+    return trait_uuid
 
 
 async def _write_self_belief(
     driver: Any,
     group_id: str,
     belief_data: dict[str, Any],
-) -> None:
-    """Write a self-belief edge to the graph."""
+) -> str | None:
+    """Write a self-belief edge. Returns entity UUID or None if skipped."""
     belief_text = belief_data.get("belief", "")
     if not belief_text:
-        return
+        return None
 
     self_entity = await _get_self_entity(driver, group_id)
     if not self_entity:
-        return
+        return None
 
     belief_uuid = _stable_uuid("belief", group_id, belief_text)
-    confidence = belief_data.get("confidence", 0.5)
+    confidence = float(belief_data.get("confidence", 0.5))
+    evidence = belief_data.get("evidence", "")
+    summary = belief_text
+    if evidence:
+        summary = f"{belief_text} [evidence: {evidence[:200]}]"
 
     belief_uuid = await _upsert_self_model_entity(
         driver,
         uuid=belief_uuid,
         group_id=group_id,
         name="self_belief",
-        summary=belief_text,
+        summary=summary,
         labels=["SelfBelief"],
     )
     await _upsert_self_model_edge(
@@ -607,30 +644,38 @@ async def _write_self_belief(
         confidence=confidence,
         is_belief=True,
     )
+    return belief_uuid
 
 
 async def _write_self_pattern(
     driver: Any,
     group_id: str,
     pattern_data: dict[str, Any],
-) -> None:
-    """Write a self-pattern edge to the graph."""
+) -> str | None:
+    """Write a self-pattern edge. Returns entity UUID or None if skipped."""
     pattern_name = pattern_data.get("pattern", "")
     if not pattern_name:
-        return
+        return None
 
     self_entity = await _get_self_entity(driver, group_id)
     if not self_entity:
-        return
+        return None
 
     pattern_uuid = _stable_uuid("pattern", group_id, pattern_name)
+    freq = pattern_data.get("frequency", "")
+    ctx = pattern_data.get("context", "")
+    summary_parts = [pattern_name]
+    if freq:
+        summary_parts.append(f"frequency={freq}")
+    if ctx:
+        summary_parts.append(f"context={ctx}")
 
     pattern_uuid = await _upsert_self_model_entity(
         driver,
         uuid=pattern_uuid,
         group_id=group_id,
         name=pattern_name,
-        summary=str(pattern_data),
+        summary=" | ".join(summary_parts),
         labels=["SelfPattern", "Pattern"],
     )
     await _upsert_self_model_edge(
@@ -643,7 +688,7 @@ async def _write_self_pattern(
         fact=f"has_pattern: {pattern_name}",
         confidence=0.7,
     )
-
+    return pattern_uuid
 
 async def _get_self_entity(
     driver: Any,

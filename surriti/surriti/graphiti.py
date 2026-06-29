@@ -2982,10 +2982,11 @@ class Surriti:
         self,
         *,
         episode_type: EpisodeType,
-        content: str,
+        content: "str | dict",
         group_id: str = "",
         name: str | None = None,
         reference_time: datetime | None = None,
+        source_description: str | None = None,
     ) -> AddEpisodeResults:
         """Store a self-referential episode for operational self-awareness.
 
@@ -3029,6 +3030,10 @@ class Surriti:
                 f"self_success, self_pattern"
             )
 
+        import json as _json  # noqa: PLC0415
+        if isinstance(content, dict):
+            content = _json.dumps(content, ensure_ascii=False)
+
         episode_name = name or f"self_{episode_type.value}"
         ref_time = reference_time or datetime.now(timezone.utc)
 
@@ -3037,7 +3042,7 @@ class Surriti:
             name=episode_name,
             content=content,
             source=episode_type,
-            source_description=f"self_{episode_type.value}",
+            source_description=source_description or f"self_{episode_type.value}",
             reference_time=ref_time,
             group_id=group_id,
         )
@@ -3109,6 +3114,13 @@ class Surriti:
             entities=[self_entity],
             group_id=group_id,
         )
+
+        # Fire cognition so self-awareness pass processes this episode
+        if self._cognition is not None and self._cognition.enabled:
+            try:
+                self._cognition.notify(group_id, episode.uuid)
+            except Exception:  # noqa: BLE001
+                logger.exception("add_self_episode cognition notify raised; ignoring")
 
         return AddEpisodeResults(
             episode=episode,
