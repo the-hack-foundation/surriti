@@ -373,7 +373,10 @@ async def _extract_self_traits(
     try:
         response = await _complete_json(
             llm, prompt=prompt,
-            system="Extract structured self-model data from AI observations. Return only valid JSON.",
+            system=(
+                "Extract structured self-model data from AI self-observations. "
+                "Return only valid JSON."
+            ),
         )
         if not response:
             return 0, 0
@@ -511,6 +514,13 @@ def _strip_fences(text: str) -> str:
     return t.strip()
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _render_episodes_for_llm(episodes: list[dict[str, Any]], limit: int = 12) -> str:
     """Render episodes for LLM prompt.
 
@@ -542,7 +552,7 @@ def _render_episodes_for_llm(episodes: list[dict[str, Any]], limit: int = 12) ->
                 parts.append(f"  signals: {', '.join(sigs)}")
             for lc in (data.get("lesson_candidates") or []):
                 lc_text = lc.get("lesson", "")
-                lc_conf = lc.get("confidence", 0)
+                lc_conf = _safe_float(lc.get("confidence"), 0.0)
                 lc_ev = lc.get("evidence", "")
                 if lc_text:
                     parts.append(f"  lesson (conf={lc_conf:.2f}): {lc_text}")

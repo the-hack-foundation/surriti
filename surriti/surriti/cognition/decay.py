@@ -16,6 +16,9 @@ _DEFAULT_HALF_LIFE_DAYS: dict[str, float] = {
 
 DEFAULT_DECAY_POINTS_PER_DAY = 0.01
 DEFAULT_RECALL_BOOST = 0.04
+DEFAULT_REINFORCEMENT_BOOST = 0.03
+MAX_RECALL_BOOST = 0.2
+MAX_REINFORCEMENT_BOOST = 0.25
 
 PROTECTED_MEMORY_CLASSES: frozenset[str] = frozenset(
     {
@@ -77,4 +80,18 @@ def effective_confidence(
     half_life_overrides: dict[str, float] | None = None,
 ) -> float:
     _ = half_life_overrides
-    return linear_vitality(edge, now=now)
+    base = max(0.0, min(1.0, float(edge.confidence)))
+    vitality = linear_vitality(edge, now=now)
+    if is_decay_protected(edge):
+        return base
+
+    reinforcement_count = max(1, int(edge.reinforcement_count or 1))
+    reinforcement_boost = min(
+        MAX_REINFORCEMENT_BOOST,
+        math.log1p(reinforcement_count - 1) * DEFAULT_REINFORCEMENT_BOOST,
+    )
+    recall_count = max(0, int(edge.recall_count or 0))
+    recall_boost = min(MAX_RECALL_BOOST, recall_count * DEFAULT_RECALL_BOOST)
+
+    score = (base * vitality) + reinforcement_boost + recall_boost
+    return max(0.0, min(1.0, score))

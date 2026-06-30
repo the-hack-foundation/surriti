@@ -20,6 +20,7 @@ import pytest
 from surriti.cognition import CognitionConfig, CognitionScheduler
 from surriti.cognition._jsonio import parse_json_loose, snake_case
 from surriti.cognition.affect import score_affect
+from surriti.cognition.self_awareness import _render_episodes_for_llm
 from surriti.cognition.decay import effective_confidence, half_life_for
 from surriti.cognition.perspective import looks_like_belief
 from surriti.cognition.procedural import classify_episode
@@ -172,6 +173,23 @@ def test_snake_case_normalises():
     assert snake_case("Distance Running") == "distance_running"
     assert snake_case("FortNite_BR") == "fortnite_br"
     assert snake_case("  multi   space\tword ") == "multi_space_word"
+
+
+def test_render_structured_self_episode_accepts_string_confidence():
+    text = _render_episodes_for_llm([
+        {
+            "source_description": "legba/post_turn_reflection",
+            "content": (
+                '{"kind":"reflective_self_observation",'
+                '"lesson_candidates":[{"lesson":"Lead with implementation.",'
+                '"confidence":"0.86","evidence":"User asked for code."}],'
+                '"future_behavior_adjustments":["Start with the patch."]}'
+            ),
+        }
+    ])
+
+    assert "lesson (conf=0.86): Lead with implementation." in text
+    assert "adjustment: Start with the patch." in text
 
 
 # ---------------------------------------------------------------- state
