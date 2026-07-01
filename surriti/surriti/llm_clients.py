@@ -353,10 +353,11 @@ def _build_extraction_user(
 
 def _strip_json_fences(text: str) -> str:
     text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    return text
+    # LLMs occasionally emit leading newlines before fences or trailing
+    # whitespace after them; handle both with a single pattern.
+    text = re.sub(r"```[a-zA-Z]*\s*", "", text, count=1)
+    text = re.sub(r"\s*```\s*$", "", text)
+    return text.strip()
 
 
 def _parse_extraction(raw: str) -> ExtractionResult:
@@ -550,7 +551,8 @@ def _parse_frame_classification(
                 if isinstance(object_role_raw, str) else None,
             confidence=max(0.0, min(1.0, confidence)),
         )
-    except Exception:
+    except (TypeError, ValueError, KeyError) as exc:
+        logger.debug("frame classification parse failed for %r: %s", fallback_predicate, exc)
         return None
 
 

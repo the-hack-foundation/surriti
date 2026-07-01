@@ -47,6 +47,17 @@ class InMemoryDriver:
     async def query(self, surql: str, variables: dict[str, Any] | None = None):
         s = surql.strip()
         v = variables or {}
+        if " IN $values" in s and "WHERE group_id = $g" in s:
+            import re as _re
+
+            _m = _re.search(r"FROM\s+(\w+)\s+WHERE.*?AND\s+(\w+)\s+IN\s+\$values", s)
+            if _m:
+                tbl, field = _m.group(1), _m.group(2)
+                wanted = set(v.get("values") or [])
+                return [[
+                    r for r in self.records[tbl]
+                    if r.get("group_id") == v.get("g") and r.get(field) in wanted
+                ]]
         if s.startswith('CREATE type::record("episode"'):
             self._insert("episode", v)
             return [[{"ok": True}]]
@@ -86,16 +97,13 @@ class InMemoryDriver:
             self._insert("entity", v)
             return [[{"ok": True}]]
         if "RELATE" in s and "->relates_to->" in s:
-            self._insert(
-                "relates_to",
-                {
-                    **v,
-                    "in": v["src"],
-                    "out": v["tgt"],
-                    "source_node_uuid": v["src"],
-                    "target_node_uuid": v["tgt"],
-                },
-            )
+            row = dict(v.get("row") or v)
+            row.setdefault("uuid", v.get("uuid"))
+            row["in"] = v["src"]
+            row["out"] = v["tgt"]
+            row["source_node_uuid"] = v["src"]
+            row["target_node_uuid"] = v["tgt"]
+            self._insert("relates_to", row)
             return [[{"ok": True}]]
         if "RELATE" in s and "->mentions->" in s:
             self._insert("mentions", {**v, "in": v["ep"], "out": v["en"]})
@@ -428,10 +436,103 @@ class InMemoryDriver:
                         if key in v:
                             r[key] = v[key]
             return [[{"ok": True}]]
+
+        # ── Generic CREATE type::record(...) fallback ───────────────────
+        import re as _re
+        _m = _re.match(r"CREATE type::record\(\"(\w+)\"", s)
+        if _m:
+            tbl = _m.group(1)
+            if tbl not in self.records:
+                self.records[tbl] = []
+            self._insert(tbl, v.get("row") or v)
+            return [[{"ok": True}]]
+
+        # ── Generic UPSERT type::record(...) fallback ───────────────────
+        _um = _re.match(r"UPSERT type::record\(\"(\w+)\"", s)
+        if _um:
+            tbl = _um.group(1)
+            if tbl not in self.records:
+                self.records[tbl] = []
+            payload = dict(v.get("row") or v)
+            payload.setdefault("uuid", v.get("uuid"))
+            # Upsert: replace existing with same uuid, or append.
+            existing = None
+            for i, r in enumerate(self.records[tbl]):
+                if r.get("uuid") == payload.get("uuid"):
+                    existing = i
+                    break
+            if existing is not None:
+                merged = {**self.records[tbl][existing], **payload}
+                self.records[tbl][existing] = merged
+            else:
+                self._insert(tbl, payload)
+            return [[{"ok": True}]]
+
+        # ── Memory Pack export queries ─────────────────────────────────
+        _exp_tables = {
+            "entity": "entity",
+            "entity_alias": "entity_alias",
+            "relation_frame": "relation_frame",
+            "relates_to": "relates_to",
+        }
+        for _tbl, _rec in _exp_tables.items():
+            # Paginated export: SELECT ... FROM <table> WHERE group_id = $g
+            #   ORDER BY created_at, uuid LIMIT $limit START $offset
+            if (
+                _re.search(rf"\bFROM\s+{_tbl}\b", s)
+                and "ORDER BY created_at, uuid" in s
+                and "$limit" in s
+            ):
+                offset = int(v.get("offset") or 0)
+                limit = int(v.get("limit") or 1000)
+                rows = [
+                    r for r in self.records[_rec]
+                    if r.get("group_id") == v.get("g")
+                ]
+                # Sort by created_at then uuid for deterministic pagination.
+                rows.sort(
+                    key=lambda r: (
+                        str(r.get("created_at") or ""),
+                        str(r.get("uuid") or ""),
+                    )
+                )
+                page = rows[offset : offset + limit]
+                # Inject `in` / `out` aliases for relates_to if the
+                # query requested them (record::id(in) AS `in`).
+                if _tbl == "relates_to" and "record::id(in)" in s:
+                    for r in page:
+                        r.setdefault("in", r.get("source_node_uuid", r.get("uuid")))
+                        r.setdefault("out", r.get("target_node_uuid", r.get("uuid")))
+                return [page]
+
+        # ── DELETE queries (used by import replace) ─────────────────────
+        for _tbl in ("relates_to", "entity_alias", "relation_frame", "entity"):
+            if s.startswith(f"DELETE {_tbl} WHERE uuid"):
+                before = len(self.records[_tbl])
+                self.records[_tbl] = [
+                    r for r in self.records[_tbl]
+                    if r.get("uuid") != v.get("uuid")
+                ]
+                after = len(self.records[_tbl])
+                return [[{"deleted": before - after}]]
+            if s.startswith(f"DELETE {_tbl} WHERE group_id") or \
+                    f"DELETE {_tbl} WHERE group_id" in s:
+                before = len(self.records[_tbl])
+                self.records[_tbl] = [
+                    r for r in self.records[_tbl]
+                    if r.get("group_id") != v.get("g")
+                ]
+                after = len(self.records[_tbl])
+                return [[{"deleted": before - after}]]
+
         return [[]]
 
     def _insert(self, table: str, payload: dict[str, Any]) -> None:
         record = {k: val for k, val in payload.items() if k not in {"src", "tgt", "ep", "en"}}
+        if table in {"entity", "community"} and "emb" in record:
+            record["name_embedding"] = record.pop("emb")
+        if table == "relates_to" and "emb" in record:
+            record["fact_embedding"] = record.pop("emb")
         self.records[table].append(record)
 
 

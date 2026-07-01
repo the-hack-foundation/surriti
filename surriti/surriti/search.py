@@ -402,8 +402,10 @@ async def search_nodes(
             by_uuid.setdefault(hit["uuid"], hit)
         rankings.append([h["uuid"] for h in by_uuid.values()])
     if query.strip():
-        for hit in await _fulltext_search_nodes(driver, query, group_id, limit):
+        ft_hits = await _fulltext_search_nodes(driver, query, group_id, limit)
+        for hit in ft_hits:
             by_uuid.setdefault(hit["uuid"], hit)
+        rankings.append([h["uuid"] for h in ft_hits])
     fused = _rrf_merge(rankings)
     rows = [by_uuid[u] for u in by_uuid if node_passes_filters(by_uuid[u], filters)]
     rows.sort(key=lambda r: fused.get(r["uuid"], 0.0), reverse=True)

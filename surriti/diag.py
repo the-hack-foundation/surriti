@@ -22,7 +22,7 @@ async def main():
         group_id="test-family",
     )
     print(f"Added episode: {ep}")
-    print(f"Episode uuid: {ep.uuid if hasattr(ep, 'uuid') else 'N/A'}")
+    print(f"Episode uuid: {ep.episode.uuid}")
 
     # Check what's in the DB
     episodes = await driver.query('SELECT * FROM episode WHERE group_id = "test-family";')

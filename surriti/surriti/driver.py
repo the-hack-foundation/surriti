@@ -172,16 +172,31 @@ class SurrealDriver:
                 )
                 if not stale:
                     raise
+                if attempt >= max_retries:
+                    raise SurritiConnectionError(
+                        f"SurrealDB connection to {self.url!r} could not be re-established "
+                        f"after {max_retries + 1} attempts: {exc}"
+                    ) from exc
                 logger.warning(
-                    "SurrealDB connection appears stale (%s); reconnecting and retrying.",
+                    "SurrealDB connection appears stale (%s); reconnecting and retrying "
+                    "(attempt %d/%d).",
                     exc,
+                    attempt + 2,
+                    max_retries + 1,
                 )
                 try:
                     await self.close()
                 except Exception:  # pragma: no cover
                     logger.debug("close() raised during reconnect; ignoring", exc_info=True)
-                await self.connect()
-                return await self.db.query(surql, variables or {})
+                try:
+                    await self.connect()
+                except SurritiConnectionError:
+                    raise
+                except Exception as exc2:
+                    raise SurritiConnectionError(
+                        f"SurrealDB reconnect to {self.url!r} failed: {exc2}"
+                    ) from exc2
+                continue
 
     async def init_schema(self) -> None:
         """Apply the Surriti schema. Idempotent - safe to call repeatedly."""

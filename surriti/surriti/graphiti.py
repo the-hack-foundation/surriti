@@ -1559,6 +1559,73 @@ class Surriti:
         )
         return parse_edge(rows[0]) if rows else None
 
+    async def export_memory_pack(
+        self,
+        group_id: str,
+        output_path: str | Path,
+        *,
+        include_embeddings: str = "never",
+        page_size: int = 1000,
+    ) -> dict:
+        """Export the compact knowledge graph for *group_id* into a ``.surriti-pack.zip``.
+
+        This is the primary public API for creating Surriti Memory Packs.
+        Returns a dict with ``output_path``, ``manifest``, ``counts``,
+        ``checksums``, and ``warnings`` keys.
+        """
+
+        from surriti.memory_pack import export_group_to_zip
+
+        result = await export_group_to_zip(
+            self.driver,
+            group_id,
+            output_path,
+            include_embeddings=include_embeddings,
+            page_size=page_size,
+            embedding_model=getattr(self.embedder, "model", None),
+        )
+        return {
+            "output_path": result.output_path,
+            "manifest": result.manifest,
+            "counts": result.counts,
+            "checksums": result.checksums,
+            "warnings": result.warnings,
+        }
+
+    async def import_memory_pack(
+        self,
+        input_path: str | Path,
+        target_group_id: str,
+        *,
+        mode: str = "merge",
+    ) -> dict:
+        """Import a compact Memory Pack into *target_group_id*.
+
+        The default merge mode is idempotent and remaps source UUIDs into the
+        target group so packs can be imported alongside their source graph.
+        """
+
+        from surriti.memory_pack import import_group_from_zip
+
+        result = await import_group_from_zip(
+            self.driver,
+            input_path,
+            target_group_id,
+            mode=mode,
+        )
+        return {
+            "target_group_id": result.target_group_id,
+            "mode": result.mode,
+            "counts": result.counts,
+            "validation": {
+                "ok": result.validation.ok,
+                "errors": result.validation.errors,
+                "warnings": result.validation.warnings,
+                "counts": result.validation.counts,
+            },
+            "warnings": result.warnings,
+        }
+
     async def get_episode(self, uuid: str) -> EpisodicNode | None:
         from surriti.search import _unwrap
 

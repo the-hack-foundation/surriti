@@ -82,6 +82,19 @@ from surriti.search_filters import (
 from surriti.validators import IDENTITY_PREDICATES, repair_fact
 from surriti.entity_resolution import ResolvedEntity, resolve_entity_mentions
 from surriti.profiles import backfill_profiles, refresh_entity_profiles
+from surriti.memory_pack import (
+    MEMORY_PACK_FORMAT,
+    MEMORY_PACK_VERSION,
+    ExportResult,
+    ImportResult,
+    ValidationResult,
+    export_group_to_dir,
+    export_group_to_zip,
+    import_group_from_dir,
+    import_group_from_zip,
+    validate_pack_dir,
+    validate_pack_zip,
+)
 
 __all__ = [
     # Core facade
@@ -139,7 +152,8 @@ __all__ = [
     # Helpers
     "setup_logging",
     "make_fact_key",
-    "repair_fact",    "IDENTITY_PREDICATES",
+    "repair_fact",
+    "IDENTITY_PREDICATES",
     # Entity resolution + dossier profiles
     "ResolvedEntity",
     "resolve_entity_mentions",
@@ -157,6 +171,18 @@ __all__ = [
     "make_slot_key",
     "normalize_symmetric",
     "qualifier_hash",
+    # Memory Pack
+    "MEMORY_PACK_FORMAT",
+    "MEMORY_PACK_VERSION",
+    "ExportResult",
+    "ImportResult",
+    "ValidationResult",
+    "export_group_to_dir",
+    "export_group_to_zip",
+    "import_group_from_dir",
+    "import_group_from_zip",
+    "validate_pack_dir",
+    "validate_pack_zip",
 ]
 
 __version__ = "0.5.0"

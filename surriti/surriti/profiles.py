@@ -133,7 +133,7 @@ async def refresh_entity_profiles(
                 await driver.query(
                     "SELECT * FROM relates_to WHERE group_id = $g "
                     "AND (in = $rec OR out = $rec) "
-                    "AND (invalid_at IS NONE OR invalid_at = NONE) "
+                    "AND invalid_at IS NONE "
                     "ORDER BY valid_at DESC LIMIT $lim;",
                     {
                         "g": group_id,
