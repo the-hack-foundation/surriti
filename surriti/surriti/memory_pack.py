@@ -151,11 +151,26 @@ def _compute_sha256(filepath: Path) -> str:
     return h.hexdigest()
 
 
-def _stable_import_uuid(target_group_id: str, table: str, source_uuid: Any) -> str:
-    """Return an idempotent target UUID for a source record."""
+def _stable_import_uuid(
+    target_group_id: str,
+    table: str,
+    source_uuid: Any,
+    *,
+    fallback_name: str = "",
+) -> str:
+    """Return an idempotent target UUID for a source record.
+
+    When ``source_uuid`` is empty the caller should supply ``fallback_name``
+    (e.g. entity ``name``) so repeated imports converge on the same UUID.
+    Without any stable input a warning-level UUIDv4 fallback is used and
+    the caller is expected to warn.
+    """
     source = str(source_uuid or "").strip()
     if not source:
-        source = uuid.uuid4().hex
+        if fallback_name:
+            source = str(fallback_name).strip()
+        if not source:
+            source = uuid.uuid4().hex
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"surriti:{target_group_id}:{table}:{source}"))
 
 
@@ -221,7 +236,6 @@ def _normalize_entity(row: dict, *, include_embeddings: str) -> dict:
         out[k] = _json_safe(v)
     if include_embeddings == "never":
         for f in _EMBEDDING_FIELDS.get("entity", []):
-            out.pop(f, None)
             out.pop(f, None)
     return out
 
@@ -463,12 +477,11 @@ async def export_group_to_dir(
     # Checksums.
     checksums: dict[str, dict] = {}
     for fname, fpath in files.items():
+        key = fname.replace(".jsonl", "")
         checksums[fname] = {
-            "rows": counts.get(fname.replace(".jsonl", "").replace("entity_", "entity_"), 0),
+            "rows": counts.get(key, 0),
             "sha256": _compute_sha256(fpath),
         }
-    # Fix alias count key.
-    checksums["entity_aliases.jsonl"]["rows"] = counts["entity_aliases"]
 
     # Manifest.
     manifest = {
@@ -536,6 +549,9 @@ async def export_group_to_zip(
     This is the primary public API for creating Memory Packs.
     """
     output_path = Path(output_path)
+    # Write to a temp file first, then atomically rename.  Avoids leaving
+    # a truncated .zip on disk when the connection drops mid-export.
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
 
     with tempfile.TemporaryDirectory(prefix="surriti_pack_") as tmpdir:
         tmp = Path(tmpdir)
@@ -550,8 +566,8 @@ async def export_group_to_zip(
             embedding_model=embedding_model,
         )
 
-        # Bundle into ZIP.
-        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Bundle into ZIP (temp file).
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for fname in [
                 "manifest.json",
                 "checksums.json",
@@ -563,6 +579,9 @@ async def export_group_to_zip(
                 fpath = tmp / fname
                 if fpath.exists():
                     zf.write(fpath, fname)
+
+    # Atomic rename — final path only appears on complete success.
+    tmp_path.rename(output_path)
 
     return ExportResult(
         output_path=str(output_path),
@@ -747,6 +766,29 @@ def validate_pack_zip(path: str | Path) -> ValidationResult:
 # ---------------------------------------------------------------------------
 
 
+_MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024  # 512 MiB
+
+
+def _validate_zip_safety(zf: zipfile.ZipFile, tmp: Path) -> None:
+    """Reject zip bombs and path-traversal entries before extraction."""
+    total = sum(
+        m.file_size for m in zf.infolist() if not m.is_dir()
+    )
+    if total > _MAX_UNCOMPRESSED_BYTES:
+        raise ValueError(
+            f"Zip uncompressed size {total} exceeds limit "
+            f"{_MAX_UNCOMPRESSED_BYTES}; possible zip bomb."
+        )
+    root = tmp.resolve()
+    for member in zf.infolist():
+        target = (tmp / member.filename).resolve()
+        if not str(target).startswith(str(root) + "/") and target != root:
+            raise ValueError(
+                f"Zip entry {member.filename!r} escapes temp dir; "
+                f"possible path-traversal attack."
+            )
+
+
 async def _existing_rows_by_key(
     driver,
     table: str,
@@ -785,20 +827,74 @@ async def _upsert_plain_record(driver, table: str, row: dict) -> None:
     )
 
 
+async def _safe_upsert(
+    driver, table: str, row: dict, label: str, warnings: list[str]
+) -> None:
+    """Upsert with concurrency-safe retry on unique-index races."""
+    try:
+        await _upsert_plain_record(driver, table, row)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already contains" in msg or "unique" in msg:
+            warnings.append(f"Race on {label}; reusing existing row.")
+        else:
+            raise
+
+
+def _resolve_frame_ref(
+    raw_id: Any,
+    frame_uuid_map: dict[str, str],
+    source_uuid: str,
+    warnings: list[str],
+) -> str | None:
+    """Map a source-group relation_frame_id to the target group.
+
+    When no mapping exists the reference is cleared (set to ``None``)
+    and a warning is emitted so the caller can backfill later.
+    """
+    sid = str(raw_id or "").strip()
+    if not sid:
+        return None
+    mapped = frame_uuid_map.get(sid)
+    if mapped is None:
+        warnings.append(
+            f"Edge {source_uuid!r}: relation frame {sid!r} not mapped — cleared"
+        )
+    return mapped
+
+
 async def _upsert_edge(driver, row: dict) -> None:
+    """Insert or update a ``relates_to`` edge idempotently.
+
+    SurrealDB does not support UPSERT on graph relations.  We check
+    whether the UUID already exists: UPDATE in-place when it does,
+    RELATE (create) when it does not.  No DELETE — the edge is never
+    left missing between operations.
+    """
     src = row.pop("source_node_uuid")
     tgt = row.pop("target_node_uuid")
-    await driver.query(
-        "DELETE relates_to WHERE uuid = $uuid;",
-        {"uuid": row["uuid"]},
+    restored = _restore_datetimes(row)
+    from surriti.search import _unwrap
+
+    existing = _unwrap(
+        await driver.query(
+            "SELECT uuid FROM relates_to WHERE group_id = $group_id AND uuid = $uuid LIMIT 1;",
+            {"group_id": restored.get("group_id", ""), "uuid": restored["uuid"]},
+        )
     )
-    await driver.query(
-        """
-        RELATE (type::record("entity", $src))->relates_to->(type::record("entity", $tgt))
-        CONTENT $row;
-        """,
-        {"src": src, "tgt": tgt, "row": _restore_datetimes(row)},
-    )
+    if existing:
+        await driver.query(
+            "UPDATE relates_to CONTENT $row WHERE uuid = $uuid;",
+            {"uuid": restored["uuid"], "row": restored},
+        )
+    else:
+        await driver.query(
+            """
+            RELATE (type::record("entity", $src))->relates_to->(type::record("entity", $tgt))
+            CONTENT $row;
+            """,
+            {"src": src, "tgt": tgt, "row": restored},
+        )
 
 
 async def import_group_from_dir(
@@ -863,12 +959,22 @@ async def import_group_from_dir(
         name = str(source.get("name") or "")
         target_uuid = str(existing_entities.get(name, {}).get("uuid") or "") if name else ""
         if not target_uuid:
-            target_uuid = _stable_import_uuid(target_group_id, "entity", source_uuid)
+            target_uuid = _stable_import_uuid(
+                target_group_id, "entity", source_uuid, fallback_name=name,
+            )
         entity_uuid_map[source_uuid] = target_uuid
 
+        if not source.get("uuid"):
+            warnings.append(
+                f"Entity {name!r} has empty source uuid; import may not be "
+                f"idempotent across runs."
+            )
         row = _without_omission_markers(source)
+        if "created_at" not in row or row.get("created_at") is None:
+            row["created_at"] = datetime.now(timezone.utc)
+            warnings.append(f"Entity {name!r} missing created_at; defaulting to now.")
         row.update({"uuid": target_uuid, "group_id": target_group_id})
-        await _upsert_plain_record(driver, "entity", row)
+        await _safe_upsert(driver, "entity", row, f"entity {name!r}", warnings)
         counts["entities"] += 1
 
     for source in frames:
@@ -882,8 +988,10 @@ async def import_group_from_dir(
         frame_uuid_map[source_uuid] = target_uuid
 
         row = _without_omission_markers(source)
+        if "created_at" not in row or row.get("created_at") is None:
+            row["created_at"] = datetime.now(timezone.utc)
         row.update({"uuid": target_uuid, "group_id": target_group_id})
-        await _upsert_plain_record(driver, "relation_frame", row)
+        await _safe_upsert(driver, "relation_frame", row, f"frame {canonical!r}", warnings)
         counts["relation_frames"] += 1
 
     for source in aliases:
@@ -903,6 +1011,8 @@ async def import_group_from_dir(
             target_uuid = _stable_import_uuid(target_group_id, "entity_alias", source.get("uuid"))
 
         row = _without_omission_markers(source)
+        if "created_at" not in row or row.get("created_at") is None:
+            row["created_at"] = datetime.now(timezone.utc)
         row.update(
             {
                 "uuid": target_uuid,
@@ -911,7 +1021,7 @@ async def import_group_from_dir(
                 "source_episode_uuid": None,
             }
         )
-        await _upsert_plain_record(driver, "entity_alias", row)
+        await _safe_upsert(driver, "entity_alias", row, f"alias {normalized!r}", warnings)
         counts["entity_aliases"] += 1
 
     for source in edges:
@@ -939,9 +1049,8 @@ async def import_group_from_dir(
                 "source_node_uuid": src,
                 "target_node_uuid": tgt,
                 "episodes": [],
-                "relation_frame_id": frame_uuid_map.get(
-                    str(row.get("relation_frame_id") or ""),
-                    row.get("relation_frame_id"),
+                "relation_frame_id": _resolve_frame_ref(
+                    row.get("relation_frame_id"), frame_uuid_map, source_uuid, warnings
                 ),
                 "supersedes": [
                     edge_uuid_map[e] for e in row.get("supersedes", []) if e in edge_uuid_map
@@ -984,6 +1093,8 @@ async def import_group_from_zip(
     with tempfile.TemporaryDirectory(prefix="surriti_pack_import_") as tmpdir:
         tmp = Path(tmpdir)
         with zipfile.ZipFile(input_path, "r") as zf:
+            # Defend against zip bombs and path-traversal attacks.
+            _validate_zip_safety(zf, tmp)
             zf.extractall(tmp)
         return await import_group_from_dir(
             driver,
